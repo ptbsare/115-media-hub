@@ -551,6 +551,22 @@ def ensure_db() -> None:
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_created_at ON cross_copy_jobs(created_at DESC)"
             )
+            # 文件哈希备忘录：跨盘复制算出来的 SHA1 沉淀下来，下次秒传直接复用
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_hash_cache (
+                    provider TEXT NOT NULL,
+                    file_id TEXT NOT NULL,
+                    size INTEGER NOT NULL DEFAULT 0,
+                    sha1 TEXT NOT NULL DEFAULT '',
+                    updated_ts REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY (provider, file_id)
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_media_hash_cache_updated_ts ON media_hash_cache(updated_ts)"
+            )
             cursor.execute("PRAGMA table_info(cross_copy_jobs)")
             cross_copy_job_columns = {str(row[1]) for row in cursor.fetchall()}
             if "source_share_url" not in cross_copy_job_columns:

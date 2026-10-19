@@ -102,7 +102,18 @@
         const providers = Array.isArray(state.capabilities?.providers) ? state.capabilities.providers : [];
         const matched = providers.find(item => String(item?.name || '') === key);
         if (matched?.label) return String(matched.label);
-        const fallback = { '115': '115 网盘', quark: '夸克网盘', aliyun: '阿里云盘' };
+        // capabilities 只覆盖能做跨盘复制的网盘（115/夸克/阿里）。任务里的来源网盘
+        // 可能是别的（天翼、123），这时退到全量 providerMeta，最后才用静态表，
+        // 避免把内部代号 tianyi 这种直接显示给用户。
+        const meta = (window.providerMeta || []).find(item => String(item?.name || '') === key);
+        if (meta && meta.label) return String(meta.label);
+        const fallback = {
+            '115': '115网盘',
+            quark: '夸克网盘',
+            aliyun: '阿里云盘',
+            tianyi: '天翼云盘',
+            '123pan': '123 网盘',
+        };
         return fallback[key] || key || '未知网盘';
     }
 

@@ -9,6 +9,22 @@
             };
         }
 
+        // 任务卡片上的网盘名：优先查全局 providerMeta，其次静态表，最后退回内部代号。
+        // 不要再用「不是夸克就是 115」这种判断，天翼/123/阿里会被显示成错的网盘名。
+        function resolveProviderLabel(provider) {
+            const key = String(provider || '').trim();
+            const meta = (window.providerMeta || []).find(item => String(item?.name || '') === key);
+            if (meta && meta.label) return String(meta.label);
+            const fallback = {
+                '115': '115网盘',
+                quark: '夸克网盘',
+                aliyun: '阿里云盘',
+                tianyi: '天翼云盘',
+                '123pan': '123 网盘',
+            };
+            return fallback[key] || key || '未知网盘';
+        }
+
         function normalizeResourceJobFilter(value = 'all') {
             const normalized = String(value || 'all').trim().toLowerCase();
             return ['all', 'active', 'submitted', 'completed', 'failed'].includes(normalized) ? normalized : 'all';
@@ -319,7 +335,7 @@
                 const jobId = Number(job.id || 0) || 0;
                 const progress = getScraperJobProgress(job);
                 const expanded = scraperJobExpanded.has(jobId);
-                const providerLabel = String(job.provider || '') === 'quark' ? '夸克' : '115';
+                const providerLabel = resolveProviderLabel(job.provider);
                 const canRollback = !!job.can_rollback;
                 const rollbackLabel = canRollback ? '回退' : '不可回退';
                 const actionCount = Array.isArray(job.actions) ? job.actions.length : 0;

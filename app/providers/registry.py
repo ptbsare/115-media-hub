@@ -41,6 +41,22 @@ def list_all() -> List[CloudProvider]:
         return list(_providers.values())
 
 
+def label_for(name: str, default: str = "") -> str:
+    """把内部代号换成给人看的网盘名。
+
+    `name` 是内部标识（如 "tianyi" / "115" / "quark"），直接拼进用户可见文案
+    会显示成英文代号。凡是要展示给用户的地方都应走这里拿中文名。
+    """
+    key = str(name or "").strip()
+    if not key:
+        return str(default or "").strip()
+    provider = get_or_none(key)
+    if provider is None:
+        return str(default or "").strip() or key
+    label = str(getattr(provider, "label", "") or "").strip()
+    return label or str(default or "").strip() or key
+
+
 def list_enabled(cfg: Optional[Dict[str, Any]] = None) -> List[CloudProvider]:
     enabled_map = {}
     if isinstance(cfg, dict):

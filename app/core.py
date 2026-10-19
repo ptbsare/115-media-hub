@@ -2763,6 +2763,29 @@ def match_mount_point_by_remote_path(cfg: Dict[str, Any], remote_path: str) -> D
     return {}
 
 
+_PROVIDER_DISPLAY_NAMES = {
+    "115": "115网盘",
+    "quark": "夸克网盘",
+    "aliyun": "阿里云盘",
+    "tianyi": "天翼云盘",
+    "123pan": "123 网盘",
+}
+
+
+def provider_display_name(name: Any, default: str = "") -> str:
+    """把内部代号换成给人看的网盘名。
+
+    `name` 是内部标识（"tianyi" / "115" / "quark" …）。直接拼进用户可见文案
+    会显示成英文代号，所以凡是给用户看的地方都该走这里。
+    这里用静态表而不是查 provider 注册表，避免 core 反向依赖注册表造成循环导入；
+    需要反映 provider 自身 label 时应改用 `providers.registry.label_for`。
+    """
+    key = str(name or "").strip().lower()
+    if not key:
+        return str(default or "").strip()
+    return _PROVIDER_DISPLAY_NAMES.get(key, "") or str(default or "").strip() or key
+
+
 def resolve_provider_relative_path(
     cfg: Dict[str, Any],
     remote_path: str,
@@ -2775,7 +2798,9 @@ def resolve_provider_relative_path(
     relative_path = normalize_relative_path(matched.get("relative_path", ""))
     expected_key = normalize_mount_provider(expected_provider)
     if expected_key and provider != expected_key:
-        raise RuntimeError(f"路径前缀匹配到 {provider}，当前仅支持 {expected_key}")
+        raise RuntimeError(
+            f"路径前缀匹配到 {provider_display_name(provider)}，当前仅支持 {provider_display_name(expected_key)}"
+        )
     return provider, relative_path
 
 

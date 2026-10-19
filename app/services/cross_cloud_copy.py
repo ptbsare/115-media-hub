@@ -22,6 +22,12 @@
     此时引擎不再提前下载，而是用惰性 sink（``_LazyDownloadSink``）把下载推迟到
     「第一次真正读数据」：秒传命中 → read 永不发生 → 一个字节都不下。
 
+哈希备忘录（media_hash_cache）：
+    夸克这类源拿不到哈希，只能下载一遍算；算出来的 ``sha1 + size`` 会沉淀进
+    SQLite（见 ``media_hash_cache.py``），下一次复制同一个文件（哪怕目标是另一个
+    目录）直接命中，不必再下一遍。备忘录里的哈希若与源文件实际内容不符，
+    引擎会清掉缓存、改走「下载重新算哈希」的路径重试一次，而不是把复制判死。
+
 provider 能力依赖：
     - 源：resolve_download_url / resolve_download_info（三家均已实现）
     - 源（可选）：get_file_hash → ``{"sha1", "size", "name"}``（115/阿里已实现）
@@ -42,6 +48,7 @@ import requests
 
 from ..core import normalize_http_url
 from ..providers.base import CloudProvider, UploadError
+from . import media_hash_cache
 from .local_storage import ensure_free_space, resolve_cross_copy_temp_dir
 
 logger = logging.getLogger(__name__)
@@ -82,6 +89,20 @@ class CrossCloudCopyCancelled(CrossCloudCopyError):
 
     def __init__(self, message: str = "复制已取消"):
         super().__init__(str(message or "复制已取消"))
+
+
+class _SourceHashMismatch(CrossCloudCopyError):
+    """惰性下载校验失败：已知哈希与源文件实际内容对不上。
+
+    典型来源是「哈希备忘录里的 sha1 已经过期/记错」——网盘端文件被替换但 file_id
+    没变。调用方据此清掉缓存并改走「下载重新算哈希」的路径重试一次，
+    而不是把复制直接判失败（见 copy_file_across_clouds 的自愈逻辑）。
+    """
+
+    def __init__(self, *, expected_sha1: str = "", actual_sha1: str = ""):
+        super().__init__("源文件已变更，请重试")
+        self.expected_sha1 = str(expected_sha1 or "")
+        self.actual_sha1 = str(actual_sha1 or "")
 
 
 class CopyFileResult:
@@ -237,25 +258,61 @@ def _invalidate_source_hash(provider: Any, cookie: str, file_id: str) -> None:
         _source_hash_cache.pop(key, None)
 
 
-def resolve_source_hash(provider: Any, cookie: str, file_id: str) -> Dict[str, Any]:
+def resolve_source_hash(
+    provider: Any, cookie: str, file_id: str, size: int = -1
+) -> Dict[str, Any]:
     """按能力探测源端能否直接给出 ``sha1 + size``（不下载文件）。
 
-    走 ``provider.get_file_hash(cookie, file_id)``（可选能力，115/阿里已实现）：
-        - 有 → 返回 ``{"sha1": 大写SHA1, "size": int, "name": str, "md5": str}``
-        - 没有 / 拿不到 / 抛错 → 返回 ``{}``，调用方回退「下载一遍算哈希」
+    两级缓存，按开销从低到高依次尝试：
+        1. 进程内缓存（10 分钟，键含 cookie 摘要）——挡同一任务内的重复请求；
+        2. 持久化哈希备忘录 ``media_hash_cache``（30 天，跨任务复用）——
+           夸克这类没有哈希能力的源，只要以前下载算过一次，这里就能直接命中；
+        3. 最后才走 ``provider.get_file_hash(cookie, file_id)``（115/阿里已实现）。
 
-    缓存 10 分钟（进程内，线程锁），键含 cookie 摘要，避免跨账号串味。
+    :param size: 调用方知道的文件大小；> 0 时才查备忘录（查表必须校验大小，
+        大小不符说明文件被换过，旧哈希作废）。<= 0 表示大小未知，跳过备忘录。
+
+    返回 ``{"sha1": 大写SHA1, "size": int, "name": str, "md5": str, "origin": str}``；
+    都没有 → ``{}``，调用方回退「下载一遍算哈希」。
     """
-    getter = getattr(provider, "get_file_hash", None)
-    if not callable(getter):
-        return {}
     token = str(file_id or "").strip()
     if not token:
         return {}
+    provider_name = str(getattr(provider, "name", "") or "")
     key = _source_hash_cache_key(provider, cookie, token)
     cached = _read_cached_source_hash(key)
     if cached is not None:
         return cached
+    # 备忘录：数据库故障已在 media_hash_cache 内部吞掉；这里再兜一层，
+    # 防止将来缓存模块改动把异常漏进复制主流程。
+    try:
+        with_size = int(size)
+    except (TypeError, ValueError):
+        with_size = -1
+    if with_size > 0 and provider_name:
+        try:
+            remembered = media_hash_cache.lookup_file_hash(provider_name, token, with_size)
+        except Exception as exc:
+            logger.warning("媒体哈希缓存查询异常（已忽略）：%s", exc)
+            remembered = ""
+        if remembered:
+            logger.info(
+                "cross-cloud source hash hit media cache: %s file_id=%s size=%s sha1=%s",
+                provider_name,
+                token,
+                with_size,
+                remembered[:12],
+            )
+            return {
+                "sha1": remembered,
+                "size": with_size,
+                "name": "",
+                "md5": "",
+                "origin": "cache",
+            }
+    getter = getattr(provider, "get_file_hash", None)
+    if not callable(getter):
+        return {}
     try:
         info = getter(cookie, token)
     except Exception as exc:
@@ -265,23 +322,24 @@ def resolve_source_hash(provider: Any, cookie: str, file_id: str) -> Dict[str, A
         return {}
     sha1 = _normalize_sha1(info.get("sha1", ""))
     try:
-        size = int(info.get("size", 0) or 0)
+        info_size = int(info.get("size", 0) or 0)
     except (TypeError, ValueError):
         return {}
-    if not sha1 or size <= 0:
+    if not sha1 or info_size <= 0:
         return {}
     record = {
         "sha1": sha1,
-        "size": size,
+        "size": info_size,
         "name": str(info.get("name", "") or "").strip(),
         "md5": str(info.get("md5", "") or "").strip().lower(),
+        "origin": "provider",
     }
     _write_cached_source_hash(key, record)
     logger.info(
         "cross-cloud source hash resolved: %s file_id=%s size=%s sha1=%s",
-        str(getattr(provider, "name", "") or ""),
+        provider_name,
         token,
-        size,
+        info_size,
         sha1[:12],
     )
     return dict(record)
@@ -569,8 +627,9 @@ class _LazyDownloadSink:
     秒传命中 → 这些调用永不发生 → 零下载流量；未命中 → 才真正下一遍。
 
     双通道沿用 ``_open_sink``：≤64MB 进内存，>64MB 进临时文件（``temp_dir``）。
-    下载完成后用已知 SHA1 校验；不一致说明源文件在元信息读取后被改过，
-    报「源文件已变更，请重试」并让上层重试。
+    下载完成后用已知 SHA1 校验；不一致说明已知哈希已经不可信（源文件被替换、
+    或备忘录记错了），抛 ``_SourceHashMismatch``（文案「源文件已变更，请重试」），
+    由上层决定是「清缓存重算」自愈还是直接失败。
 
     ``size`` 是属性（符合 ``UploadSink`` 协议与各 provider 的
     ``getattr(sink, "size", -1)`` 用法），读取它**不会**触发下载。
@@ -682,7 +741,7 @@ class _LazyDownloadSink:
                 self._expected_sha1[:12],
                 sha1[:12],
             )
-            raise CrossCloudCopyError("源文件已变更，请重试")
+            raise _SourceHashMismatch(expected_sha1=self._expected_sha1, actual_sha1=sha1)
         sink.seek(0)
         self._sink = sink
         self._is_temp_file = is_temp_file
@@ -782,6 +841,24 @@ def _target_has_same_file(
     return False
 
 
+def _remember_hash_quietly(provider: str, file_id: str, size: int, sha1: str) -> None:
+    """把确认过的哈希写进备忘录。缓存只是优化，任何异常都不许冒泡到复制主流程。"""
+    if not provider or not file_id or int(size or 0) <= 0 or not sha1:
+        return
+    try:
+        media_hash_cache.remember_file_hash(provider, file_id, int(size), sha1)
+    except Exception as exc:
+        logger.warning("媒体哈希缓存写入异常（已忽略）：%s", exc)
+
+
+def _forget_hash_quietly(provider: str, file_id: str) -> None:
+    """清掉一条哈希记录（脏缓存自愈用）。同样不允许因缓存故障打断复制。"""
+    try:
+        media_hash_cache.forget_file_hash(provider, file_id)
+    except Exception as exc:
+        logger.warning("媒体哈希缓存清除异常（已忽略）：%s", exc)
+
+
 def copy_file_across_clouds(
     *,
     source_provider: CloudProvider,
@@ -859,7 +936,7 @@ def copy_file_across_clouds(
     hash_origin = "caller" if (known_sha1 and known_size > 0) else ""
     if not hash_origin:
         known_sha1, known_size, known_md5 = "", -1, ""
-        probed = resolve_source_hash(source_provider, source_cookie, source_file_id)
+        probed = resolve_source_hash(source_provider, source_cookie, source_file_id, size=size)
         if probed:
             known_sha1 = _normalize_sha1(probed.get("sha1", ""))
             try:
@@ -869,7 +946,8 @@ def copy_file_across_clouds(
             if known_sha1 and known_size > 0:
                 known_md5 = known_md5 or str(probed.get("md5", "") or "").strip().lower()
                 hash_name_hint = str(probed.get("name", "") or "").strip()
-                hash_origin = "provider"
+                # 哈希来自持久化备忘录时记成 cache：校验不一致就自愈（清缓存重算）
+                hash_origin = str(probed.get("origin", "") or "provider")
             else:
                 known_sha1, known_size = "", -1
 
@@ -884,169 +962,202 @@ def copy_file_across_clouds(
     if not str(temp_dir or "").strip() and cfg is not None:
         temp_dir = resolve_temp_dir(cfg)
 
-    file_md5 = ""
-    file_sha1 = ""
     total = int(size)
-    sink = None
-    lazy_sink: Optional[_LazyDownloadSink] = None
-    is_temp_file = False
-    temp_path = ""
-    try:
-        if zero_traffic:
-            # ---- 零流量路径：不提前下载，用惰性 sink 把下载推迟到首次读数据 ----
-            total = int(known_size)
-            if not filename:
-                filename = hash_name_hint
-            if not filename:
-                # 只为拿文件名探一次元信息（元信息请求不产生下载流量）
-                try:
-                    info = _resolve_source_download(source_provider, source_cookie, source_file_id)
-                    filename = _info_filename(info)
-                except Exception as exc:
-                    logger.info("cross-cloud filename probe failed: %s", exc)
-            if not filename:
-                filename = f"cross-copy-{int(started)}"
 
-            file_sha1 = known_sha1
-            file_md5 = known_md5
-            lazy_sink = _LazyDownloadSink(
-                source_provider=source_provider,
-                source_cookie=source_cookie,
-                source_file_id=source_file_id,
-                size=total,
-                expected_sha1=file_sha1,
-                temp_dir=str(temp_dir or ""),
-                progress_cb=progress_cb,
-                cancel_check=cancel_check,
-            )
-            sink = lazy_sink
-            logger.info(
-                "cross-cloud zero-traffic path armed: %s->%s file_id=%s size=%s sha1=%s origin=%s",
-                source_name,
-                target_name,
-                source_file_id,
-                total,
-                file_sha1[:12],
-                hash_origin,
-            )
-            # 不伪造 0→100 的下载进度，直接进入上传阶段（秒传命中即瞬间完成）
-            _report_progress(progress_cb, 0, total, "upload")
-        else:
-            # ---- 原路径：下载（双通道 + 同步哈希），拿不到源哈希时走这里 ----
-            sink_size = size if size >= 0 else -1
-            _precheck_disk_space(str(temp_dir or ""), sink_size)
-            sink, is_temp_file, temp_path = _open_sink(sink_size, temp_dir)
-            # 先探一次源元信息补全文件名/大小
-            if not filename or size < 0:
-                try:
-                    info = _resolve_source_download(source_provider, source_cookie, source_file_id)
-                    if not filename:
-                        filename = _info_filename(info)
-                    if size < 0:
-                        hinted = int(info.get("size", 0) or 0)
-                        if hinted > 0:
-                            total = hinted
-                except Exception as exc:
-                    logger.info("cross-cloud source meta probe failed: %s", exc)
-            if not filename:
-                filename = f"cross-copy-{int(started)}"
+    def _copy_once(use_zero_traffic: bool) -> CopyFileResult:
+        """跑一遍「准备数据源 → 上传」，一次尝试独占自己的 sink 与临时文件。
 
-            download_result = _download_to_sink(
-                source_provider=source_provider,
-                source_cookie=source_cookie,
-                source_file_id=source_file_id,
-                sink=sink,
-                total=total,
-                progress_cb=progress_cb,
-                cancel_check=cancel_check,
-            )
-            downloaded = int(download_result.get("size", 0) or 0)
-            if downloaded <= 0:
-                raise CrossCloudCopyError("源文件为空或下载不到数据")
-            if size >= 0 and downloaded != size:
-                raise CrossCloudCopyError(
-                    f"下载不完整（{downloaded}/{size} 字节）", retriable=True
-                )
-            total = downloaded
-            file_md5 = str(download_result.get("md5", "") or "")
-            file_sha1 = str(download_result.get("sha1", "") or "").upper()
-            sink.seek(0)
-
-        # ---- 上传（秒传优先） ----
-        def _upload_progress(sent_bytes: int, total_bytes: int, _phase: str = "upload") -> None:
-            _report_progress(progress_cb, sent_bytes, total_bytes, "upload")
-
+        之所以收成内部函数：脏缓存自愈需要换条路径重跑一遍，而惰性 sink 与临时
+        文件必须在两次尝试之间彻底释放，不能串用上一轮的半截数据。
+        """
+        nonlocal filename
+        attempt_total = int(total if not use_zero_traffic else known_size)
+        attempt_sha1 = ""
+        attempt_md5 = ""
+        attempt_sink = None
+        attempt_lazy: Optional[_LazyDownloadSink] = None
+        attempt_is_temp = False
+        attempt_temp_path = ""
         try:
-            upload_result = target_provider.upload_file(
-                target_cookie,
-                sink,
-                filename,
-                str(target_dir_id or "").strip(),
-                sha1=file_sha1,
-                md5=file_md5,
-                size=total,
-                progress_cb=_upload_progress,
-                cancel_check=cancel_check,
-            )
-        except CrossCloudCopyCancelled:
-            raise
-        except CrossCloudCopyError:
-            # 惰性 sink 在 upload_file 内部才下载：下载失败 / 源文件变更要原样冒泡，
-            # 不能被下面的 UploadError 映射或「上传失败」包装吃掉
-            raise
-        except UploadError as exc:
-            raise CrossCloudCopyError(str(exc), retriable=bool(getattr(exc, "retriable", False))) from exc
-        except Exception as exc:
-            raise CrossCloudCopyError(f"上传到目标网盘失败：{exc}", retriable=True) from exc
+            if use_zero_traffic:
+                # ---- 零流量路径：不提前下载，用惰性 sink 把下载推迟到首次读数据 ----
+                if not filename:
+                    filename = hash_name_hint
+                if not filename:
+                    # 只为拿文件名探一次元信息（元信息请求不产生下载流量）
+                    try:
+                        info = _resolve_source_download(source_provider, source_cookie, source_file_id)
+                        filename = _info_filename(info)
+                    except Exception as exc:
+                        logger.info("cross-cloud filename probe failed: %s", exc)
+                if not filename:
+                    filename = f"cross-copy-{int(started)}"
 
-        status = str(getattr(upload_result, "status", "") or "uploaded")
-        message = str(getattr(upload_result, "message", "") or "")
-        if zero_traffic and status == "rapid":
-            message = "秒传命中，未产生下载流量"
-            logger.info(
-                "cross-cloud zero-traffic hit: %s->%s file_id=%s size=%s sha1=%s",
+                attempt_sha1 = known_sha1
+                attempt_md5 = known_md5
+                attempt_lazy = _LazyDownloadSink(
+                    source_provider=source_provider,
+                    source_cookie=source_cookie,
+                    source_file_id=source_file_id,
+                    size=attempt_total,
+                    expected_sha1=attempt_sha1,
+                    temp_dir=str(temp_dir or ""),
+                    progress_cb=progress_cb,
+                    cancel_check=cancel_check,
+                )
+                attempt_sink = attempt_lazy
+                logger.info(
+                    "cross-cloud zero-traffic path armed: %s->%s file_id=%s size=%s sha1=%s origin=%s",
+                    source_name,
+                    target_name,
+                    source_file_id,
+                    attempt_total,
+                    attempt_sha1[:12],
+                    hash_origin,
+                )
+                # 不伪造 0→100 的下载进度，直接进入上传阶段（秒传命中即瞬间完成）
+                _report_progress(progress_cb, 0, attempt_total, "upload")
+            else:
+                # ---- 原路径：下载（双通道 + 同步哈希），拿不到源哈希时走这里 ----
+                sink_size = size if size >= 0 else -1
+                _precheck_disk_space(str(temp_dir or ""), sink_size)
+                attempt_sink, attempt_is_temp, attempt_temp_path = _open_sink(sink_size, temp_dir)
+                # 先探一次源元信息补全文件名/大小
+                if not filename or size < 0:
+                    try:
+                        info = _resolve_source_download(source_provider, source_cookie, source_file_id)
+                        if not filename:
+                            filename = _info_filename(info)
+                        if size < 0:
+                            hinted = int(info.get("size", 0) or 0)
+                            if hinted > 0:
+                                attempt_total = hinted
+                    except Exception as exc:
+                        logger.info("cross-cloud source meta probe failed: %s", exc)
+                if not filename:
+                    filename = f"cross-copy-{int(started)}"
+
+                download_result = _download_to_sink(
+                    source_provider=source_provider,
+                    source_cookie=source_cookie,
+                    source_file_id=source_file_id,
+                    sink=attempt_sink,
+                    total=attempt_total,
+                    progress_cb=progress_cb,
+                    cancel_check=cancel_check,
+                )
+                downloaded = int(download_result.get("size", 0) or 0)
+                if downloaded <= 0:
+                    raise CrossCloudCopyError("源文件为空或下载不到数据")
+                if size >= 0 and downloaded != size:
+                    raise CrossCloudCopyError(
+                        f"下载不完整（{downloaded}/{size} 字节）", retriable=True
+                    )
+                attempt_total = downloaded
+                attempt_md5 = str(download_result.get("md5", "") or "")
+                attempt_sha1 = str(download_result.get("sha1", "") or "").upper()
+                attempt_sink.seek(0)
+
+            # ---- 上传（秒传优先） ----
+            def _upload_progress(sent_bytes: int, total_bytes: int, _phase: str = "upload") -> None:
+                _report_progress(progress_cb, sent_bytes, total_bytes, "upload")
+
+            try:
+                upload_result = target_provider.upload_file(
+                    target_cookie,
+                    attempt_sink,
+                    filename,
+                    str(target_dir_id or "").strip(),
+                    sha1=attempt_sha1,
+                    md5=attempt_md5,
+                    size=attempt_total,
+                    progress_cb=_upload_progress,
+                    cancel_check=cancel_check,
+                )
+            except CrossCloudCopyCancelled:
+                raise
+            except CrossCloudCopyError:
+                # 惰性 sink 在 upload_file 内部才下载：下载失败 / 源文件变更要原样冒泡，
+                # 不能被下面的 UploadError 映射或「上传失败」包装吃掉
+                raise
+            except UploadError as exc:
+                raise CrossCloudCopyError(str(exc), retriable=bool(getattr(exc, "retriable", False))) from exc
+            except Exception as exc:
+                raise CrossCloudCopyError(f"上传到目标网盘失败：{exc}", retriable=True) from exc
+
+            status = str(getattr(upload_result, "status", "") or "uploaded")
+            message = str(getattr(upload_result, "message", "") or "")
+            if use_zero_traffic and status == "rapid":
+                message = "秒传命中，未产生下载流量"
+                logger.info(
+                    "cross-cloud zero-traffic hit: %s->%s file_id=%s size=%s sha1=%s",
+                    source_name,
+                    target_name,
+                    source_file_id,
+                    attempt_total,
+                    attempt_sha1[:12],
+                )
+            elif use_zero_traffic and attempt_lazy is not None and attempt_lazy.downloaded:
+                logger.info(
+                    "cross-cloud zero-traffic missed rapid, downloaded on demand: file_id=%s size=%s",
+                    source_file_id,
+                    attempt_total,
+                )
+
+            # 成功路径才沉淀哈希：算出来的 sha1 + size 已经过上传侧确认（惰性路径
+            # 还经过下载校验），下次复制同一文件可以直接秒传，不必再下一遍。
+            _remember_hash_quietly(source_name, source_file_id, attempt_total, attempt_sha1)
+            return CopyFileResult(
+                status=status,
+                source_provider=source_name,
+                target_provider=target_name,
+                file_id=str(getattr(upload_result, "file_id", "") or ""),
+                pick_code=str(getattr(upload_result, "pick_code", "") or ""),
+                name=filename,
+                size=attempt_total,
+                sha1=attempt_sha1,
+                message=message,
+                elapsed_ms=int((time.monotonic() - started) * 1000),
+            )
+        finally:
+            # 数据源自己负责底层 sink 与临时文件（惰性 sink 的 close 会删临时文件）
+            if attempt_sink is not None:
+                try:
+                    attempt_sink.close()
+                except Exception:
+                    pass
+            if attempt_is_temp and attempt_temp_path:
+                try:
+                    os.remove(attempt_temp_path)
+                except Exception:
+                    logger.warning("cross-cloud temp file cleanup failed: %s", attempt_temp_path)
+    try:
+        try:
+            return _copy_once(zero_traffic)
+        except _SourceHashMismatch as exc:
+            # 脏缓存自愈：备忘录里的 sha1 不可信（网盘端文件被替换但 file_id 没变，
+            # 或者上次记错了）。此时零流量路径会在下载校验时直接失败，必须清掉缓存、
+            # 改走「正常下载重新算哈希」的路径重试一次，而不是把复制判死。
+            # 只对来自备忘录的哈希自愈：调用方显式给 / provider 刚回的哈希对不上，
+            # 说明源文件真的变了，静默换一份内容上传反而更危险。
+            if hash_origin != "cache":
+                raise
+            _forget_hash_quietly(source_name, source_file_id)
+            logger.warning(
+                "哈希缓存与源文件不一致，已清除并重新计算：provider=%s file_id=%s expected=%s actual=%s",
                 source_name,
-                target_name,
                 source_file_id,
-                total,
-                file_sha1[:12],
+                exc.expected_sha1[:12],
+                exc.actual_sha1[:12],
             )
-        elif zero_traffic and lazy_sink is not None and lazy_sink.downloaded:
-            logger.info(
-                "cross-cloud zero-traffic missed rapid, downloaded on demand: file_id=%s size=%s",
-                source_file_id,
-                total,
-            )
-        return CopyFileResult(
-            status=status,
-            source_provider=source_name,
-            target_provider=target_name,
-            file_id=str(getattr(upload_result, "file_id", "") or ""),
-            pick_code=str(getattr(upload_result, "pick_code", "") or ""),
-            name=filename,
-            size=total,
-            sha1=file_sha1,
-            message=message,
-            elapsed_ms=int((time.monotonic() - started) * 1000),
-        )
+            total = int(size)
+            return _copy_once(False)
     except CrossCloudCopyCancelled:
         raise
     except CrossCloudCopyError:
         raise
     except Exception as exc:
         raise CrossCloudCopyError(f"跨盘复制失败：{exc}") from exc
-    finally:
-        # 清理数据源（惰性 sink 自己负责底层 sink 与临时文件）
-        if sink is not None:
-            try:
-                sink.close()
-            except Exception:
-                pass
-        if is_temp_file and temp_path:
-            try:
-                os.remove(temp_path)
-            except Exception:
-                logger.warning("cross-cloud temp file cleanup failed: %s", temp_path)
 
 
 def cleanup_orphan_temp_files(temp_dir: str, max_age_hours: int = ORPHAN_TEMP_MAX_AGE_HOURS) -> int:

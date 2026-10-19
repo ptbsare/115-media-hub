@@ -19,6 +19,7 @@ from typing import Any, Dict, List, Optional, Set
 
 from ..core import *  # noqa: F401,F403
 from ..db import now_text, retry_sqlite_locked
+from ..providers.registry import label_for as _provider_label
 from . import scraper as scraper_service
 from .scraper import (
     _normalize_scraper_batch_preferences,
@@ -466,7 +467,7 @@ def _cross_provider_target_hint(
         if normalize_mount_provider(target_provider) == provider_key:
             continue
         label = QUICK_IMPORT_TARGET_LABELS.get(key, key)
-        return f"「{label}」分发目标必须和接收夹在同一网盘（接收夹当前在 {provider} 网盘）"
+        return f"「{label}」分发目标必须和接收夹在同一网盘（接收夹当前在 {_provider_label(provider)}）"
     return ""
 
 
@@ -485,7 +486,7 @@ def validate_quick_import_config(
         return f"请先给接收夹任务「{conf['task_name']}」选择文件夹"
     inbox_rel = str(conf.get("inbox_rel", "") or "").strip()
     if not inbox_rel:
-        return f"接收文件夹必须位于 {provider} 网盘前缀下"
+        return f"接收文件夹必须位于 {_provider_label(provider)} 前缀下"
     cross_provider = _cross_provider_target_hint(active_cfg, provider, inbox)
     if cross_provider:
         return cross_provider

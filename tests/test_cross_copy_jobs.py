@@ -8,6 +8,8 @@ import asyncio
 import os
 import shutil
 import tempfile
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch
 
@@ -84,6 +86,12 @@ class CrossCopyJobsTestBase(unittest.TestCase):
         ccj._job_progress.clear()
         ccj._last_db_progress.clear()
         ccj._cancel_requested.clear()
+        # 排队状态同样是模块级的：不清会把上一条用例的名额带进来
+        with ccj._sched_lock:
+            ccj._queued.clear()
+            ccj._active.clear()
+        with ccj._running_lock:
+            ccj._running.clear()
 
         self.cfg = {
             "cross_copy_notify": True,
@@ -186,6 +194,14 @@ class TestJobExecution(CrossCopyJobsTestBase):
         self.assertEqual(job["progress_percent"], 100)
         self.assertEqual(job["result"]["file_id"], "F-1")
         ccj._send_notify_content.assert_called_once()
+
+    def test_notify_shows_display_name_not_internal_code(self):
+        """通知文案要给人看的网盘名，不能把内部代号（quark / tianyi）直接拼进去。"""
+        job_id = self._create_job()
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result("uploaded")):
+            self._run(job_id)
+        content = ccj._send_notify_content.call_args[0][1]
+        self.assertIn("链路：夸克网盘 → 115网盘", content)
 
     def test_success_rapid(self):
         job_id = self._create_job()
@@ -514,6 +530,334 @@ class TestTransferProgress(CrossCopyJobsTestBase):
         self.assertEqual(ccj.format_transfer_size(0), "0B")
         self.assertEqual(ccj.format_transfer_size(1024), "1.00KB")
         self.assertEqual(ccj.format_transfer_size(2797571732), "2.61GB")
+
+
+class BackgroundLoopRunner:
+    """测试用后台事件循环：真的把 submit 出去的协程跑起来（替代 background_runtime）。
+
+    线上 submit_background 会把协程丢到后台线程的 loop 上；这里起一个同样的
+    loop，才能验证「同时只跑 N 个」这类行为，而不是只验证调用次数。
+    """
+
+    def __init__(self):
+        self.loop = asyncio.new_event_loop()
+        self.submitted = []
+        self._lock = threading.Lock()
+        self._ready = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="ccj-test-loop", daemon=True)
+        self._thread.start()
+        self._ready.wait(5)
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        self._ready.set()
+        self.loop.run_forever()
+
+    def __call__(self, job_factory, *args, label="", **kwargs):
+        with self._lock:
+            self.submitted.append(args[0] if args else 0)
+        return asyncio.run_coroutine_threadsafe(job_factory(*args, **kwargs), self.loop)
+
+    def close(self):
+        if self.loop.is_closed():
+            return
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self._thread.join(5)
+        self.loop.close()
+
+
+class QueueTestBase(CrossCopyJobsTestBase):
+    """排队/并发用例基类：后台任务真跑，复制引擎卡在闸门上由用例逐个放行。"""
+
+    max_concurrent = 2
+    env_max_concurrent = None
+
+    def setUp(self):
+        super().setUp()
+        self._env_patch = None
+        if self.env_max_concurrent is not None:
+            self._env_patch = patch.dict(
+                os.environ, {"CROSS_COPY_MAX_CONCURRENT": self.env_max_concurrent}
+            )
+            self._env_patch.start()
+            effective = ccj._resolve_max_concurrent()
+        else:
+            effective = self.max_concurrent
+        self.runner = BackgroundLoopRunner()
+        self.gate = threading.Semaphore(0)
+        self.engine_calls = []
+        self._engine_lock = threading.Lock()
+        self._queue_patchers = [
+            patch.object(ccj, "submit_background", self.runner),
+            patch.object(ccj, "MAX_CONCURRENT_JOBS", effective),
+            patch.object(xcc, "copy_file_across_clouds", side_effect=self._blocking_engine),
+        ]
+        for p in self._queue_patchers:
+            p.start()
+
+    def tearDown(self):
+        # 先放行所有卡住的任务，等后台 loop 收尾，再恢复 DB 路径，避免写回真实库
+        self.gate.release(100)
+        self._wait_for(lambda: not ccj._queued and not ccj._active, timeout=15)
+        for p in self._queue_patchers:
+            p.stop()
+        self.runner.close()
+        if self._env_patch is not None:
+            self._env_patch.stop()
+        super().tearDown()
+
+    def _blocking_engine(self, **kwargs):
+        with self._engine_lock:
+            self.engine_calls.append(str(kwargs.get("filename", "") or ""))
+        self.gate.acquire(timeout=15)
+        return _uploaded_result()
+
+    def _wait_for(self, predicate, timeout=8.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return bool(predicate())
+
+    def _status(self, job_id):
+        return ccj.get_cross_copy_job(job_id)["status"]
+
+    def _detail(self, job_id):
+        return str(ccj.get_cross_copy_job(job_id)["status_detail"] or "")
+
+    def _submit_all(self, job_ids):
+        for job_id in job_ids:
+            ccj.submit_cross_copy_job(job_id)
+
+
+class TestGlobalConcurrencyLimit(QueueTestBase):
+    """一次粘一堆文件：同时只跑上限那么多，其余排队。"""
+
+    max_concurrent = 2
+
+    def test_five_jobs_only_two_run_rest_wait(self):
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(5)]
+        self._submit_all(job_ids)
+
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[0]) == "running"))
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[1]) == "running"))
+        # 只有两个任务真的在下载
+        self.assertTrue(self._wait_for(lambda: len(self.engine_calls) == 2))
+        time.sleep(0.2)  # 给可能多派发的任务一点时间露头
+        self.assertEqual(self._status(job_ids[0]), "running")
+        self.assertEqual(self._status(job_ids[1]), "running")
+        for job_id in job_ids[2:]:
+            self.assertEqual(self._status(job_id), "pending")
+        self.assertEqual(len(self.engine_calls), 2)
+        self.assertEqual(sorted(ccj._active), job_ids[:2])
+        self.assertEqual(ccj._queued, job_ids[2:])
+
+    def test_queue_position_counts_down(self):
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(5)]
+        self._submit_all(job_ids)
+
+        # 排队的 3 个：前面有 2 个在跑 + 自己前面排了几个
+        self.assertTrue(self._wait_for(lambda: "前面还有 2 个任务" in self._detail(job_ids[2])))
+        self.assertIn("前面还有 3 个任务", self._detail(job_ids[3]))
+        self.assertIn("前面还有 4 个任务", self._detail(job_ids[4]))
+        self.assertIn("排队中", self._detail(job_ids[2]))
+
+        # 放行一个：第 3 个开跑，后面的位置往前挪
+        self.gate.release()
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[2]) == "running"))
+        self.assertTrue(self._wait_for(lambda: "前面还有 2 个任务" in self._detail(job_ids[3])))
+        self.assertIn("前面还有 3 个任务", self._detail(job_ids[4]))
+
+
+class TestQueueAdvance(QueueTestBase):
+    max_concurrent = 1
+
+    def test_next_job_starts_after_previous_finishes(self):
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(3)]
+        self._submit_all(job_ids)
+
+        self.assertTrue(self._wait_for(lambda: len(self.engine_calls) == 1))
+        self.assertEqual(self._status(job_ids[0]), "running")
+        self.assertEqual(self._status(job_ids[1]), "pending")
+        self.assertEqual(self._status(job_ids[2]), "pending")
+
+        self.gate.release()
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[0]) == "completed"))
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[1]) == "running"))
+        self.assertTrue(self._wait_for(lambda: self.engine_calls == ["m0.mkv", "m1.mkv"]))
+
+    def test_cancel_queued_job_never_runs(self):
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(3)]
+        self._submit_all(job_ids)
+        self.assertTrue(self._wait_for(lambda: len(self.engine_calls) == 1))
+
+        result = ccj.cancel_cross_copy_job(job_ids[1])
+        self.assertTrue(result["ok"])
+        self.assertEqual(self._status(job_ids[1]), "cancelled")
+        self.assertNotIn(job_ids[1], ccj._queued)
+
+        # 放行后面所有任务：被取消的那个不能借空闲名额复活
+        self.gate.release(10)
+        self.assertTrue(self._wait_for(lambda: self._status(job_ids[2]) == "completed"))
+        self.assertEqual(self._status(job_ids[1]), "cancelled")
+        self.assertEqual(self.engine_calls, ["m0.mkv", "m2.mkv"])
+
+    def test_exception_releases_slot(self):
+        """任务抛异常也必须还名额，否则后面的任务永远排不上（名额泄漏）。"""
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(2)]
+
+        def flaky_engine(**kwargs):
+            with self._engine_lock:
+                self.engine_calls.append(str(kwargs.get("filename", "") or ""))
+            if len(self.engine_calls) == 1:
+                raise ValueError("boom")
+            return _uploaded_result()
+
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=flaky_engine):
+            self._submit_all(job_ids)
+            self.assertTrue(self._wait_for(lambda: self._status(job_ids[1]) == "completed"))
+        self.assertEqual(self._status(job_ids[0]), "failed")
+        self.assertEqual(self.engine_calls, ["m0.mkv", "m1.mkv"])
+        self.assertTrue(self._wait_for(lambda: not ccj._active))
+
+
+class TestEnvMaxConcurrent(QueueTestBase):
+    """CROSS_COPY_MAX_CONCURRENT=1：串行执行。"""
+
+    env_max_concurrent = "1"
+
+    def test_env_one_runs_serially(self):
+        self.assertEqual(ccj._resolve_max_concurrent(), 1)
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(3)]
+        self._submit_all(job_ids)
+
+        self.assertTrue(self._wait_for(lambda: len(self.engine_calls) == 1))
+        time.sleep(0.2)
+        self.assertEqual(len(self.engine_calls), 1)
+        self.assertEqual(self._status(job_ids[1]), "pending")
+        self.assertEqual(self._status(job_ids[2]), "pending")
+
+    def test_invalid_values_fall_back_to_default(self):
+        for raw in ("0", "abc", "99", "-3", ""):
+            with patch.dict(os.environ, {"CROSS_COPY_MAX_CONCURRENT": raw}):
+                self.assertEqual(ccj._resolve_max_concurrent(), ccj.DEFAULT_MAX_CONCURRENT, raw)
+
+    def test_valid_values_are_used(self):
+        for raw, expected in (("1", 1), ("3", 3), ("8", 8)):
+            with patch.dict(os.environ, {"CROSS_COPY_MAX_CONCURRENT": raw}):
+                self.assertEqual(ccj._resolve_max_concurrent(), expected)
+
+    def test_missing_env_uses_default(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CROSS_COPY_MAX_CONCURRENT", None)
+            self.assertEqual(ccj._resolve_max_concurrent(), 2)
+
+
+class TestStartupRequeueQueue(QueueTestBase):
+    """启动恢复同样走排队路径，重启后不会一次全起跑。"""
+
+    max_concurrent = 1
+
+    def test_requeue_only_starts_one(self):
+        job_ids = [self._create_job(title=f"J{i}", filename=f"m{i}.mkv") for i in range(3)]
+        result = ccj.requeue_cross_copy_jobs_on_startup()
+        self.assertEqual(result["requeued"], 3)
+
+        self.assertTrue(self._wait_for(lambda: len(self.engine_calls) == 1))
+        self.assertEqual(self.engine_calls, ["m0.mkv"])
+        self.assertEqual(ccj._queued, job_ids[1:])
+        self.assertEqual(self._status(job_ids[1]), "pending")
+        self.assertIn("排队中", self._detail(job_ids[1]))
+
+
+class TestTargetDirIdResolution(CrossCopyJobsTestBase):
+    """只给「保存到哪个路径」的任务，执行前必须先把路径换成目录 id。
+
+    订阅补源走的是这条入口：它只知道 savepath，不知道目录 id。如果不补这一步，
+    文件会被传到根目录——任务显示成功，东西却存错了地方。
+    """
+
+    def _create_savepath_job(self, **overrides):
+        params = dict(
+            title="补源任务",
+            source_provider="quark",
+            target_provider="115",
+            source_file_id="f-quark-9",
+            target_savepath="/云下载/电影",
+            filename="movie.mkv",
+            file_size=1024,
+        )
+        params.update(overrides)
+        return ccj.create_cross_copy_job(**params)
+
+    def test_resolves_target_dir_id_from_savepath(self):
+        calls = []
+
+        def fake_ensure(cookie, path):
+            calls.append((cookie, path))
+            return "dir-resolved"
+
+        self.target_provider.ensure_folder_id_by_path = fake_ensure
+        job_id = self._create_savepath_job()
+        captured = {}
+
+        def fake_copy(**kwargs):
+            captured.update(kwargs)
+            return _uploaded_result("uploaded")
+
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=fake_copy):
+            self._run(job_id)
+
+        self.assertEqual(calls, [("cookie-x", "/云下载/电影")])
+        self.assertEqual(captured.get("target_dir_id"), "dir-resolved")
+        # 解析结果要落库，避免重试时再解析一次
+        self.assertEqual(ccj.get_cross_copy_job(job_id)["target_dir_id"], "dir-resolved")
+
+    def test_explicit_target_dir_id_is_kept(self):
+        """已经给了目录 id 的任务不能被路径解析覆盖。"""
+        self.target_provider.ensure_folder_id_by_path = MagicMock(return_value="dir-other")
+        job_id = self._create_job()  # 默认 target_dir_id="dir-115"
+        captured = {}
+
+        def fake_copy(**kwargs):
+            captured.update(kwargs)
+            return _uploaded_result("uploaded")
+
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=fake_copy):
+            self._run(job_id)
+
+        self.target_provider.ensure_folder_id_by_path.assert_not_called()
+        self.assertEqual(captured.get("target_dir_id"), "dir-115")
+
+    def test_resolve_failure_fails_job_instead_of_root_upload(self):
+        """解析失败要明确失败，绝不能悄悄传到根目录。"""
+        self.target_provider.ensure_folder_id_by_path = MagicMock(side_effect=RuntimeError("目录不可写"))
+        job_id = self._create_savepath_job()
+
+        def fake_copy(**kwargs):
+            raise AssertionError("解析失败时不应该开始复制")
+
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=fake_copy):
+            self._run(job_id)
+
+        job = ccj.get_cross_copy_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("保存目录", job["status_detail"])
+
+    def test_empty_resolve_result_fails_job(self):
+        self.target_provider.ensure_folder_id_by_path = MagicMock(return_value="")
+        job_id = self._create_savepath_job()
+
+        def fake_copy(**kwargs):
+            raise AssertionError("解析失败时不应该开始复制")
+
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=fake_copy):
+            self._run(job_id)
+
+        job = ccj.get_cross_copy_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertIn("/云下载/电影", job["status_detail"])
 
 
 if __name__ == "__main__":

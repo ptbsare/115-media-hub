@@ -369,7 +369,9 @@ class QuickImportConfigTest(unittest.TestCase):
         message = quick_import.validate_quick_import_config(cfg) or ""
         self.assertIn("同一网盘", message)
         self.assertIn("电影", message)
-        self.assertIn("quark", message)
+        # 这里必须说人话（「夸克网盘」），不能把内部代号 quark 直接拼给用户看
+        self.assertIn("夸克网盘", message)
+        self.assertNotIn("quark", message)
 
 
 class MultiInboxFanoutTest(unittest.TestCase):

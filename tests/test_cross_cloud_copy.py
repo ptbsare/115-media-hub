@@ -6,13 +6,16 @@
 import hashlib
 import io
 import os
+import shutil
 import tempfile
 import unittest
 from unittest.mock import MagicMock, patch
 
 import requests
 
+from app import db
 from app.services import cross_cloud_copy as xcc
+from app.services import media_hash_cache
 from app.providers.base import UploadError, UploadResult
 
 
@@ -119,6 +122,17 @@ def _chunked(data, chunk_size=1024 * 1024):
 
 class CrossCloudCopyTestBase(unittest.TestCase):
     def setUp(self):
+        # 复制成功会把哈希写进「备忘录」，这里换成临时库：测试之间互不串味，
+        # 也不会写到真实数据目录。
+        self._tmp_db_dir = tempfile.mkdtemp(prefix="xcopy-db-")
+        self._orig_db_path = db.DB_PATH
+        self._orig_db_ensured = db._DB_ENSURED
+        db.DB_PATH = os.path.join(self._tmp_db_dir, "data.db")
+        db._DB_ENSURED = False
+        db.ensure_db()
+        xcc.clear_source_hash_cache()
+        self.addCleanup(self._restore_db)
+
         self.get_calls = []
         self.get_responses = []  # 按调用次序消费；单个则重复返回
 
@@ -137,6 +151,11 @@ class CrossCloudCopyTestBase(unittest.TestCase):
         for patcher in self._patchers:
             patcher.start()
         self.addCleanup(self._stop_all)
+
+    def _restore_db(self):
+        db.DB_PATH = self._orig_db_path
+        db._DB_ENSURED = self._orig_db_ensured
+        shutil.rmtree(self._tmp_db_dir, ignore_errors=True)
 
     def _stop_all(self):
         for patcher in self._patchers:
@@ -424,6 +443,180 @@ class TestIdempotency(CrossCloudCopyTestBase):
         self.target.list_entries_payload = failing_list
         result = self._copy(filename="exists.mkv", size=1500, check_existing=True)
         self.assertEqual(result.status, "rapid")
+
+
+class _HashSource(_FakeProvider):
+    """带可选哈希能力的源网盘（用来观察是否真的问过 provider）。"""
+
+    def __init__(self, *args, file_hash=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.file_hash = {} if file_hash is None else file_hash
+        self.hash_calls = 0
+
+    def get_file_hash(self, cookie, file_id):
+        self.hash_calls += 1
+        if isinstance(self.file_hash, Exception):
+            raise self.file_hash
+        return self.file_hash
+
+
+class _RapidTarget(_FakeProvider):
+    """秒传命中即返回，绝不读取 sink（读一下就会触发惰性下载）。"""
+
+    def upload_file(
+        self,
+        cookie,
+        sink,
+        filename,
+        target_dir_id="0",
+        *,
+        sha1="",
+        md5="",
+        size=-1,
+        progress_cb=None,
+        cancel_check=None,
+        **kwargs,
+    ):
+        self.upload_calls.append({"filename": filename, "sha1": sha1, "md5": md5, "size": size})
+        if progress_cb is not None:
+            try:
+                progress_cb(size, size)
+            except Exception:
+                pass
+        if isinstance(self.upload_result, Exception):
+            raise self.upload_result
+        return self.upload_result
+
+
+class TestMediaHashCacheIntegration(CrossCloudCopyTestBase):
+    """哈希备忘录接进复制引擎后的行为（命中 / 沉淀 / 脏缓存自愈 / 故障降级）。"""
+
+    def setUp(self):
+        super().setUp()
+        self.data = b"h" * 5000
+        self.sha1 = hashlib.sha1(self.data).hexdigest().upper()
+        # 每个用例自己传 source/target，这里只占位（_copy 的默认值会读这两个属性）
+        self.source = None
+        self.target = None
+
+    def _source(self, file_id):
+        return _HashSource(
+            "quark",
+            download_info={
+                "url": f"https://cdn.example.com/{file_id}",
+                "size": len(self.data),
+                "file_name": f"{file_id}.mkv",
+            },
+        )
+
+    def test_cache_hit_skips_provider_hash_and_download(self):
+        # 小写写入也应命中（内部统一大写）
+        media_hash_cache.remember_file_hash("quark", "fid-cache", len(self.data), self.sha1.lower())
+        source = self._source("fid-cache")
+        target = _RapidTarget("115", supports_upload=True, upload_result=_rapid_result())
+
+        result = self._copy(
+            source_provider=source,
+            target_provider=target,
+            source_file_id="fid-cache",
+            size=len(self.data),
+            filename="cached.mkv",
+        )
+
+        self.assertEqual(result.status, "rapid")
+        self.assertEqual(result.sha1, self.sha1)
+        self.assertEqual(result.message, "秒传命中，未产生下载流量")
+        self.assertEqual(source.hash_calls, 0)  # 没问 provider
+        self.assertEqual(self.get_calls, [])  # 一个下载请求都没发
+        self.assertEqual(target.upload_calls[0]["sha1"], self.sha1)
+        self.assertEqual(target.upload_calls[0]["size"], len(self.data))
+
+    def test_successful_copy_remembers_hash(self):
+        source = self._source("fid-write")
+        target = _RapidTarget("115", supports_upload=True, upload_result=_rapid_result())
+        self.get_responses = [_FakeResponse(200, _chunked(self.data))]
+
+        result = self._copy(
+            source_provider=source,
+            target_provider=target,
+            source_file_id="fid-write",
+            size=len(self.data),
+            filename="w.mkv",
+        )
+
+        self.assertEqual(result.sha1, self.sha1)
+        self.assertEqual(
+            media_hash_cache.lookup_file_hash("quark", "fid-write", len(self.data)),
+            self.sha1,
+        )
+
+    def test_dirty_cache_heals_and_recomputes(self):
+        """缓存里的 sha1 是错的：先清缓存，再下载重算，最终成功。"""
+        wrong_sha1 = hashlib.sha1(b"stale-content").hexdigest().upper()
+        media_hash_cache.remember_file_hash("quark", "fid-dirty", len(self.data), wrong_sha1)
+        source = self._source("fid-dirty")
+        target = _FakeProvider("115", supports_upload=True, upload_result=_uploaded_result())
+        self.get_responses = [_FakeResponse(200, _chunked(self.data))]
+
+        forget_spy = MagicMock(wraps=media_hash_cache.forget_file_hash)
+        with patch.object(media_hash_cache, "forget_file_hash", forget_spy):
+            result = self._copy(
+                source_provider=source,
+                target_provider=target,
+                source_file_id="fid-dirty",
+                size=len(self.data),
+                filename="d.mkv",
+            )
+
+        # 自愈分支必须真的执行过：清过一次脏缓存
+        forget_spy.assert_called_once_with("quark", "fid-dirty")
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.sha1, self.sha1)
+        # 第一次走零流量路径（上传时才下载）校验失败 → 必须重新下载算哈希
+        self.assertTrue(self.get_calls)
+        self.assertEqual(target.upload_calls[-1]["sha1"], self.sha1)
+        self.assertEqual(target.upload_calls[-1]["md5"], hashlib.md5(self.data).hexdigest())
+        self.assertEqual(source.hash_calls, 0)  # 夸克没哈希能力，不该去问
+        # 脏缓存被替换成重算后的正确值
+        self.assertEqual(
+            media_hash_cache.lookup_file_hash("quark", "fid-dirty", len(self.data)),
+            self.sha1,
+        )
+
+    def test_clean_cache_hit_needs_no_download(self):
+        """对照组：缓存正确时一点下载都不该发生（防止自愈逻辑误伤正常路径）。"""
+        media_hash_cache.remember_file_hash("quark", "fid-clean", len(self.data), self.sha1)
+        source = self._source("fid-clean")
+        target = _RapidTarget("115", supports_upload=True, upload_result=_rapid_result())
+
+        self._copy(
+            source_provider=source,
+            target_provider=target,
+            source_file_id="fid-clean",
+            size=len(self.data),
+            filename="c.mkv",
+        )
+
+        self.assertEqual(self.get_calls, [])
+
+    def test_cache_failures_do_not_break_copy(self):
+        source = self._source("fid-boom")
+        target = _RapidTarget("115", supports_upload=True, upload_result=_rapid_result())
+        self.get_responses = [_FakeResponse(200, _chunked(self.data))]
+
+        with patch.object(media_hash_cache, "lookup_file_hash", side_effect=RuntimeError("db down")), patch.object(
+            media_hash_cache, "remember_file_hash", side_effect=RuntimeError("db down")
+        ):
+            result = self._copy(
+                source_provider=source,
+                target_provider=target,
+                source_file_id="fid-boom",
+                size=len(self.data),
+                filename="b.mkv",
+            )
+
+        self.assertEqual(result.status, "rapid")
+        self.assertEqual(result.sha1, self.sha1)
 
 
 class TestOrphanCleanup(unittest.TestCase):

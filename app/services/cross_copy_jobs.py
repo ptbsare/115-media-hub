@@ -4,6 +4,7 @@
 复用任务中心的展示 / 取消 / 重试框架，不破坏资源导入链路。
 
 生命周期：pending → running → completed / failed / cancelled / skipped
+- 排队：全局同时只跑 MAX_CONCURRENT_JOBS 个任务，其余 pending 排 FIFO 队列
 - 取消：内存取消集合 + DB 状态双保险；取消后不自动重试（显式 retry 才重来）
 - 重试：整任务重来（断点续传由各 provider 自行处理，当前三家均为 False）
 - 启动恢复：把残留的 running/pending 任务重新入队（防重启丢任务）
@@ -11,6 +12,7 @@
 
 import asyncio
 import logging
+import os
 import threading
 import time
 from typing import Any, Dict, List, Optional
@@ -19,6 +21,7 @@ from ..background import submit_background
 from ..core import get_config, safe_json_dumps, safe_json_loads
 from ..db import db_connection, ensure_db, now_text, sqlite_row_to_dict
 from ..providers.registry import get_or_none as _get_provider_or_none
+from ..providers.registry import label_for as _provider_label
 from . import cross_cloud_copy as xcc
 from . import cross_cloud_copy_folder as xccf
 from .notify import (
@@ -49,6 +52,40 @@ STATUS_CANCELLED = "cancelled"
 STATUS_SKIPPED = "skipped"
 
 ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING}
+
+# 全局并发上限：同时执行的跨盘复制任务数。
+# 单个任务内部已经按 Range 分段并发下载，2 个并行基本能跑满带宽；
+# 再多只会互相抢带宽，还会把 115 秒传 / 夸克取链打出 405 与风控。
+DEFAULT_MAX_CONCURRENT = 2
+MAX_CONCURRENT_HARD_LIMIT = 8
+
+
+def _resolve_max_concurrent() -> int:
+    """读 CROSS_COPY_MAX_CONCURRENT（1~8），没填或填了非法值都回落默认 2。"""
+    raw = str(os.environ.get("CROSS_COPY_MAX_CONCURRENT", "") or "").strip()
+    if not raw:
+        return DEFAULT_MAX_CONCURRENT
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_CONCURRENT
+    if value < 1 or value > MAX_CONCURRENT_HARD_LIMIT:
+        return DEFAULT_MAX_CONCURRENT
+    return value
+
+
+MAX_CONCURRENT_JOBS = _resolve_max_concurrent()
+
+# 排队状态（进程内）：_queued 是按入队顺序等待的任务，_active 是已经占住名额的。
+# 用 threading.Lock 而不是 asyncio 原语：submit 可能从线程池里调用
+# （订阅补源走 asyncio.to_thread），锁必须能跨线程用。
+_queued: List[int] = []
+_active: set = set()
+_sched_lock = threading.Lock()
+
+# 防重复执行（同一个 job 不会被两个协程同时跑）
+_running: set = set()
+_running_lock = threading.Lock()
 
 
 def _normalize_status(value: Any) -> str:
@@ -210,6 +247,8 @@ def cancel_cross_copy_job(job_id: int) -> Dict[str, Any]:
     with _cancel_lock:
         _cancel_requested.add(job_id)
     if status == STATUS_PENDING:
+        # 还在排队：直接从队列摘掉，别让空出来的名额把它捡起来
+        _discard_from_queue(job_id)
         _finalize_cancelled(job_id, "已取消（尚未开始）")
     return {"ok": True, "msg": "已请求取消"}
 
@@ -252,20 +291,71 @@ def retry_cross_copy_job(job_id: int) -> Dict[str, Any]:
 
 
 def submit_cross_copy_job(job_id: int) -> None:
-    """后台执行任务（防重复提交）。"""
+    """把任务放进等待队列并触发调度。
+
+    这里只负责「排队 + 叫一声调度器」，真正能不能开跑由全局并发上限决定；
+    队列里的任务不占名额，所以粘 20 个文件不会同时起 20 个下载线程。
+    """
     job_id = int(job_id)
-    if job_id in _running_jobs():
-        return
-    submit_background(run_cross_copy_job, job_id, label=f"cross-copy-job-{job_id}")
+    with _sched_lock:
+        if job_id in _active or job_id in _queued:
+            return
+        _queued.append(job_id)
+    _schedule()
 
 
-def _running_jobs() -> set:
-    with _running_lock:
-        return set(_running)
+def _schedule() -> None:
+    """有空闲名额就按 FIFO 拉起排队任务。
+
+    名额在「派发」这一刻就记进 _active，任务结束时由 run_cross_copy_job 的
+    finally 归还。派发本身失败（后台运行器起不来）也必须把名额还回去，
+    否则一个卡住的派发就能把整个队列永久堵死。
+    """
+    while True:
+        with _sched_lock:
+            if not _queued or len(_active) >= MAX_CONCURRENT_JOBS:
+                break
+            job_id = _queued.pop(0)
+            _active.add(job_id)
+        try:
+            submit_background(run_cross_copy_job, job_id, label=f"cross-copy-job-{job_id}")
+        except Exception as exc:  # noqa: BLE001 - 起不来也要还名额，别拖死队列
+            logger.exception("cross-copy job %s submit failed", job_id)
+            _release_slot(job_id)
+            _fail_job(job_id, f"任务启动失败：{exc}")
+    _refresh_queue_details()
 
 
-_running: set = set()
-_running_lock = threading.Lock()
+def _release_slot(job_id: int) -> None:
+    """归还并发名额。必须在 finally 里调用，漏一次就少一个坑位。"""
+    with _sched_lock:
+        _active.discard(int(job_id))
+
+
+def _refresh_queue_details() -> None:
+    """把「前面还有几个任务」写回排队中的任务，让用户看到真实位置。"""
+    with _sched_lock:
+        waiting = list(_queued)
+        ahead_base = len(_active)
+    try:
+        for index, job_id in enumerate(waiting):
+            update_cross_copy_job(job_id, status_detail=_queue_waiting_detail(ahead_base + index))
+    except Exception as exc:  # noqa: BLE001 - 文案写不进去不影响调度
+        logger.info("cross-copy queue detail refresh skipped: %s", exc)
+
+
+def _queue_waiting_detail(ahead: int) -> str:
+    return f"排队中：前面还有 {max(0, int(ahead))} 个任务"
+
+
+def _discard_from_queue(job_id: int) -> None:
+    """把任务从等待队列里摘掉（取消用），别让后面的空闲名额把它捡起来跑。"""
+    job_id = int(job_id)
+    with _sched_lock:
+        try:
+            _queued.remove(job_id)
+        except ValueError:
+            pass
 
 
 def _clear_job_progress(job_id: int) -> None:
@@ -440,6 +530,10 @@ async def run_cross_copy_job(job_id: int) -> None:
         if not target_cookie:
             raise xcc.CrossCloudCopyError(f"请先在参数配置中填写{target_provider.label}认证信息")
 
+        # 订阅补源这类调用只给了「保存到哪个路径」，没给目录 id。这里必须先把路径
+        # 换成真实目录 id，否则上传会落到根目录（看起来成功，其实存错地方）。
+        job = _ensure_target_dir_id(job, target_provider, target_cookie)
+
         update_cross_copy_job(job_id, status_detail="开始复制")
         if not str(job.get("target_path", "") or "").strip():
             early_target_path = _join_pan_path(job.get("target_savepath"), job.get("filename"))
@@ -534,6 +628,49 @@ async def run_cross_copy_job(job_id: int) -> None:
             _cancel_requested.discard(job_id)
         with _running_lock:
             _running.discard(job_id)
+        # 无论成功/失败/取消/异常，都必须还名额并拉起下一个排队的任务
+        _release_slot(job_id)
+        _schedule()
+
+
+def _ensure_target_dir_id(
+    job: Dict[str, Any],
+    target_provider,
+    target_cookie: str,
+) -> Dict[str, Any]:
+    """补齐目标目录 id。
+
+    两条入口给的字段不一样：界面上建任务的是「目录 id」，订阅补源给的是
+    「保存到哪个路径」。后者如果不换成目录 id，上传会落到根目录——文件确实
+    传上去了，但存错地方，用户很难发现。这里就地补一次并写回任务记录。
+
+    解析失败不阻断：抛明确错误比悄悄传到根目录好。
+    """
+    existing = str(job.get("target_dir_id", "") or "").strip()
+    if existing:
+        return job
+    savepath = str(job.get("target_savepath", "") or "").strip()
+    if not savepath:
+        return job
+    resolver = getattr(target_provider, "ensure_folder_id_by_path", None)
+    if not callable(resolver):
+        raise xcc.CrossCloudCopyError(
+            f"{getattr(target_provider, 'label', '目标网盘') or '目标网盘'} 无法按路径定位保存目录"
+        )
+    try:
+        resolved = str(resolver(target_cookie, savepath) or "").strip()
+    except Exception as exc:  # noqa: BLE001 - 统一翻成人话
+        raise xcc.CrossCloudCopyError(f"在目标网盘创建保存目录失败：{exc}") from exc
+    if not resolved:
+        raise xcc.CrossCloudCopyError(f"在目标网盘找不到保存目录：{savepath}")
+    job["target_dir_id"] = resolved
+    try:
+        job_id = int(job.get("id") or 0)
+    except (TypeError, ValueError):
+        job_id = 0
+    if job_id:
+        update_cross_copy_job(job_id, target_dir_id=resolved)
+    return job
 
 
 def _job_source_is_dir(job: Dict[str, Any]) -> bool:
@@ -617,8 +754,9 @@ def _push_cross_copy_notification(cfg: Dict[str, Any], job: Dict[str, Any], *, o
     runtime_cfg = build_notify_runtime_config(cfg)
     if not bool(runtime_cfg.get("enabled", False)):
         return
-    source_label = str(job.get("source_provider", "") or "")
-    target_label = str(job.get("target_provider", "") or "")
+    # 通知里要给人看的网盘名，不能直接拼内部代号（否则会显示 tianyi 这种英文）
+    source_label = _provider_label(str(job.get("source_provider", "") or ""), default="源网盘")
+    target_label = _provider_label(str(job.get("target_provider", "") or ""), default="目标网盘")
     title = str(job.get("title", "") or job.get("filename", "") or "文件")
     if ok:
         content = "\n".join(
@@ -646,7 +784,11 @@ def _push_cross_copy_notification(cfg: Dict[str, Any], job: Dict[str, Any], *, o
 
 
 def requeue_cross_copy_jobs_on_startup() -> Dict[str, int]:
-    """启动恢复：重启前残留的 pending/running 任务重新入队。"""
+    """启动恢复：重启前残留的 pending/running 任务重新入队。
+
+    走的是和新建任务同一条排队路径（submit → _schedule），
+    重启后一次涌入几十个任务也不会同时开跑。
+    """
     ensure_db()
     requeued = 0
     with db_connection() as conn:
@@ -671,5 +813,6 @@ def requeue_cross_copy_jobs_on_startup() -> Dict[str, int]:
 
 
 def _stale_job_ids() -> List[int]:
+    """待恢复的任务按 job id 升序排队（先建的先跑）。"""
     jobs = list_cross_copy_jobs(limit=100, status=STATUS_PENDING)
-    return [int(job["id"]) for job in jobs]
+    return sorted(int(job["id"]) for job in jobs)

@@ -133,6 +133,7 @@
 | `app/services/sign115.py` | 115 每日签到 |
 | `app/services/cross_cloud_copy.py` | 跨盘复制引擎（P0-B）：源直链下载 + 同步 SHA1/MD5 + 内存/磁盘双通道 + 目标秒传/分片上传 + 取消/换链重试/幂等/孤儿清理；零流量路径（源端已知哈希 + 惰性 sink，秒传命中不下载）与分段下载（Range，绕开整文件流限速） |
 | `app/services/cross_cloud_copy_folder.py` | 整文件夹跨盘复制：BFS 递归建清单（上限 2000 文件 / 20 层，超限拒绝）、目标端逐级建目录、字节加权进度、单文件失败继续并汇总 partial |
+| `app/services/media_hash_cache.py` | 文件哈希备忘录（media_hash_cache）：按 (provider, file_id) 沉淀已确认的 SHA1，查缓存校验 size、30 天过期，供跨盘复制复用零流量秒传；缓存故障不影响复制主流程 |
 | `app/services/local_storage.py` | 本地存储位置管理：位置列表归一化/去重、目录可用性探测、暂存目录解析、磁盘空间预检 |
 | `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知 |
 | `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |
