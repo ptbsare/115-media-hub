@@ -812,6 +812,44 @@ def requeue_cross_copy_jobs_on_startup() -> Dict[str, int]:
     return {"requeued": requeued}
 
 
+def cleanup_temp_files_on_startup() -> Dict[str, int]:
+    """扫掉异常退出留下的半截临时文件，返回清掉的数量。
+
+    正常完成/失败的任务都在 ``finally`` 里自己删临时文件，只有容器被杀、进程
+    崩溃这类硬中断才会留下 ``xcopy-*.part``。这些文件没人认领，不清理就会一直
+    占着磁盘，所以启动时扫一遍、长期运行时再按间隔扫一遍。
+
+    清理失败不影响主流程：临时文件占的是磁盘，不该把服务拉不起来。
+    """
+    removed = 0
+    try:
+        cfg = get_config()
+        temp_dir = xcc.resolve_temp_dir(cfg)
+        if temp_dir:
+            removed = int(xcc.cleanup_orphan_temp_files(temp_dir) or 0)
+            if removed:
+                logger.info("cross-copy orphan temp files cleaned: %s in %s", removed, temp_dir)
+    except Exception as exc:  # noqa: BLE001 - 清理失败不阻断启动
+        logger.warning("cross-copy orphan temp cleanup skipped: %s", exc)
+    return {"removed": removed}
+
+
+# 容器长期运行时的兜底扫描间隔。孤儿文件本来就不多，30 分钟一次足够，
+# 又不会把磁盘 IO 花在空扫描上。
+TEMP_CLEANUP_INTERVAL_SECONDS = 30 * 60
+
+
+async def cross_copy_temp_cleanup_watcher() -> None:
+    """定时清理半截临时文件（容器长期运行、没有重启机会时的兜底）。"""
+    await asyncio.sleep(60)
+    while True:
+        try:
+            await asyncio.to_thread(cleanup_temp_files_on_startup)
+        except Exception as exc:  # noqa: BLE001 - 定时任务不能把循环打死
+            logger.warning("跨盘复制临时文件定期清理失败：%s", exc)
+        await asyncio.sleep(TEMP_CLEANUP_INTERVAL_SECONDS)
+
+
 def _stale_job_ids() -> List[int]:
     """待恢复的任务按 job id 升序排队（先建的先跑）。"""
     jobs = list_cross_copy_jobs(limit=100, status=STATUS_PENDING)

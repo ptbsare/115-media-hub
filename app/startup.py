@@ -23,7 +23,11 @@ from .services.resource import (
 from .services.sign115 import refresh_sign115_status, run_sign115_job
 from .services.subscription import queue_subscription_job
 from .services.scraper import requeue_scraper_jobs_on_startup
-from .services.cross_copy_jobs import requeue_cross_copy_jobs_on_startup
+from .services.cross_copy_jobs import (
+    requeue_cross_copy_jobs_on_startup,
+    cleanup_temp_files_on_startup,
+    cross_copy_temp_cleanup_watcher,
+)
 from .services.monitor_runs import (
     cleanup_runs,
     reconcile_waiting_runs,
@@ -124,6 +128,11 @@ async def startup() -> None:
         requeue_cross_copy_jobs_on_startup()
     except Exception:
         logging.exception("Failed to requeue cross-copy jobs on startup")
+    try:
+        # 上次被杀时留下的半截临时文件没人认领，启动时扫一遍
+        cleanup_temp_files_on_startup()
+    except Exception:
+        logging.exception("Failed to clean cross-copy temp files on startup")
     os.makedirs(LOG_DIR, exist_ok=True)
     restore_runtime_logs_from_files()
 
@@ -321,6 +330,7 @@ async def startup() -> None:
     asyncio.create_task(monitor_scheduler())
     asyncio.create_task(offline_completion_watcher())
     asyncio.create_task(subscription_offline_staging_cleanup_watcher())
+    asyncio.create_task(cross_copy_temp_cleanup_watcher())
     asyncio.create_task(subscription_scheduler())
     asyncio.create_task(sign115_scheduler())
     asyncio.create_task(memory_housekeeper())

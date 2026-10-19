@@ -860,5 +860,33 @@ class TestTargetDirIdResolution(CrossCopyJobsTestBase):
         self.assertIn("/云下载/电影", job["status_detail"])
 
 
+class TestStartupTempCleanup(CrossCopyJobsTestBase):
+    """启动时要扫掉上次硬中断留下的半截临时文件（此前只测过函数，没人调它）。"""
+
+    def test_cleans_orphan_files_in_resolved_temp_dir(self):
+        temp_root = tempfile.mkdtemp(prefix="xcopy-start-", dir=self.tmp)
+        old = os.path.join(temp_root, "xcopy-crashed.part")
+        with open(old, "w") as fh:
+            fh.write("x")
+        os.utime(old, (0, 0))
+
+        with patch.object(xcc, "resolve_temp_dir", return_value=temp_root):
+            result = ccj.cleanup_temp_files_on_startup()
+
+        self.assertEqual(result["removed"], 1)
+        self.assertFalse(os.path.exists(old))
+
+    def test_cleanup_failure_does_not_raise(self):
+        """清理出错不能把启动拉不起来。"""
+        with patch.object(xcc, "resolve_temp_dir", side_effect=RuntimeError("配置坏了")):
+            result = ccj.cleanup_temp_files_on_startup()
+        self.assertEqual(result["removed"], 0)
+
+    def test_no_temp_dir_is_noop(self):
+        with patch.object(xcc, "resolve_temp_dir", return_value=""):
+            result = ccj.cleanup_temp_files_on_startup()
+        self.assertEqual(result["removed"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
