@@ -26,7 +26,7 @@
                                        网盘浏览
   115 share preview|receive|preview-batch  分享管理
   115 scrape identify|rename-plan|rename|diff|jobs|providers|entries|folders|rename-warning|jobs-create|move|copy|delete|rollback|jobs-clear|batch-preferences
-                                       刮削管理
+                                       文件管理（刮削/重命名）
   115 watchlist list|add|remove|update  推荐清单
   115 strm orphans|cleanup|dirs         STRM 管理
   115 resource import|preview|quick-links|delete
@@ -1454,7 +1454,7 @@ def _build_scrape_plan_options(args) -> Dict[str, Any]:
 
 
 def cmd_scrape(args, c: Client):
-    """刮削管理"""
+    """文件管理（网盘文件浏览 / 重命名 / 复制 / 移动）"""
     if args.action == "identify":
         path = " ".join(args.path) if args.path else ""
         if not path:
@@ -2271,7 +2271,7 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_share.add_argument("--limit", type=int, default=0, help="分页条数 (preview)")
 
     # scrape
-    sp_scrape = sp.add_parser("scrape", help="刮削管理")
+    sp_scrape = sp.add_parser("scrape", help="文件管理（刮削/重命名）")
     sp_scrape.add_argument("action", choices=["identify", "rename-plan", "diff", "jobs", "providers", "entries", "folders", "rename", "rename-warning", "jobs-create", "move", "copy", "delete", "rollback", "jobs-clear", "batch-preferences"])
     sp_scrape.add_argument("path", nargs="*", help="文件路径 (identify/rename-plan/move/copy/delete/rename/rename-warning/jobs-create) 或子动作 get|set|clear (batch-preferences)")
     sp_scrape.add_argument("--job-id", default="", help="Job ID (diff/rollback)")

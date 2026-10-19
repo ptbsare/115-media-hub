@@ -1,0 +1,321 @@
+<style>
+    .cc-modal-shell {
+        display: flex;
+        flex-direction: column;
+        max-height: 92vh;
+    }
+    .cc-modal-header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 18px 20px 12px;
+    }
+    .cc-modal-title {
+        font-size: 1.05rem;
+        font-weight: 900;
+        letter-spacing: 0.01em;
+    }
+    .cc-modal-subtitle {
+        margin-top: 4px;
+        font-size: 0.76rem;
+        opacity: 0.72;
+        line-height: 1.5;
+    }
+    .cc-modal-body {
+        display: grid;
+        grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+        gap: 14px;
+        padding: 0 20px;
+        min-height: 0;
+        flex: 1 1 auto;
+    }
+    .cc-pane {
+        display: flex;
+        flex-direction: column;
+        min-width: 0;
+        min-height: 0;
+        border: 1px solid rgba(148, 163, 184, 0.18);
+        border-radius: 16px;
+        background: rgba(15, 23, 42, 0.35);
+        overflow: hidden;
+    }
+    .cc-pane-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 10px;
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.14);
+    }
+    .cc-pane-title {
+        font-size: 0.82rem;
+        font-weight: 800;
+    }
+    .cc-select {
+        max-width: 55%;
+        border-radius: 10px;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        background: rgba(2, 6, 23, 0.6);
+        color: inherit;
+        font-size: 0.78rem;
+        font-weight: 700;
+        padding: 6px 8px;
+    }
+    .cc-trail {
+        display: flex;
+        align-items: center;
+        gap: 4px;
+        padding: 8px 12px;
+        overflow-x: auto;
+        white-space: nowrap;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+        scrollbar-width: thin;
+    }
+    .cc-trail-btn {
+        border: 0;
+        background: transparent;
+        color: inherit;
+        font-size: 0.75rem;
+        font-weight: 700;
+        opacity: 0.72;
+        cursor: pointer;
+        padding: 2px 4px;
+        border-radius: 6px;
+    }
+    .cc-trail-btn:hover:not(:disabled) { opacity: 1; background: rgba(148, 163, 184, 0.14); }
+    .cc-trail-btn.is-current { opacity: 1; cursor: default; }
+    .cc-trail-sep { opacity: 0.4; font-size: 0.72rem; }
+    .cc-list {
+        flex: 1 1 auto;
+        min-height: 180px;
+        max-height: 46vh;
+        overflow-y: auto;
+        padding: 6px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+    }
+    .cc-entry {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        width: 100%;
+        border: 1px solid transparent;
+        background: transparent;
+        color: inherit;
+        border-radius: 10px;
+        padding: 8px 10px;
+        font-size: 0.82rem;
+        text-align: left;
+        cursor: pointer;
+    }
+    .cc-entry:hover { background: rgba(148, 163, 184, 0.12); }
+    .cc-entry.is-selected {
+        background: rgba(56, 189, 248, 0.16);
+        border-color: rgba(56, 189, 248, 0.42);
+    }
+    .cc-entry-icon { flex: 0 0 auto; font-size: 0.92rem; }
+    .cc-entry-name {
+        flex: 1 1 auto;
+        min-width: 0;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+    }
+    .cc-entry-meta { flex: 0 0 auto; font-size: 0.72rem; opacity: 0.62; }
+    .cc-entry-check {
+        flex: 0 0 auto;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 18px;
+        height: 18px;
+        border-radius: 6px;
+        border: 1px solid rgba(148, 163, 184, 0.4);
+        font-size: 0.66rem;
+        line-height: 1;
+        font-weight: 900;
+        color: transparent;
+    }
+    .cc-entry.is-selected .cc-entry-check {
+        background: #0284c7;
+        border-color: #0284c7;
+        color: #f8fafc;
+    }
+    /* 源侧文件夹右侧的「进入 ›」：点它才进目录，点整行是选中整个文件夹 */
+    .cc-entry-enter {
+        flex: 0 0 auto;
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 8px;
+        padding: 1px 6px;
+        font-size: 0.68rem;
+        font-weight: 700;
+        opacity: 0.72;
+        white-space: nowrap;
+    }
+    .cc-entry-enter:hover { opacity: 1; background: rgba(148, 163, 184, 0.18); }
+    .cc-selbar {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        flex-wrap: wrap;
+        gap: 8px;
+        padding: 6px 12px;
+        font-size: 0.74rem;
+        border-bottom: 1px solid rgba(148, 163, 184, 0.1);
+    }
+    .cc-selbar-text { opacity: 0.78; font-variant-numeric: tabular-nums; }
+    .cc-selbar-actions { display: flex; gap: 6px; }
+    .cc-selbar-btn {
+        border: 1px solid rgba(148, 163, 184, 0.28);
+        border-radius: 8px;
+        padding: 4px 9px;
+        font-size: 0.72rem;
+        font-weight: 700;
+        color: inherit;
+        background: rgba(2, 6, 23, 0.35);
+        cursor: pointer;
+    }
+    .cc-selbar-btn:hover:not(:disabled) { background: rgba(148, 163, 184, 0.18); }
+    .cc-selbar-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+    .cc-list-empty {
+        padding: 20px 12px;
+        font-size: 0.8rem;
+        opacity: 0.72;
+        text-align: center;
+    }
+    .cc-list-error { color: #fca5a5; opacity: 1; }
+    .cc-modal-footer {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        flex-wrap: wrap;
+        padding: 14px 20px 18px;
+        border-top: 1px solid rgba(148, 163, 184, 0.12);
+        margin-top: 14px;
+    }
+    .cc-summary-block {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        min-width: 0;
+        flex: 1 1 260px;
+    }
+    .cc-summary {
+        font-size: 0.78rem;
+        line-height: 1.5;
+        min-width: 0;
+        opacity: 0.86;
+        word-break: break-all;
+    }
+    .cc-summary-note {
+        font-size: 0.75rem;
+        line-height: 1.5;
+        color: #fca5a5;
+        word-break: break-all;
+    }
+    .cc-modal-actions { display: flex; gap: 8px; }
+    .cc-btn {
+        border: 0;
+        border-radius: 12px;
+        padding: 9px 16px;
+        font-size: 0.84rem;
+        font-weight: 800;
+        cursor: pointer;
+    }
+    .cc-btn-ghost { background: rgba(148, 163, 184, 0.18); color: inherit; }
+    .cc-btn-primary { background: #0284c7; color: #f8fafc; }
+    .cc-btn-primary:hover:not(:disabled) { background: #0ea5e9; }
+    .cc-btn:disabled, .cc-btn.btn-disabled { opacity: 0.45; cursor: not-allowed; }
+    .cc-job-card { border-radius: 16px; }
+    .cc-job-progress { margin: 8px 0 4px; }
+    .cc-job-progress-head {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        font-size: 0.72rem;
+        opacity: 0.8;
+        margin-bottom: 4px;
+    }
+    .cc-job-progress-track {
+        height: 6px;
+        border-radius: 999px;
+        background: rgba(148, 163, 184, 0.2);
+        overflow: hidden;
+    }
+    .cc-job-progress-track > span {
+        display: block;
+        height: 100%;
+        border-radius: inherit;
+        background: linear-gradient(90deg, #0284c7, #38bdf8);
+        transition: width 0.3s ease;
+    }
+    .cc-job-progress-meta {
+        margin-top: 4px;
+        font-size: 0.7rem;
+        letter-spacing: 0.01em;
+        opacity: 0.72;
+        font-variant-numeric: tabular-nums;
+    }
+    html.theme-day .cc-pane { background: rgba(241, 245, 249, 0.7); border-color: rgba(15, 23, 42, 0.1); }
+    html.theme-day .cc-select { background: #ffffff; border-color: rgba(15, 23, 42, 0.16); }
+    html.theme-day .cc-entry:hover { background: rgba(15, 23, 42, 0.06); }
+    html.theme-day .cc-selbar-btn { background: #ffffff; border-color: rgba(15, 23, 42, 0.16); }
+    html.theme-day .cc-summary-note { color: #b91c1c; }
+    html.theme-day .cc-job-progress-track { background: rgba(15, 23, 42, 0.12); }
+    @media (max-width: 860px) {
+        .cc-modal-body { grid-template-columns: minmax(0, 1fr); }
+        .cc-list { max-height: 30vh; }
+        .cc-modal-footer { align-items: stretch; }
+        .cc-modal-actions { justify-content: flex-end; }
+    }
+</style>
+
+<div id="cross-copy-modal" class="hidden fixed inset-0 bg-black/70 backdrop-blur-sm z-[58] p-4">
+    <div class="w-full max-w-5xl mx-auto mt-[3vh] overflow-hidden group-card modal-card cc-modal-shell">
+        <div class="cc-modal-header">
+            <div class="min-w-0">
+                <div class="cc-modal-title">新建跨盘复制</div>
+                <div class="cc-modal-subtitle">从源网盘勾选要复制的文件（可以多选），也可以直接选一个文件夹整个复制（点文件夹右侧「进入」可查看里面的文件）。目标网盘支持秒传时会自动命中，不消耗上传流量。</div>
+            </div>
+            <button type="button" class="resource-job-modal-close" onclick="closeCrossCopyModal()" aria-label="关闭新建复制">✕</button>
+        </div>
+        <div class="cc-modal-body">
+            <section class="cc-pane">
+                <div class="cc-pane-head">
+                    <span class="cc-pane-title">① 源文件</span>
+                    <select id="cross-copy-source-provider" class="cc-select" aria-label="源网盘" onchange="onCrossCopySourceProviderChange(this.value)"></select>
+                </div>
+                <div id="cross-copy-source-trail" class="cc-trail"></div>
+                <div class="cc-selbar">
+                    <span id="cross-copy-source-selection" class="cc-selbar-text">还没有选择文件</span>
+                    <div class="cc-selbar-actions">
+                        <button id="cross-copy-select-all" type="button" class="cc-selbar-btn" onclick="selectAllCrossCopySources()">全选本页</button>
+                        <button id="cross-copy-clear-selection" type="button" class="cc-selbar-btn" onclick="clearCrossCopySelection()">清空选择</button>
+                    </div>
+                </div>
+                <div id="cross-copy-source-list" class="cc-list"></div>
+            </section>
+            <section class="cc-pane">
+                <div class="cc-pane-head">
+                    <span class="cc-pane-title">② 目标目录</span>
+                    <select id="cross-copy-target-provider" class="cc-select" aria-label="目标网盘" onchange="onCrossCopyTargetProviderChange(this.value)"></select>
+                </div>
+                <div id="cross-copy-target-trail" class="cc-trail"></div>
+                <div id="cross-copy-target-list" class="cc-list"></div>
+            </section>
+        </div>
+        <div class="cc-modal-footer">
+            <div class="cc-summary-block">
+                <div id="cross-copy-summary" class="cc-summary">请选择要复制的文件</div>
+                <div id="cross-copy-summary-note" class="cc-summary-note hidden"></div>
+            </div>
+            <div class="cc-modal-actions">
+                <button type="button" class="cc-btn cc-btn-ghost" onclick="closeCrossCopyModal()">取消</button>
+                <button id="cross-copy-submit" type="button" class="cc-btn cc-btn-primary" onclick="submitCrossCopyTask()" disabled>开始复制</button>
+            </div>
+        </div>
+    </div>
+</div>

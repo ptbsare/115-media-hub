@@ -1,18 +1,49 @@
-import threading
+import base64
+import hashlib
+import json
 import logging
+import mimetypes
+import threading
+import time
 
 import requests
 
-from .base import CloudProvider
+from .base import CloudProvider, UploadError, UploadResult
 from .common import parse_int
 from .registry import register
 from ..share_selection import normalize_share_selection_entry, normalize_share_selection_meta
 from ..core import *  # noqa: F401,F403
 
 _quark_http_local = threading.local()
+
+# 夸克每次 API 响应都会用 Set-Cookie 轮换 __puus（有时含 __pus），下载直链的 CDN 回调
+# 按它校验登录态。只带配置里的静态 cookie 去下载会被拒：
+# 403 RequestDeniedByCallback / require login [auth expired]。
+# 这里缓存轮换结果，并节流写回配置，保证后续请求和下载都用最新值。
+_QUARK_COOKIE_LOCK = threading.RLock()
+_QUARK_COOKIE_ROTATED: Dict[str, str] = {}
+_QUARK_COOKIE_PERSIST_AT = 0.0
+_QUARK_COOKIE_PERSIST_INTERVAL = 60.0
+_QUARK_COOKIE_CACHE_MAX_ROWS = 64
+_QUARK_ROTATION_NAMES = ("__puus", "__pus")
 _QUARK_BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+)
+# 夸克网关按身份限制 file/download：浏览器身份取直链时，单文件超过免费额度直接返回
+# HTTP 400 / code 23018 "download file size limit"（实测 2.6GB 视频必拦）；
+# 换成客户端身份（quark-cloud-drive + Channel/pckk_other_ch）可正常拿到直链。
+# 注意：只对取直链这一个接口用客户端 UA，其余接口仍用浏览器 UA。
+_QUARK_CLIENT_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) quark-cloud-drive/2.5.56 Chrome/100.0.4896.160 "
+    "Electron/18.3.5.12 Safari/537.36 Channel/pckk_other_ch"
+)
+_QUARK_SIZE_LIMIT_CODES = (23018,)
+_QUARK_SIZE_LIMIT_KEYWORD = "download file size limit"
+_QUARK_SIZE_LIMIT_HINT = (
+    "夸克以网页身份拒绝下载该大文件（非会员单文件限制，code 23018）。"
+    "已尝试以客户端身份重试仍失败，请开通夸克会员或改用其他来源。"
 )
 _QUARK_SHARE_CACHE_TTL_SECONDS = max(60, min(30 * 60, int(SHARE_SNAP_CACHE_TTL_SECONDS or 300)))
 _QUARK_SHARE_TOKEN_CACHE_MAX_ROWS = 256
@@ -322,9 +353,92 @@ def http_request_json_payload(
     payload_json = safe_json_loads(raw, {})
     return payload_json if isinstance(payload_json, dict) else {}
 
+def _split_quark_cookie(cookie: str) -> List[Any]:
+    pairs: List[Any] = []
+    for raw in str(cookie or "").split(";"):
+        item = raw.strip()
+        if "=" not in item:
+            continue
+        name, value = item.split("=", 1)
+        name = name.strip()
+        if name:
+            pairs.append((name, value))
+    return pairs
+
+
+def _current_quark_cookie(cookie: str) -> str:
+    """返回当前最新 cookie（已包含轮换后的 __puus）。"""
+    raw = str(cookie or "").strip()
+    if not raw:
+        return ""
+    with _QUARK_COOKIE_LOCK:
+        return _QUARK_COOKIE_ROTATED.get(raw, raw)
+
+
+def _persist_rotated_quark_cookie(cookie: str) -> None:
+    """把轮换后的 cookie 节流写回配置（失败不影响主流程）。"""
+    global _QUARK_COOKIE_PERSIST_AT
+    now = time.monotonic()
+    with _QUARK_COOKIE_LOCK:
+        if now - _QUARK_COOKIE_PERSIST_AT < _QUARK_COOKIE_PERSIST_INTERVAL:
+            return
+        _QUARK_COOKIE_PERSIST_AT = now
+    try:
+        cfg = get_config()
+        if str(cfg.get("cookie_quark", "") or "").strip() == cookie:
+            return
+        cfg["cookie_quark"] = cookie
+        save_config(cfg)
+    except Exception as exc:  # pragma: no cover - 落盘失败不影响请求
+        logging.debug("夸克 cookie 轮换写回配置失败: %s", exc)
+
+
+def _rotate_quark_cookie(cookie: str, response) -> str:
+    """把响应 Set-Cookie 里的 __puus/__pus 合并进 cookie，返回最新 cookie。"""
+    raw = str(cookie or "").strip()
+    if not raw or response is None:
+        return raw
+    try:
+        cookies = getattr(response, "cookies", None)
+        if cookies is None:
+            return raw
+        updates: Dict[str, str] = {}
+        for name in _QUARK_ROTATION_NAMES:
+            try:
+                value = cookies.get(name)
+            except Exception:
+                value = None
+            if value:
+                updates[name] = str(value)
+        if not updates:
+            return raw
+
+        parts = [f"{name}={updates.get(name, value)}" for name, value in _split_quark_cookie(raw)]
+        known = {name for name, _ in _split_quark_cookie(raw)}
+        for name, value in updates.items():
+            if name not in known:
+                parts.append(f"{name}={value}")
+        merged = "; ".join(parts)
+        if merged == raw:
+            return raw
+
+        with _QUARK_COOKIE_LOCK:
+            if len(_QUARK_COOKIE_ROTATED) >= _QUARK_COOKIE_CACHE_MAX_ROWS:
+                _QUARK_COOKIE_ROTATED.clear()
+            _QUARK_COOKIE_ROTATED[raw] = merged
+            for key, value in list(_QUARK_COOKIE_ROTATED.items()):
+                if value == raw:
+                    _QUARK_COOKIE_ROTATED[key] = merged
+        _persist_rotated_quark_cookie(merged)
+        return merged
+    except Exception as exc:  # pragma: no cover - 轮换失败降级为原 cookie
+        logging.debug("解析夸克 Set-Cookie 失败: %s", exc)
+        return raw
+
+
 def _build_quark_headers(cookie: str, referer: str = "https://pan.quark.cn/") -> Dict[str, str]:
     return {
-        "Cookie": str(cookie or "").strip(),
+        "Cookie": _current_quark_cookie(cookie),
         "Accept": "application/json, text/plain, */*",
         "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-GB;q=0.7,en-US;q=0.6",
         "Connection": "keep-alive",
@@ -340,6 +454,14 @@ def _build_quark_headers(cookie: str, referer: str = "https://pan.quark.cn/") ->
         "Sec-Fetch-Site": "same-site",
         "User-Agent": _QUARK_BROWSER_USER_AGENT,
     }
+
+def _build_quark_client_headers(cookie: str) -> Dict[str, str]:
+    """取下载直链专用头：模拟夸克桌面客户端，绕开网页身份的单文件体积限制。"""
+    headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
+    for key in ("Sec-Ch-Ua", "Sec-Ch-Ua-Mobile", "Sec-Ch-Ua-Platform", "Priority"):
+        headers.pop(key, None)
+    headers["User-Agent"] = _QUARK_CLIENT_USER_AGENT
+    return headers
 
 def _extract_quark_error(payload: Any, fallback: str = "夸克网盘请求失败") -> str:
     data = payload if isinstance(payload, dict) else {}
@@ -361,6 +483,13 @@ def _extract_quark_error(payload: Any, fallback: str = "夸克网盘请求失败
     detail = next((part for part in parts if part), "")
     return detail or str(fallback or "夸克网盘请求失败")
 
+def _is_quark_size_limit_error(payload: Any, detail: str = "") -> bool:
+    """夸克"网页身份下载大文件被拒"（code 23018 / download file size limit）。"""
+    data = payload if isinstance(payload, dict) else {}
+    code = parse_int(data.get("code"), default=0)
+    text = f"{detail or ''} {_extract_quark_error(data, '')}".lower()
+    return code in _QUARK_SIZE_LIMIT_CODES or _QUARK_SIZE_LIMIT_KEYWORD in text
+
 def _raise_quark_http_error(exc: Exception, fallback: str = "夸克网盘请求失败") -> None:
     status_code = 0
     payload: Dict[str, Any] = {}
@@ -381,6 +510,8 @@ def _raise_quark_http_error(exc: Exception, fallback: str = "夸克网盘请求�
         if isinstance(payload_obj, dict):
             payload = payload_obj
     detail = _extract_quark_error(payload, "")
+    if status_code > 0 and _is_quark_size_limit_error(payload, detail):
+        raise RuntimeError(_QUARK_SIZE_LIMIT_HINT) from exc
     if status_code > 0:
         message = f"HTTP {status_code}"
         if detail:
@@ -400,6 +531,7 @@ def _request_quark_json(url: str, headers: Dict[str, str], timeout: int = 45, fa
             headers=headers,
             timeout=max(3, int(timeout or 45)),
         )
+        _rotate_quark_cookie(headers.get("Cookie", ""), response)
         response.raise_for_status()
         try:
             payload = response.json()
@@ -426,6 +558,7 @@ def _request_quark_json_payload(
             headers=headers,
             timeout=max(3, int(timeout or 45)),
         )
+        _rotate_quark_cookie(headers.get("Cookie", ""), response)
         response.raise_for_status()
         try:
             payload_json = response.json()
@@ -653,6 +786,19 @@ def create_quark_folder(cookie: str, cid: str = "0", folder_name: str = "") -> D
     if not normalized_name:
         raise RuntimeError("文件夹名称不能为空")
 
+    def _find_existing_folder() -> str:
+        folder_payload = list_quark_entries_payload(normalized_cookie, parent_id, folders_only=True)
+        entries = folder_payload.get("entries", []) if isinstance(folder_payload.get("entries"), list) else []
+        matched = next(
+            (
+                entry
+                for entry in entries
+                if entry.get("is_dir") and str(entry.get("name", "")).strip() == normalized_name
+            ),
+            None,
+        )
+        return str((matched or {}).get("id", "") or "").strip()
+
     try:
         headers = _build_quark_headers(normalized_cookie, referer="https://pan.quark.cn/")
         url = _build_quark_api_url("/1/clouddrive/file")
@@ -662,29 +808,45 @@ def create_quark_folder(cookie: str, cid: str = "0", folder_name: str = "") -> D
             "dir_path": "",
             "dir_init_lock": False,
         }
-        response = _request_quark_json_payload(
-            url,
-            payload,
-            headers,
-            timeout=45,
-            method="POST",
-            fallback="新建夸克目录失败",
-        )
+        # 夸克在父目录刚创建后立刻建子目录，会瞬时假报「file is doloading[同名冲突]」。
+        # 这类冲突稍等即消失，重试并顺手复用已存在的同名目录，避免跨盘复制因此中断。
+        last_conflict: Optional[Exception] = None
+        response: Dict[str, Any] = {}
+        for attempt in range(4):
+            if attempt:
+                time.sleep(1.2 * attempt)
+            try:
+                response = _request_quark_json_payload(
+                    url,
+                    payload,
+                    headers,
+                    timeout=45,
+                    method="POST",
+                    fallback="新建夸克目录失败",
+                )
+                break
+            except RuntimeError as exc:
+                message = str(exc)
+                if "同名冲突" not in message and "doloading" not in message:
+                    raise
+                last_conflict = exc
+                existing_id = _find_existing_folder()
+                if existing_id:
+                    mark_cookie_health_success("quark", trigger="runtime:create_quark_folder")
+                    return {
+                        "id": existing_id,
+                        "name": normalized_name,
+                        "cid": parent_id,
+                        "created": False,
+                    }
+        else:
+            raise last_conflict or RuntimeError("新建夸克目录失败：同名冲突")
+
         data = response.get("data") if isinstance(response.get("data"), dict) else {}
         folder_id = str(data.get("fid", "") or data.get("id", "") or "").strip()
         success = _is_quark_success(response)
         if (not success) or (not folder_id):
-            folder_payload = list_quark_entries_payload(normalized_cookie, parent_id, folders_only=True)
-            entries = folder_payload.get("entries", []) if isinstance(folder_payload.get("entries"), list) else []
-            matched = next(
-                (
-                    entry
-                    for entry in entries
-                    if entry.get("is_dir") and str(entry.get("name", "")).strip() == normalized_name
-                ),
-                None,
-            )
-            folder_id = str((matched or {}).get("id", "") or "").strip()
+            folder_id = _find_existing_folder()
         if not folder_id:
             raise RuntimeError(_extract_quark_error(response, "新建夸克目录失败"))
         mark_cookie_health_success("quark", trigger="runtime:create_quark_folder")
@@ -1793,6 +1955,418 @@ def submit_quark_share_save(
         raise
 
 
+# === 上传能力（秒传优先：md5+sha1 双哈希 → 未命中走 OSS 分片） ===
+# 链路（对齐社区成熟实现 athunderx/OpenList quark driver）：
+#   /file/upload/pre   → task_id / bucket / obj_key / upload_id / upload_url / auth_info / callback / part_size
+#   /file/update/hash  → data.finish=true 即秒传命中（零上传流量）
+#   每片 /file/upload/auth 拿 auth_key → OSS PUT（partNumber + uploadId）
+#   /file/upload/auth（commit 版）→ OSS POST CompleteMultipartUpload XML（Content-MD5 + x-oss-callback）
+#   /file/upload/finish 收尾
+_QUARK_UPLOAD_DEFAULT_PART_SIZE = 4 * 1024 * 1024
+_QUARK_UPLOAD_PART_SIZE_MIN = 100 * 1024
+_QUARK_UPLOAD_PART_SIZE_MAX = 64 * 1024 * 1024
+_QUARK_OSS_SDK_USER_AGENT = "aliyun-sdk-js/6.6.1 Chrome 98.0.4758.80 on Windows 10 64-bit"
+
+
+def _guess_quark_mime_type(filename: str) -> str:
+    guessed, _ = mimetypes.guess_type(str(filename or ""))
+    return str(guessed or "application/octet-stream")
+
+
+def _map_quark_api_error(resp: Any) -> str:
+    """把夸克接口错误映射为面向用户的文案（上传/下载等写操作共用）。"""
+    payload = resp if isinstance(resp, dict) else {}
+    code = parse_int(payload.get("code"), default=0)
+    message = _extract_quark_error(payload, "")
+    lowered = message.lower()
+    if code in (32011, 32012, 32013) or "cookie" in lowered or "登录" in message or "登录" in lowered:
+        return "夸克登录已失效，请更新 Cookie 后重试"
+    if "验证" in message or "captcha" in lowered or "风控" in message:
+        return "夸克触发安全验证，请稍后再试或更新 Cookie"
+    if _is_quark_size_limit_error(payload, message):
+        return _QUARK_SIZE_LIMIT_HINT
+    if "频繁" in message or "limit" in lowered or "频率" in message:
+        return "夸克操作过于频繁，请稍后再试"
+    return message or "夸克上传失败，请稍后重试"
+
+
+def _quark_upload_pre(
+    cookie: str, filename: str, mime_type: str, pdir_fid: str, size: int
+) -> Dict[str, Any]:
+    """上传预检：换取 task_id 与 OSS 上传参数。"""
+    headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
+    url = _build_quark_api_url("/1/clouddrive/file/upload/pre")
+    now_ms = int(time.time() * 1000)
+    payload = {
+        "ccp_hash_update": True,
+        "dir_name": "",
+        "file_name": str(filename or ""),
+        "format_type": str(mime_type or "application/octet-stream"),
+        "l_created_at": now_ms,
+        "l_updated_at": now_ms,
+        "pdir_fid": str(pdir_fid or "0").strip() or "0",
+        "size": max(0, int(size or 0)),
+    }
+    response = _request_quark_json_payload(
+        url,
+        payload,
+        headers,
+        timeout=45,
+        method="POST",
+        fallback="夸克上传初始化失败",
+    )
+    if not _is_quark_success(response):
+        raise UploadError(_map_quark_api_error(response), provider="quark")
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    metadata = response.get("metadata") if isinstance(response.get("metadata"), dict) else {}
+    if not str(data.get("task_id", "") or "").strip():
+        raise UploadError("夸克上传初始化失败（未返回任务 ID）", retriable=True, provider="quark")
+    pre = dict(data)
+    pre["part_size"] = parse_int(
+        metadata.get("part_size"), default=_QUARK_UPLOAD_DEFAULT_PART_SIZE
+    )
+    return pre
+
+
+def _quark_upload_hash(cookie: str, task_id: str, md5: str, sha1: str) -> bool:
+    """秒传检测：finish=true 表示云端已有同哈希文件。"""
+    headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
+    url = _build_quark_api_url("/1/clouddrive/file/update/hash")
+    response = _request_quark_json_payload(
+        url,
+        {"md5": str(md5 or "").strip().lower(), "sha1": str(sha1 or "").strip().upper(), "task_id": str(task_id or "")},
+        headers,
+        timeout=45,
+        method="POST",
+        fallback="夸克秒传检测失败",
+    )
+    if not _is_quark_success(response):
+        raise UploadError(_map_quark_api_error(response), provider="quark")
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    return bool(data.get("finish", False))
+
+
+def _quark_oss_upload_url(pre: Dict[str, Any]) -> str:
+    """由 upload_pre 返回构造 OSS 端点（upload_url 形如 https://upload-host）。"""
+    bucket = str(pre.get("bucket", "") or "").strip()
+    obj_key = str(pre.get("obj_key", "") or "").strip()
+    upload_url = str(pre.get("upload_url", "") or "").strip()
+    if upload_url.startswith("https://"):
+        upload_url = upload_url[len("https://"):]
+    elif upload_url.startswith("http://"):
+        upload_url = upload_url[len("http://"):]
+    if not bucket or not obj_key or not upload_url:
+        raise UploadError("夸克上传配置缺失（OSS 参数不完整）", retriable=True, provider="quark")
+    return f"https://{bucket}.{upload_url.rstrip('/')}/{obj_key}"
+
+
+def _quark_upload_auth(cookie: str, pre: Dict[str, Any], auth_meta: str) -> str:
+    """向夸克换取 OSS 临时授权 auth_key。"""
+    headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
+    url = _build_quark_api_url("/1/clouddrive/file/upload/auth")
+    response = _request_quark_json_payload(
+        url,
+        {
+            "auth_info": str(pre.get("auth_info", "") or ""),
+            "auth_meta": auth_meta,
+            "task_id": str(pre.get("task_id", "") or ""),
+        },
+        headers,
+        timeout=45,
+        method="POST",
+        fallback="夸克上传授权失败",
+    )
+    if not _is_quark_success(response):
+        raise UploadError(_map_quark_api_error(response), provider="quark")
+    data = response.get("data") if isinstance(response.get("data"), dict) else {}
+    auth_key = str(data.get("auth_key", "") or "").strip()
+    if not auth_key:
+        raise UploadError("夸克上传授权失败（未返回 auth_key）", retriable=True, provider="quark")
+    return auth_key
+
+
+def _quark_upload_part(
+    cookie: str, pre: Dict[str, Any], mime_type: str, part_number: int, chunk: bytes
+) -> str:
+    """单片上传：授权 → OSS PUT。返回 ETag。"""
+    bucket = str(pre.get("bucket", "") or "").strip()
+    obj_key = str(pre.get("obj_key", "") or "").strip()
+    upload_id = str(pre.get("upload_id", "") or "").strip()
+    time_str = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    is_multipart = bool(upload_id)
+    resource = f"/{bucket}/{obj_key}"
+    if is_multipart:
+        resource = f"{resource}?partNumber={int(part_number)}&uploadId={upload_id}"
+    auth_meta = (
+        f"PUT\n\n{mime_type}\n{time_str}\n"
+        f"x-oss-date:{time_str}\n"
+        f"x-oss-user-agent:{_QUARK_OSS_SDK_USER_AGENT}\n"
+        f"{resource}"
+    )
+    auth_key = _quark_upload_auth(cookie, pre, auth_meta)
+    oss_url = _quark_oss_upload_url(pre)
+    try:
+        response = _get_quark_http_session().put(
+            normalize_http_url(oss_url),
+            params={"partNumber": str(int(part_number)), "uploadId": upload_id} if is_multipart else None,
+            data=chunk,
+            headers={
+                "Authorization": auth_key,
+                "Content-Type": str(mime_type or "application/octet-stream"),
+                "Referer": "https://pan.quark.cn/",
+                "x-oss-date": time_str,
+                "x-oss-user-agent": _QUARK_OSS_SDK_USER_AGENT,
+            },
+            timeout=max(30, min(600, 60 + len(chunk) // (1024 * 1024))),
+        )
+    except Exception as exc:
+        raise UploadError(
+            f"夸克分片 {part_number} 上传失败（网络错误）", retriable=True, provider="quark"
+        ) from exc
+    if int(response.status_code or 0) != 200:
+        raise UploadError(
+            f"夸克分片 {part_number} 上传失败（HTTP {int(response.status_code or 0)}）",
+            retriable=True,
+            provider="quark",
+        )
+    etag = str(response.headers.get("ETag", "") or "").strip().strip('"')
+    if not etag:
+        raise UploadError(f"夸克分片 {part_number} 未返回 ETag", retriable=True, provider="quark")
+    return etag
+
+
+def _quark_upload_commit(cookie: str, pre: Dict[str, Any], etags: List[str]) -> None:
+    """OSS CompleteMultipartUpload（callback 由夸克服务端把对象转存进网盘）。"""
+    bucket = str(pre.get("bucket", "") or "").strip()
+    obj_key = str(pre.get("obj_key", "") or "").strip()
+    upload_id = str(pre.get("upload_id", "") or "").strip()
+    time_str = time.strftime("%a, %d %b %Y %H:%M:%S GMT", time.gmtime())
+    body_parts = ['<?xml version="1.0" encoding="UTF-8"?>\n<CompleteMultipartUpload>\n']
+    for index, etag in enumerate(etags or []):
+        body_parts.append(
+            f"<Part>\n<PartNumber>{index + 1}</PartNumber>\n<ETag>{etag}</ETag>\n</Part>\n"
+        )
+    body_parts.append("</CompleteMultipartUpload>")
+    body = "".join(body_parts)
+    content_md5 = base64.b64encode(hashlib.md5(body.encode("utf-8")).digest()).decode("ascii")
+    callback_bytes = json.dumps(
+        pre.get("callback") if isinstance(pre.get("callback"), dict) else {},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    callback_b64 = base64.b64encode(callback_bytes).decode("ascii")
+    auth_meta = (
+        f"POST\n{content_md5}\napplication/xml\n{time_str}\n"
+        f"x-oss-callback:{callback_b64}\n"
+        f"x-oss-date:{time_str}\n"
+        f"x-oss-user-agent:{_QUARK_OSS_SDK_USER_AGENT}\n"
+        f"/{bucket}/{obj_key}?uploadId={upload_id}"
+    )
+    auth_key = _quark_upload_auth(cookie, pre, auth_meta)
+    oss_url = _quark_oss_upload_url(pre)
+    try:
+        response = _get_quark_http_session().post(
+            normalize_http_url(oss_url),
+            params={"uploadId": upload_id} if upload_id else None,
+            data=body.encode("utf-8"),
+            headers={
+                "Authorization": auth_key,
+                "Content-MD5": content_md5,
+                "Content-Type": "application/xml",
+                "Referer": "https://pan.quark.cn/",
+                "x-oss-callback": callback_b64,
+                "x-oss-date": time_str,
+                "x-oss-user-agent": _QUARK_OSS_SDK_USER_AGENT,
+            },
+            timeout=60,
+        )
+    except Exception as exc:
+        raise UploadError("夸克上传提交失败（网络错误）", retriable=True, provider="quark") from exc
+    if int(response.status_code or 0) != 200:
+        raise UploadError(
+            f"夸克上传提交失败（HTTP {int(response.status_code or 0)}）", retriable=True, provider="quark"
+        )
+
+
+def _quark_upload_finish(cookie: str, pre: Dict[str, Any]) -> None:
+    """上传收尾（失败不阻断主流程，OSS 侧已完成转存）。"""
+    headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
+    url = _build_quark_api_url("/1/clouddrive/file/upload/finish")
+    try:
+        response = _request_quark_json_payload(
+            url,
+            {"obj_key": str(pre.get("obj_key", "") or ""), "task_id": str(pre.get("task_id", "") or "")},
+            headers,
+            timeout=30,
+            method="POST",
+            fallback="夸克上传收尾失败",
+        )
+        if not _is_quark_success(response):
+            logging.info(
+                "Quark upload finish non-fatal: %s", _extract_quark_error(response, "")
+            )
+    except Exception as exc:
+        logging.info("Quark upload finish non-fatal: %s", exc)
+
+
+def upload_quark_file(
+    cookie: str,
+    sink: Any,
+    filename: str,
+    target_dir_id: str = "0",
+    *,
+    md5: str = "",
+    sha1: str = "",
+    size: int = -1,
+    progress_cb=None,
+    cancel_check=None,
+) -> UploadResult:
+    """把 sink 上传到夸克网盘（秒传优先，未命中走 OSS 分片）。
+
+    md5/sha1 由复制引擎在下载时同步算出；缺省时本函数读取 sink 计算（一遍同时算两个）。
+    """
+    cookie = str(cookie or "").strip()
+    filename = str(filename or "").strip()
+    if not cookie:
+        raise UploadError("夸克 Cookie 未配置", provider="quark")
+    if not filename:
+        raise UploadError("上传文件名为空", provider="quark")
+    if sink is None:
+        raise UploadError("上传数据源为空", provider="quark")
+
+    total = int(size if size is not None and size >= 0 else getattr(sink, "size", -1) or -1)
+    if total < 0:
+        raise UploadError("无法确定上传文件大小", provider="quark")
+    if total == 0:
+        raise UploadError("不能上传空文件", provider="quark")
+
+    file_md5 = str(md5 or "").strip().lower()
+    file_sha1 = str(sha1 or getattr(sink, "sha1", "") or "").strip().upper()
+    if not file_md5 or not file_sha1:
+        sink.seek(0)
+        md5_hasher = hashlib.md5()
+        sha1_hasher = hashlib.sha1()
+        while True:
+            chunk = sink.read(1024 * 1024)
+            if not chunk:
+                break
+            md5_hasher.update(chunk)
+            sha1_hasher.update(chunk)
+        if not file_md5:
+            file_md5 = md5_hasher.hexdigest()
+        if not file_sha1:
+            file_sha1 = sha1_hasher.hexdigest().upper()
+        sink.seek(0)
+
+    mime_type = _guess_quark_mime_type(filename)
+    target_id = str(target_dir_id or "0").strip() or "0"
+
+    def _check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise UploadError("上传已取消", provider="quark")
+
+    try:
+        pre = _quark_upload_pre(cookie, filename, mime_type, target_id, total)
+    except Exception as exc:
+        mark_cookie_health_failure("quark", exc, trigger="runtime:upload_quark_file")
+        raise
+
+    # ---- 秒传探测 ----
+    try:
+        finished = _quark_upload_hash(cookie, str(pre.get("task_id", "") or ""), file_md5, file_sha1)
+    except Exception as exc:
+        mark_cookie_health_failure("quark", exc, trigger="runtime:upload_quark_file")
+        raise
+    if finished:
+        mark_cookie_health_success("quark", trigger="runtime:upload_quark_file")
+        return UploadResult(
+            status="rapid",
+            name=filename,
+            size=total,
+            sha1=file_sha1,
+            message="秒传命中",
+        )
+
+    # ---- 秒传未命中：OSS 分片上传 ----
+    part_size = parse_int(pre.get("part_size"), default=_QUARK_UPLOAD_DEFAULT_PART_SIZE)
+    part_size = max(_QUARK_UPLOAD_PART_SIZE_MIN, min(int(part_size or 0) or _QUARK_UPLOAD_DEFAULT_PART_SIZE, _QUARK_UPLOAD_PART_SIZE_MAX))
+
+    try:
+        etags: List[str] = []
+        sent = 0
+        part_number = 1
+        sink.seek(0)
+        while True:
+            _check_cancel()
+            chunk = sink.read(part_size)
+            if not chunk:
+                break
+            etag = _quark_upload_part(cookie, pre, mime_type, part_number, chunk)
+            etags.append(etag)
+            sent += len(chunk)
+            part_number += 1
+            if progress_cb:
+                try:
+                    progress_cb(sent, total)
+                except Exception:
+                    pass
+        _quark_upload_commit(cookie, pre, etags)
+        _quark_upload_finish(cookie, pre)
+    except UploadError:
+        raise
+    except Exception as exc:
+        raise UploadError(f"夸克上传失败：{exc}", provider="quark") from exc
+
+    mark_cookie_health_success("quark", trigger="runtime:upload_quark_file")
+    return UploadResult(
+        status="uploaded",
+        name=filename,
+        size=total,
+        sha1=file_sha1,
+        message="上传完成",
+    )
+
+
+def resolve_quark_download_url(cookie: str, file_id: str) -> Dict[str, Any]:
+    """获取夸克网盘文件（自己盘内）的下载直链，支持 Range。
+
+    复制引擎的夸克→X 链路用它取源数据。直链有时效（分钟级~小时），
+    过期后需重新调用本函数换链（复制引擎的重试逻辑会处理）。
+    """
+    normalized_cookie = str(cookie or "").strip()
+    if not normalized_cookie:
+        raise RuntimeError("Quark Cookie 未配置")
+    fid = str(file_id or "").strip()
+    if not fid:
+        raise RuntimeError("文件 ID 不能为空")
+    headers = _build_quark_client_headers(normalized_cookie)
+    url = _build_quark_api_url("/1/clouddrive/file/download")
+    response = _request_quark_json_payload(
+        url,
+        {"fids": [fid]},
+        headers,
+        timeout=45,
+        method="POST",
+        fallback="获取夸克下载地址失败",
+    )
+    if not _is_quark_success(response):
+        raise RuntimeError(_map_quark_api_error(response))
+    data = response.get("data") if isinstance(response.get("data"), list) else []
+    first = data[0] if data and isinstance(data[0], dict) else {}
+    download_url = str(first.get("download_url", "") or "").strip()
+    if not download_url:
+        raise RuntimeError("夸克下载地址获取失败（返回为空，文件可能已被清理）")
+    mark_cookie_health_success("quark", trigger="runtime:resolve_quark_download_url")
+    return {
+        "url": download_url,
+        "fid": fid,
+        "size": parse_int(first.get("size"), default=0),
+        "file_name": str(first.get("file_name", "") or "").strip(),
+        # 下载必须用刚轮换过的 cookie（CDN 回调校验 __puus），否则 403 auth expired
+        "cookie": _current_quark_cookie(normalized_cookie),
+    }
+
+
 class QuarkProvider(CloudProvider):
     name = "quark"
     label = "夸克网盘"
@@ -1808,6 +2382,9 @@ class QuarkProvider(CloudProvider):
     supports_move = True
     supports_copy = True
     supports_delete = True
+    supports_upload = True
+    supports_rapid_upload = True
+    supports_upload_resume = False
 
     def list_entries_payload(self, cookie, cid="0", folders_only=False):
         return list_quark_entries_payload(cookie, cid, folders_only)
@@ -1893,7 +2470,12 @@ class QuarkProvider(CloudProvider):
         raise NotImplementedError("Quark does not support offline download")
 
     def resolve_download_url(self, cookie, file_id):
-        raise NotImplementedError("Quark does not support direct download URL resolution")
+        result = resolve_quark_download_url(cookie, file_id)
+        return str(result.get("url", "") or "")
+
+    def resolve_download_info(self, cookie, file_id):
+        """下载直链 + 元信息（复制引擎用：URL 过期时重取、校验大小）。"""
+        return resolve_quark_download_url(cookie, file_id)
 
     def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
         return rename_quark_entry(cookie, entry_id, new_name, parent_id)
@@ -1906,6 +2488,32 @@ class QuarkProvider(CloudProvider):
 
     def delete_entries(self, cookie, entry_ids, parent_id=""):
         return delete_quark_entries(cookie, entry_ids, parent_id)
+
+    def upload_file(
+        self,
+        cookie,
+        sink,
+        filename,
+        target_dir_id="0",
+        *,
+        sha1="",
+        md5="",
+        size=-1,
+        progress_cb=None,
+        cancel_check=None,
+        **kwargs,
+    ):
+        return upload_quark_file(
+            cookie,
+            sink,
+            filename,
+            target_dir_id,
+            md5=md5,
+            sha1=sha1,
+            size=size,
+            progress_cb=progress_cb,
+            cancel_check=cancel_check,
+        )
 
 
 register(QuarkProvider())

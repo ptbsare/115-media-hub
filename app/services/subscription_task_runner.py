@@ -20,6 +20,7 @@ from .resource import (
     _pick_submit_offline_hash,
     build_offline_job_identity,
 )
+from .subscription_cross_copy import register_cross_copy_from_candidates
 from .subscription_episode import _extract_subscription_season_from_name
 
 
@@ -2219,6 +2220,27 @@ async def _run_subscription_task_quark(
         legacy_candidate = search_result.get("candidate", {}) if isinstance(search_result.get("candidate"), dict) else {}
         if legacy_candidate:
             ranked_candidates = [legacy_candidate]
+
+    # ---- 跨盘补源：夸克候选注册为复制任务（省去手动跨盘复制） ----
+    # fallback 语义由幂等跳过保证：订阅转存成功 → 文件已在目标盘 → 补源任务跳过；
+    # 转存失败/未命中 → 补源任务把资源复制进目标网盘。
+    cross_copy_registered_job_ids: List[int] = []
+    if str(task.get("cross_copy_mode", "off") or "off") != "off" and list(task.get("cross_copy_sources", []) or []):
+        try:
+            cross_copy_stats = await asyncio.to_thread(
+                register_cross_copy_from_candidates,
+                task=task,
+                cfg=cfg,
+                candidates=ranked_candidates,
+            )
+            cross_copy_registered_job_ids = [
+                max(0, int(job_id or 0)) for job_id in (cross_copy_stats.get("registered", []) or [])
+            ]
+            for log_message, log_level in (cross_copy_stats.get("logs", []) or []):
+                await write_subscription_log(log_message, log_level)
+        except Exception as exc:
+            await write_subscription_log(f"跨盘补源注册失败（不影响本次订阅）：{exc}", "warn")
+
     if not ranked_candidates:
         _subscription_stage_timer_enter(stage_timer, "finalize")
         if completed_locked:

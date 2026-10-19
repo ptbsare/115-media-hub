@@ -1,4 +1,3 @@
-import base64
 from http.cookies import SimpleCookie
 from typing import Iterator
 
@@ -6,6 +5,12 @@ from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse, RedirectResponse, Response, StreamingResponse
 
 from ..core import *  # noqa: F401,F403
+from ..providers.pan115_downurl import (
+    collect_115_download_urls,
+    extract_115_download_error_detail,
+    is_115_size_limit_error,
+    resolve_115_downurl_payload,
+)
 from ..services.strm_files import delete_orphan_metadata_dirs, list_local_scan_dirs, preview_orphan_metadata_dirs
 
 router = APIRouter()
@@ -62,163 +67,6 @@ _RELAY_STREAM_CHUNK_SIZE = max(
     32 * 1024,
     min(1024 * 1024, int(os.environ.get("STRM_RELAY_CHUNK_SIZE", 256 * 1024) or (256 * 1024))),
 )
-_RSA_115_MODULUS = int(
-    (
-        "8686980c0f5a24c4b9d43020cd2c22703ff3f450756529058b1cf88f09b8602136477198a6e2683149659bd122c33592"
-        "fdb5ad47944ad1ea4d36c6b172aad6338c3bb6ac6227502d010993ac967d1aef00f0c8e038de2e4d3bc2ec368af2e9f10a6f"
-        "1eda4f7262f136420c07c331b871bf139f74f3010e3c4fe57df3afb71683"
-    ),
-    16,
-)
-_RSA_115_EXPONENT = int("10001", 16)
-_M115_G_KTS = [
-    240,
-    229,
-    105,
-    174,
-    191,
-    220,
-    191,
-    138,
-    26,
-    69,
-    232,
-    190,
-    125,
-    166,
-    115,
-    184,
-    222,
-    143,
-    231,
-    196,
-    69,
-    218,
-    134,
-    196,
-    155,
-    100,
-    139,
-    20,
-    106,
-    180,
-    241,
-    170,
-    56,
-    1,
-    53,
-    158,
-    38,
-    105,
-    44,
-    134,
-    0,
-    107,
-    79,
-    165,
-    54,
-    52,
-    98,
-    166,
-    42,
-    150,
-    104,
-    24,
-    242,
-    74,
-    253,
-    189,
-    107,
-    151,
-    143,
-    77,
-    143,
-    137,
-    19,
-    183,
-    108,
-    142,
-    147,
-    237,
-    14,
-    13,
-    72,
-    62,
-    215,
-    47,
-    136,
-    216,
-    254,
-    254,
-    126,
-    134,
-    80,
-    149,
-    79,
-    209,
-    235,
-    131,
-    38,
-    52,
-    219,
-    102,
-    123,
-    156,
-    126,
-    157,
-    122,
-    129,
-    50,
-    234,
-    182,
-    51,
-    222,
-    58,
-    169,
-    89,
-    52,
-    102,
-    59,
-    170,
-    186,
-    129,
-    96,
-    72,
-    185,
-    213,
-    129,
-    156,
-    248,
-    108,
-    132,
-    119,
-    255,
-    84,
-    120,
-    38,
-    95,
-    190,
-    232,
-    30,
-    54,
-    159,
-    52,
-    128,
-    92,
-    69,
-    44,
-    155,
-    118,
-    213,
-    27,
-    143,
-    204,
-    195,
-    184,
-    245,
-]
-_M115_G_KEY_S = [0x29, 0x23, 0x21, 0x5E]
-_M115_G_KEY_L = [120, 6, 173, 76, 51, 134, 93, 24, 76, 1, 63, 70]
 _DEFAULT_115_USER_AGENT = "Mozilla/5.0 115-media-hub"
 
 
@@ -319,163 +167,13 @@ def _collect_set_cookie_pairs(response_set_cookies: List[str]) -> str:
     return "; ".join(extra_cookie_pairs)
 
 
-def _extract_115_download_error_detail(payload: Any, fallback: str = "115 下载地址解析失败") -> str:
-    result = payload if isinstance(payload, dict) else {}
-    return (
-        str(result.get("error", "")).strip()
-        or str(result.get("msg", "")).strip()
-        or str(result.get("message", "")).strip()
-        or fallback
-    )
-
-
-def _is_115_large_file_limit_error(payload: Any) -> bool:
-    result = payload if isinstance(payload, dict) else {}
-    code = str(result.get("msg_code", "") or result.get("errno", "") or "").strip()
-    message = _extract_115_download_error_detail(result, fallback="").strip()
-    return code == "50028" or ("文件大小超出限制" in message and "电脑端下载" in message)
-
-
-def _rsa_115_encrypt_block(block: bytes) -> str:
-    block_size = 128
-    if len(block) + 11 > block_size:
-        raise RuntimeError("115 downurl 加密块过长")
-    padded = b"\x00\x02" + (b"\xff" * (block_size - len(block) - 3)) + b"\x00" + block
-    number = int.from_bytes(padded, byteorder="big", signed=False)
-    encrypted = pow(number, _RSA_115_EXPONENT, _RSA_115_MODULUS)
-    return f"{encrypted:0256x}"
-
-
-def _rsa_115_public_decrypt_block(raw_block: bytes) -> bytes:
-    number = int.from_bytes(bytes(raw_block), byteorder="big", signed=False)
-    decoded = pow(number, _RSA_115_EXPONENT, _RSA_115_MODULUS)
-    hex_text = f"{decoded:x}"
-    if len(hex_text) % 2:
-        hex_text = "0" + hex_text
-    payload = bytes.fromhex(hex_text)
-    idx = 1
-    while idx < len(payload) and payload[idx] != 0:
-        idx += 1
-    if idx + 1 >= len(payload):
-        return b""
-    return payload[idx + 1 :]
-
-
-def _m115_getkey(length: int, key: Optional[List[int]] = None) -> List[int]:
-    if key is not None:
-        return [
-            ((int(key[i]) + _M115_G_KTS[length * i]) & 0xFF) ^ _M115_G_KTS[length * (length - 1 - i)]
-            for i in range(length)
-        ]
-    return _M115_G_KEY_L[:] if length == 12 else _M115_G_KEY_S[:]
-
-
-def _m115_xor(src: List[int], key: List[int]) -> List[int]:
-    src_len = len(src)
-    key_len = len(key)
-    mod4 = src_len % 4
-    result: List[int] = []
-    if mod4:
-        for i in range(mod4):
-            result.append(int(src[i]) ^ int(key[i % key_len]))
-    for i in range(mod4, src_len):
-        result.append(int(src[i]) ^ int(key[(i - mod4) % key_len]))
-    return result
-
-
-def _m115_sym_encode(src: List[int], key1: List[int], key2: Optional[List[int]]) -> List[int]:
-    k1 = _m115_getkey(4, key1)
-    k2 = _m115_getkey(12, key2)
-    result = _m115_xor(src, k1)
-    result.reverse()
-    return _m115_xor(result, k2)
-
-
-def _m115_sym_decode(src: List[int], key1: List[int], key2: List[int]) -> List[int]:
-    k1 = _m115_getkey(4, key1)
-    k2 = _m115_getkey(12, key2)
-    result = _m115_xor(src, k2)
-    result.reverse()
-    return _m115_xor(result, k1)
-
-
-def _m115_asym_encode(src: List[int]) -> str:
-    chunk_size = 128 - 11
-    encrypted_hex_chunks: List[str] = []
-    for offset in range(0, len(src), chunk_size):
-        encrypted_hex_chunks.append(_rsa_115_encrypt_block(bytes(src[offset : offset + chunk_size])))
-    all_hex = "".join(encrypted_hex_chunks)
-    return base64.b64encode(bytes.fromhex(all_hex)).decode("ascii")
-
-
-def _m115_asym_decode(src: List[int]) -> List[int]:
-    block_size = 128
-    raw = bytes(src)
-    result: List[int] = []
-    for offset in range(0, len(raw), block_size):
-        result.extend(_rsa_115_public_decrypt_block(raw[offset : offset + block_size]))
-    return result
-
-
-def _m115_encode_downurl_payload(payload_text: str, timestamp: int) -> Tuple[str, List[int]]:
-    key = list(hashlib.md5(f"!@###@#{timestamp}DFDR@#@#".encode("utf-8")).digest())
-    src = list(payload_text.encode("latin1"))
-    encrypted = _m115_sym_encode(src, key1=key, key2=None)
-    mixed = key[:16] + encrypted
-    return _m115_asym_encode(mixed), key
-
-
-def _m115_decode_downurl_payload(encoded_text: str, key: List[int]) -> str:
-    raw = list(base64.b64decode(str(encoded_text or "").strip()))
-    decoded = _m115_asym_decode(raw)
-    if len(decoded) < 16:
-        raise RuntimeError("115 downurl 返回数据异常")
-    payload_bytes = bytes(_m115_sym_decode(decoded[16:], key1=key, key2=decoded[:16]))
-    try:
-        return payload_bytes.decode("utf-8")
-    except Exception:
-        return payload_bytes.decode("latin1", errors="ignore")
-
-
 def _resolve_115_download_payload_by_chrome_api(cookie: str, pick_code: str, user_agent: str) -> Tuple[str, str]:
-    throttle_115_api_requests()
-    timestamp = int(time.time())
-    payload_text = json.dumps({"pickcode": pick_code}, ensure_ascii=False, separators=(",", ":"))
-    encoded_data, decode_key = _m115_encode_downurl_payload(payload_text, timestamp)
-    headers = {
-        "Cookie": cookie,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://115.com/",
-        "Origin": "https://115.com",
-        "User-Agent": _normalize_115_user_agent(user_agent),
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
-    body = urllib.parse.urlencode({"data": encoded_data}).encode("utf-8")
-    request = urllib.request.Request(
-        "https://proapi.115.com/app/chrome/downurl?t=" + str(timestamp),
-        headers=headers,
-        method="POST",
-        data=body,
-    )
-    with urllib.request.urlopen(request, timeout=45) as resp:
-        charset = resp.headers.get_content_charset() or "utf-8"
-        body_text = resp.read().decode(charset, errors="ignore")
-        result = safe_json_loads(body_text, {})
-        response_set_cookies = resp.headers.get_all("Set-Cookie") or []
-    if not isinstance(result, dict):
-        raise RuntimeError("115 downurl 返回异常")
-    if not bool(result.get("state", False)):
-        raise RuntimeError(_extract_115_download_error_detail(result, fallback="115 downurl 解析失败"))
-    encrypted_payload = str(result.get("data", "")).strip()
-    if not encrypted_payload:
-        raise RuntimeError("115 downurl 返回为空")
-    decoded_payload_text = _m115_decode_downurl_payload(encrypted_payload, decode_key)
-    decoded_payload = safe_json_loads(decoded_payload_text, {})
-    download_urls = _collect_115_download_urls(decoded_payload)
-    download_url = str(download_urls[0] if download_urls else "").strip()
-    if not download_url:
-        raise RuntimeError("115 downurl 未解析到下载链接")
-    download_cookie = _collect_set_cookie_pairs(response_set_cookies)
+    """电脑端 downurl 取链（实现已下沉到 providers.pan115_downurl，这里只保留签名）。
+
+    返回 (下载直链, 下载用 Cookie 头)。失败抛 Pan115DownurlError（RuntimeError
+    子类，文案与原实现逐字一致），上层「downurl 回退失败: <原因>」的拼接不变。
+    """
+    download_url, download_cookie, _meta = resolve_115_downurl_payload(cookie, pick_code, user_agent)
     return download_url, download_cookie
 
 
@@ -785,39 +483,6 @@ def _resolve_115_folder_id_by_path_paginated(cookie: str, relative_path: str) ->
     return current_cid
 
 
-def _collect_115_download_urls(payload: Any) -> List[str]:
-    urls: List[str] = []
-    seen: Set[str] = set()
-
-    def push(url_value: Any) -> None:
-        token = str(url_value or "").strip()
-        if (not token) or (not token.lower().startswith(("http://", "https://"))) or token in seen:
-            return
-        seen.add(token)
-        urls.append(token)
-
-    def walk(node: Any) -> None:
-        if isinstance(node, str):
-            push(node)
-            return
-        if isinstance(node, list):
-            for item in node:
-                walk(item)
-            return
-        if not isinstance(node, dict):
-            return
-        for key in ("url", "download_url", "file_url", "download_url_web", "download_url_web2"):
-            walk(node.get(key))
-        for key in ("data", "urls", "result", "info"):
-            walk(node.get(key))
-        # 兼容 downurl 返回的 { "<file_id>": { url: { url: "..." } } } 结构。
-        for value in node.values():
-            walk(value)
-
-    walk(payload)
-    return urls
-
-
 def _get_cached_download_payload(cache_key: str) -> Tuple[str, str]:
     normalized_key = str(cache_key or "").strip()
     if not normalized_key:
@@ -883,8 +548,8 @@ def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str =
         if not isinstance(result, dict):
             raise RuntimeError("115 下载地址解析返回异常")
         if not bool(result.get("state", False)):
-            detail = _extract_115_download_error_detail(result)
-            if _is_115_large_file_limit_error(result):
+            detail = extract_115_download_error_detail(result)
+            if is_115_size_limit_error(result):
                 try:
                     download_url, download_cookie = _resolve_115_download_payload_by_chrome_api(
                         cookie,
@@ -899,7 +564,7 @@ def _resolve_115_download_payload(cookie: str, pick_code: str, user_agent: str =
                     return download_url, download_cookie
             raise RuntimeError(detail)
 
-        download_urls = _collect_115_download_urls(result)
+        download_urls = collect_115_download_urls(result)
         download_url = str(download_urls[0] if download_urls else "").strip()
         if not download_url:
             try:

@@ -539,11 +539,14 @@
         document.getElementById('resource-job-type-tabs')?.addEventListener('click', (e) => {
             const btn = e.target.closest('[data-task-center-tab]');
             if (!btn) return;
-            const nextTab = String(btn.dataset.taskCenterTab || 'resource').trim() === 'scraper' ? 'scraper' : 'resource';
+            const rawTab = String(btn.dataset.taskCenterTab || 'resource').trim();
+            const nextTab = ['scraper', 'cross_copy'].includes(rawTab) ? rawTab : 'resource';
             if (taskCenterTab === nextTab) return;
             taskCenterTab = nextTab;
             closeResourceJobClearMenu();
-            if (taskCenterTab === 'scraper') {
+            if (taskCenterTab === 'cross_copy') {
+                void window.fetchCrossCopyJobs?.({});
+            } else if (taskCenterTab === 'scraper') {
                 void fetchScraperJobsState();
             } else {
                 void fetchResourceJobsPage({ status: resourceJobFilter, reset: true });
@@ -555,6 +558,10 @@
             const btn = e.target.closest('[data-resource-job-filter]');
             if (!btn) return;
             const nextFilter = String(btn.dataset.resourceJobFilter || 'all').trim() || 'all';
+            if (taskCenterTab === 'cross_copy') {
+                window.setCrossCopyFilter?.(nextFilter);
+                return;
+            }
             if (taskCenterTab === 'scraper') {
                 const normalized = normalizeScraperJobFilter(nextFilter);
                 if (scraperJobFilter === normalized) return;

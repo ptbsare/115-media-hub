@@ -55,7 +55,10 @@
             const resourceActive = Number(resourceState?.job_counts?.active ?? resourceState?.stats?.active_job_count ?? pageActiveCount) || 0;
             const scraperJobs = Array.isArray(scraperJobState.jobs) ? scraperJobState.jobs : [];
             const scraperActive = Number(scraperJobState?.job_counts?.active ?? getScraperJobCounts(scraperJobs).active ?? 0) || 0;
-            return resourceActive + scraperActive;
+            const crossCopyActive = typeof window.getCrossCopyActiveCount === 'function'
+                ? Number(window.getCrossCopyActiveCount() || 0)
+                : 0;
+            return resourceActive + scraperActive + crossCopyActive;
         }
 
         function hasActiveScraperJobs() {
@@ -99,9 +102,13 @@
             if (!container) return;
             const resourceCounts = getResourceJobDisplayCounts(resourceState.jobs || []);
             const scraperCounts = getScraperJobDisplayCounts(scraperJobState.jobs || []);
+            const crossCopyCounts = typeof window.getCrossCopyJobCounts === 'function'
+                ? window.getCrossCopyJobCounts()
+                : { total: 0, active: 0 };
             const options = [
                 { value: 'resource', label: '导入任务', count: resourceCounts.total },
                 { value: 'scraper', label: '刮削任务', count: scraperCounts.total },
+                { value: 'cross_copy', label: '跨盘复制', count: crossCopyCounts.total },
             ];
             container.innerHTML = options.map(option => `
                 <button
@@ -112,12 +119,18 @@
             `).join('');
             const clearMenu = document.getElementById('resource-job-clear-menu');
             clearMenu?.classList.toggle('hidden', taskCenterTab !== 'resource' && taskCenterTab !== 'scraper');
+            const newCopyBtn = document.getElementById('cross-copy-new-btn');
+            newCopyBtn?.classList.toggle('hidden', taskCenterTab !== 'cross_copy');
             renderTaskCenterClearMenu();
             const note = document.getElementById('resource-job-modal-note');
             if (note) {
-                note.textContent = taskCenterTab === 'scraper'
-                    ? '刮削任务会记录每次执行的重命名进度；文件列表默认折叠，可展开查看每个文件状态。'
-                    : '任务列表按创建时间倒序显示，每页 10 条；筛选后可使用页码翻阅记录。';
+                if (taskCenterTab === 'scraper') {
+                    note.textContent = '刮削任务会记录每次执行的重命名进度；文件列表默认折叠，可展开查看每个文件状态。';
+                } else if (taskCenterTab === 'cross_copy') {
+                    note.textContent = '跨盘复制在后台执行：先取源网盘下载直链，再上传到目标网盘；目标网盘支持秒传时零上传。可随时取消或重试。';
+                } else {
+                    note.textContent = '任务列表按创建时间倒序显示，每页 10 条；筛选后可使用页码翻阅记录。';
+                }
             }
         }
 
@@ -196,7 +209,7 @@
             if (filter === 'completed') return '当前没有已完成的刮削记录。';
             if (filter === 'failed') return '当前没有异常刮削任务。';
             if (filter === 'rollback') return '当前没有已回退刮削任务。';
-            return '还没有刮削任务，在刮削管理里执行重命名后会出现在这里。';
+            return '还没有刮削任务，在「文件管理」里执行重命名后会出现在这里。';
         }
 
         function getScraperJobStatusLabel(status) {
@@ -428,6 +441,10 @@
             const counts = getResourceJobDisplayCounts(jobs);
             if (!container) return;
 
+            if (taskCenterTab === 'cross_copy') {
+                if (typeof window.renderCrossCopyJobs === 'function') window.renderCrossCopyJobs();
+                return;
+            }
             if (taskCenterTab === 'scraper') {
                 renderScraperJobs();
                 return;
@@ -787,11 +804,15 @@
                 lockPageScroll();
                 syncResourceJobClearMenuState();
                 renderTaskCenterTypeTabs();
-                if (taskCenterTab === 'scraper') {
+                if (taskCenterTab === 'cross_copy') {
+                    void window.fetchCrossCopyJobs?.({});
+                } else if (taskCenterTab === 'scraper') {
                     void fetchScraperJobsState();
+                    void window.fetchCrossCopyJobs?.({ silent: true });
                 } else {
                     void fetchResourceJobsPage({ status: resourceJobFilter, reset: true });
                     void fetchScraperJobsState({ silent: true });
+                    void window.fetchCrossCopyJobs?.({ silent: true });
                 }
             } else {
                 closeResourceJobClearMenu();

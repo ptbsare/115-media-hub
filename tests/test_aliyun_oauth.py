@@ -25,6 +25,17 @@ class AliyunOAuthSessionTest(unittest.TestCase):
         query = parse_qs(urlparse(session["authorize_url"]).query)
         self.assertEqual(query["code_challenge"][0], session["code_verifier"])
 
+    def test_session_requests_file_read_write_scopes(self):
+        """授权必须申请文件读写权限，否则任何文件操作都会 403。"""
+        from urllib.parse import parse_qs, urlparse
+
+        session = aliyun_oauth.create_aliyun_oauth_session()
+        query = parse_qs(urlparse(session["authorize_url"]).query)
+        scope = query["scope"][0]
+        self.assertIn("user:base", scope)
+        self.assertIn("file:all:read", scope)
+        self.assertIn("file:all:write", scope)
+
     def test_exchange_code_uses_given_verifier(self):
         fake_resp = {"access_token": "at", "refresh_token": "rt", "expires_in": 7200}
         with mock.patch.object(aliyun_oauth, "http_request_form_json", return_value=fake_resp) as mock_post:

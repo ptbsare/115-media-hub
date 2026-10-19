@@ -61,24 +61,24 @@
 - **不会做**：不做实时监控（新增内容靠文件夹监控）；不整理、不改名、不移动网盘文件。
 - **相关代码**：`app/routes/tree.py`、`app/services/tree.py`；页面 `templates/partials/pages/task.html`
 
-### 刮削管理（scraper）
-- **用途**：网盘文件浏览 + TMDB 识别绑定 + 批量重命名 / 移动 / 删除，让文件名符合播放器与刮削器预期。
-- **入口**：页面「刮削管理」；`/scraper/...`；CLI `scrape ...`（含批量偏好设置）。
-- **会做**：浏览多网盘目录、单个或批量识别（规则识别，可选 AI 候选兜底）、生成命名预览 → 确认执行 → 生成刮削任务并可回滚；115 的批量改名 / 移动会先等「受理结果回验落地」再按成功收尾监控同步事件（未确认落地时事件转 `needs_reconcile` 兜底重试，不判死）。
-- **不会做**：不生成 STRM（改完由变更同步刷新播放文件）；页面操作必须先出预览再确认（自动整理链路除外，见文件夹监控 / 接收夹）；**不把已经落成 `剧名/Season NN/` 的内容再套一层媒体文件夹**（选中的是季目录、父目录名就是这部剧时就地整理，详见 `conventions.md` 的「整理锚点」）。
-- **相关代码**：`app/routes/scraper.py`、`app/services/scraper.py`、`app/services/ai_match.py`；页面 `templates/partials/pages/scraper.html`
+### 文件管理（scraper）
+- **用途**：网盘文件浏览 + 常用文件操作（复制 / 移动 / 重命名 / 删除 / 新建文件夹）+ TMDB 识别绑定 + 批量重命名，让文件名符合播放器与刮削器预期。跨网盘复制也从这里发起（复制 → 切到目标网盘 → 跨网盘粘贴），支持一次选多个文件和整个文件夹。**跨网盘只支持复制，不提供移动**：移动要删源文件，跨盘删源出错无法回滚，所以跨盘时「移动」按钮置灰并提示改用复制（待移动清单可一键转成待复制）；同盘移动不受影响。接口层 `/scraper/{provider}/move` 也会校验 `source_provider`，不一致直接 400，防止脚本绕过前端。
+- **入口**：页面「文件管理」（模块名仍是 `scraper`，路由不变）；`/scraper/...`；`/cross_copy/...`；CLI `scrape ...`（含批量偏好设置）。
+- **会做**：浏览多网盘目录、单个或批量识别（规则识别，可选 AI 候选兜底）、生成命名预览 → 确认执行 → 生成刮削任务并可回滚；115 的批量改名 / 移动会先等「受理结果回验落地」再按成功收尾监控同步事件（未确认落地时事件转 `needs_reconcile` 兜底重试，不判死）；跨网盘粘贴时先查能力矩阵，再弹确认框写明「先下载到本地暂存再上传、大文件慢、秒传命中只下载」，文件夹会额外提示逐个文件复制。
+- **不会做**：不生成 STRM（改完由变更同步刷新播放文件）；页面操作必须先出预览再确认（自动整理链路除外，见文件夹监控 / 接收夹）；**不把已经落成 `剧名/Season NN/` 的内容再套一层媒体文件夹**（选中的是季目录、父目录名就是这部剧时就地整理，详见 `conventions.md` 的「整理锚点」）；跨网盘**移动**不支持文件夹，也不删源。
+- **相关代码**：`app/routes/scraper.py`、`app/services/scraper.py`、`app/services/ai_match.py`、`app/services/cross_cloud_copy.py`、`app/services/cross_cloud_copy_folder.py`、`app/services/cross_copy_jobs.py`；页面 `templates/partials/pages/scraper.html`、弹窗 `templates/partials/modals/cross_copy.html`
 
 ### 参数配置（settings）
 - **用途**：全局配置与运维入口：认证、签到、通知、代理、安全、AI、版本。
 - **入口**：页面「参数配置」；`/get_settings`、`/save_settings`、`/settings/...`。
-- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）。
-- **不会做**：不改任务、不动网盘文件、不生成 STRM。
+- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）、本地存储位置管理（添加/启停/删除容器内目录、探测可写与剩余空间、选定跨盘复制的暂存位置与子目录）。
+- **不会做**：不改任务、不动网盘文件、不生成 STRM；删除存储位置只删配置记录，不碰磁盘上的实际文件。
 - **相关代码**：`app/routes/settings.py`、`app/services/sign115.py`、`app/services/notify.py`；页面 `templates/partials/pages/settings.html`
 
 ### 播放代理（STRM 网关）
 - **用途**：播放器点开 `.strm` 时，把请求换成可播放的真实地址。
 - **入口**：`/strm/proxy`、`/strm/relay`（由生成的 `.strm` 内容调用）；`/strm/orphan-metadata/*` 处理刮削残留目录。
-- **会做**：按 pick_code 解析 115 下载地址（RSA 加密协议，带缓存与地址刷新）、中转或重定向，兼容 Range 请求。
+- **会做**：按 pick_code 解析 115 下载地址（RSA 加密协议，带缓存与地址刷新）、中转或重定向，兼容 Range 请求。加密取链逻辑已下沉到 `app/providers/pan115_downurl.py`，本模块只保留薄封装，跨盘复制等 provider 侧调用复用同一套实现。
 - **不会做**：不管目录结构、不判断媒体是否合法、不写 STRM 文件。
 - **相关代码**：`app/routes/strm.py`
 
@@ -106,6 +106,7 @@
 | `app/routes/tmdb.py` | TMDB 搜索 / 详情 / 类型 / 排行榜 / discover 接口 |
 | `app/routes/strm.py` | 播放代理（`/strm/proxy`、`/strm/relay`）与孤儿刮削元数据清理 |
 | `app/routes/events.py` | SSE 状态推送 `/events` 与 `/status-summary` |
+| `app/routes/cross_copy.py` | 跨盘复制：源×目标能力矩阵、任务增查、取消 / 重试 |
 
 ### 服务（业务逻辑层）`app/services/`
 
@@ -130,21 +131,28 @@
 | `app/services/subscription_offline_cleanup.py` | 离线导入未命中文件的保留与到期清理 |
 | `app/services/notify.py` | 企业微信通知（机器人 Webhook / 自建应用两通道） |
 | `app/services/sign115.py` | 115 每日签到 |
+| `app/services/cross_cloud_copy.py` | 跨盘复制引擎（P0-B）：源直链下载 + 同步 SHA1/MD5 + 内存/磁盘双通道 + 目标秒传/分片上传 + 取消/换链重试/幂等/孤儿清理；零流量路径（源端已知哈希 + 惰性 sink，秒传命中不下载）与分段下载（Range，绕开整文件流限速） |
+| `app/services/cross_cloud_copy_folder.py` | 整文件夹跨盘复制：BFS 递归建清单（上限 2000 文件 / 20 层，超限拒绝）、目标端逐级建目录、字节加权进度、单文件失败继续并汇总 partial |
+| `app/services/local_storage.py` | 本地存储位置管理：位置列表归一化/去重、目录可用性探测、暂存目录解析、磁盘空间预检 |
+| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知 |
+| `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |
 
 ### 网盘与外部 provider `app/providers/`
 
 | 文件 | 职责 |
 | --- | --- |
-| `app/providers/base.py` | `CloudProvider` 抽象基类：统一接口、限流、Cookie 存取 |
+| `app/providers/base.py` | `CloudProvider` 抽象基类：统一接口、限流、Cookie 存取、上传抽象（UploadSink/UploadResult/UploadError） |
 | `app/providers/registry.py` | provider 注册表：按名称 / link_type 查找、启用状态管理 |
 | `app/providers/common.py` | provider 共用小工具 |
-| `app/providers/pan115.py` | 115 网盘实现（目录、转存、离线、下载地址解析配合、写操作受理重试与落地回验） |
+| `app/providers/pan115.py` | 115 网盘实现（目录、转存、离线、下载地址解析配合、写操作受理重试与落地回验、上传/秒传：initupload + OSS 分片） |
+| `app/providers/pan115_cipher.py` | 115 上传协议加密封装：纯 Python AES-128-CBC + LZ4 解压 + 载荷编解码（零第三方依赖） |
+| `app/providers/pan115_downurl.py` | 115 大文件取链：RSA + XXTEA 加密的 `app/chrome/downurl` 通道（普通取链遇 50028 时回退），从 `routes/strm.py` 下沉 |
 | `app/providers/pan115_qr.py` | 115 扫码登录（客户端 / 设备选择；非官方接口，失败时可回退手动 Cookie） |
-| `app/providers/quark.py` | 夸克网盘实现 |
+| `app/providers/quark.py` | 夸克网盘实现（目录、分享解析/转存、写操作、下载直链、上传/秒传：md5+sha1 双哈希 + OSS 分片） |
 | `app/providers/tianyi.py` | 天翼云盘实现 |
 | `app/providers/pan123.py` | 123 云盘实现 |
-| `app/providers/aliyun.py` | 阿里云盘实现 |
-| `app/providers/aliyun_oauth.py` | 阿里云盘官方 OAuth（PKCE 扫码，无 AppSecret） |
+| `app/providers/aliyun.py` | 阿里云盘实现（**双模式**：扫码授权 access_token 走 openapi.alipan.com `/adrive/v1.0/openFile/*`，网页会话 refresh_token 走 api.alipan.com；目录、分享解析/转存（仅网页模式）、写操作、上传/秒传：pre_hash + content_hash + proof_code + 10MB 分片） |
+| `app/providers/aliyun_oauth.py` | 阿里云盘官方 OAuth（PKCE 扫码，无 AppSecret；scope 含 file:all:read/write） |
 | `app/providers/pansou.py` | PanSou 盘搜聚合 |
 | `app/providers/tmdb.py` | TMDB API 客户端 |
 | `app/providers/discovery_base.py` | 发现型 provider 抽象基类（自定义渠道继承即可） |
@@ -157,7 +165,7 @@
 | `templates/partials/pages/resource.html` | 资源中心 |
 | `templates/partials/pages/recommendation.html` | 资源推荐 |
 | `templates/partials/pages/subscription.html` | 影视订阅 |
-| `templates/partials/pages/scraper.html` | 刮削管理（含「扫描监控」按钮） |
+| `templates/partials/pages/scraper.html` | 文件管理（含「扫描监控」按钮） |
 | `templates/partials/pages/monitor_about.html` | 文件夹监控 + 关于 |
 | `templates/partials/pages/task.html` | 目录树同步 |
 | `templates/partials/pages/settings.html` | 参数配置 |

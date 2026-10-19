@@ -9,7 +9,7 @@ SETTINGS_MODULE_PATH = ROOT / "static/js/modules/tabs/settings.js"
 INDEX_SCRIPT_PATH = ROOT / "static/js/index.js"
 INDEX_CSS_PATH = ROOT / "static/css/index.css"
 
-SECTION_KEYS = ["auth", "strm", "tg", "pansou", "proxy", "tmdb", "ai", "notify", "security", "filter"]
+SECTION_KEYS = ["auth", "strm", "storage", "tg", "pansou", "proxy", "tmdb", "ai", "notify", "security", "filter"]
 
 
 class SettingsSectionLayoutFrontendTest(unittest.TestCase):

@@ -13909,6 +13909,19 @@
             margin-right: 0.4rem;
         }
 
+        .scraper-move-buffer .scraper-move-hint {
+            margin-top: 0.32rem;
+            max-width: 46rem;
+            font-size: 0.74rem;
+            line-height: 1.55;
+            color: #fcd34d;
+            white-space: normal;
+        }
+
+        html.theme-day .scraper-move-buffer .scraper-move-hint {
+            color: #b45309;
+        }
+
         .scraper-entry-table {
             flex: 1 1 auto;
             min-height: 0;

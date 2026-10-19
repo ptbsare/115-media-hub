@@ -1,3 +1,116 @@
+        <style>
+            /* 存储位置卡片：只服务「本地存储位置」分区，样式尽量贴着现有暗色卡片走 */
+            .settings-storage-card {
+                border: 1px solid rgba(51, 65, 85, 0.8);
+                background: rgba(15, 23, 42, 0.5);
+                border-radius: 1rem;
+                padding: 1rem;
+            }
+            .settings-storage-card-head {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.75rem;
+                margin-bottom: 0.75rem;
+            }
+            .settings-storage-card-title {
+                font-size: 0.875rem;
+                font-weight: 700;
+                color: #f1f5f9;
+            }
+            .settings-storage-list {
+                display: flex;
+                flex-direction: column;
+                gap: 0.5rem;
+            }
+            .settings-storage-row {
+                border: 1px solid rgba(51, 65, 85, 0.7);
+                background: rgba(2, 6, 23, 0.55);
+                border-radius: 0.75rem;
+                padding: 0.75rem;
+                display: flex;
+                flex-direction: column;
+                gap: 0.4rem;
+            }
+            .settings-storage-row-head {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                justify-content: space-between;
+                gap: 0.75rem;
+            }
+            .settings-storage-label {
+                font-size: 0.875rem;
+                font-weight: 700;
+                color: #e2e8f0;
+            }
+            .settings-storage-path {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 0.75rem;
+                color: #94a3b8;
+                word-break: break-all;
+            }
+            .settings-storage-actions {
+                display: flex;
+                align-items: center;
+                gap: 0.75rem;
+            }
+            .settings-storage-toggle {
+                display: inline-flex;
+                align-items: center;
+                gap: 0.35rem;
+                font-size: 0.75rem;
+                color: #cbd5e1;
+                cursor: pointer;
+            }
+            .settings-storage-delete {
+                padding: 0.3rem 0.7rem;
+                border-radius: 0.6rem;
+                border: 1px solid rgba(248, 113, 113, 0.45);
+                background: rgba(127, 29, 29, 0.35);
+                color: #fca5a5;
+                font-size: 0.75rem;
+                font-weight: 700;
+            }
+            .settings-storage-delete:hover {
+                background: rgba(153, 27, 27, 0.55);
+                color: #fecaca;
+            }
+            .settings-storage-meta {
+                font-size: 0.75rem;
+                line-height: 1.5rem;
+                color: #34d399;
+            }
+            .settings-storage-meta.is-bad {
+                color: #fbbf24;
+            }
+            .settings-storage-error {
+                font-size: 0.75rem;
+                line-height: 1.5rem;
+                color: #f87171;
+            }
+            .settings-storage-empty {
+                border: 1px dashed rgba(51, 65, 85, 0.8);
+                background: rgba(2, 6, 23, 0.4);
+                border-radius: 0.75rem;
+                padding: 0.9rem 1rem;
+                font-size: 0.75rem;
+                line-height: 1.6rem;
+                color: #94a3b8;
+            }
+            .settings-storage-form {
+                display: grid;
+                grid-template-columns: minmax(0, 1fr);
+                gap: 0.75rem;
+                align-items: end;
+            }
+            @media (min-width: 768px) {
+                .settings-storage-form {
+                    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+                }
+            }
+        </style>
         <div id="page-settings" class="page-panel module-page hidden space-y-6">
             <div id="settings-section-navbar" class="settings-section-navbar">
                 <nav id="settings-section-nav" class="settings-section-nav" aria-label="设置分区导航"></nav>
@@ -136,6 +249,72 @@
                             </div>
                             <input id="extensions" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 outline-none focus:border-sky-500 transition-colors">
                         </label>
+                    </div>
+                </section>
+
+                <section id="settings-storage" class="group-card settings-section-card" data-settings-section="storage" data-settings-step="2b" data-settings-title="本地存储位置" data-settings-nav-label="存储位置">
+                    <div class="settings-section-header">
+                        <button type="button" class="settings-section-head" aria-expanded="false" aria-controls="settings-body-storage">
+                            <span class="settings-section-step" aria-hidden="true">2b</span>
+                            <span class="settings-section-heading">
+                                <span class="settings-section-title">本地存储位置</span>
+                                <span class="settings-section-summary" data-settings-summary="storage"></span>
+                            </span>
+                            <span class="settings-section-chevron" aria-hidden="true">
+                                <svg viewBox="0 0 24 24" width="16" height="16" fill="none"><path d="M6 9l6 6 6-6" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>
+                            </span>
+                        </button>
+                    </div>
+                    <div id="settings-body-storage" class="space-y-4 settings-section-body" hidden>
+                        <div class="text-xs text-slate-500 leading-6">
+                            跨盘复制（比如从 115 复制到其它网盘）时，大文件没法直接对传，会先完整下载到下面选中的本地目录，再上传到目标网盘，传完自动清理临时文件。所以这个目录要选容量够大、剩余空间足够的盘。
+                        </div>
+                        <div class="text-xs text-slate-500 leading-6">
+                            这里填的是<strong class="text-slate-300">容器内的目录</strong>。要先把宿主机的磁盘挂载进容器（例如把宿主机的 <code class="font-mono">/mnt/hdd</code> 挂到容器的 <code class="font-mono">/app/storage</code>），目录不存在或不可写就保存不了。
+                        </div>
+
+                        <div class="settings-storage-card">
+                            <div class="settings-storage-card-head">
+                                <div class="settings-storage-card-title">已添加的位置</div>
+                                <button type="button" onclick="reloadStorageLocations()" class="px-3 py-2 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-xs">刷新</button>
+                            </div>
+                            <div id="settings-storage-list" class="settings-storage-list"></div>
+                        </div>
+
+                        <div class="settings-storage-card">
+                            <div class="settings-storage-card-title">新增位置</div>
+                            <div class="settings-storage-form mt-3">
+                                <label class="block min-w-0">
+                                    <span class="text-xs text-slate-500">容器内路径</span>
+                                    <input id="settings-storage-new-path" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="例如 /app/storage">
+                                </label>
+                                <label class="block min-w-0">
+                                    <span class="text-xs text-slate-500">名称（方便自己认）</span>
+                                    <input id="settings-storage-new-label" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如 4T 机械硬盘">
+                                </label>
+                                <button type="button" onclick="addStorageLocation()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">添加</button>
+                            </div>
+                            <div class="text-[11px] text-slate-500 mt-2 leading-5">点「添加」会先检查目录是否存在、能不能写、还剩多少空间；检查不通过不会保存。</div>
+                            <div id="settings-storage-add-status" class="hidden rounded-xl border px-4 py-3 text-sm leading-6 mt-2"></div>
+                        </div>
+
+                        <div class="settings-storage-card">
+                            <div class="settings-storage-card-title">跨盘复制用哪个位置暂存</div>
+                            <div class="settings-storage-form mt-3">
+                                <label class="block min-w-0">
+                                    <span class="text-xs text-slate-500">暂存位置</span>
+                                    <select id="settings-storage-temp-select" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1"></select>
+                                </label>
+                                <label class="block min-w-0">
+                                    <span class="text-xs text-slate-500">暂存子目录名</span>
+                                    <input id="settings-storage-temp-subdir" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="cross_copy_tmp" value="cross_copy_tmp">
+                                </label>
+                                <button type="button" onclick="saveStorageTempSetting()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">保存暂存设置</button>
+                            </div>
+                            <div class="text-[11px] text-slate-500 mt-2 leading-5">
+                                实际落盘路径 = 所选位置 + 子目录。例如选 <code class="font-mono">/app/storage</code>、子目录 <code class="font-mono">cross_copy_tmp</code>，临时文件就放在 <code class="font-mono">/app/storage/cross_copy_tmp</code>。子目录只能填相对路径，不能以 <code class="font-mono">/</code> 开头，也不能用 <code class="font-mono">..</code> 跳到所选位置之外。
+                            </div>
+                        </div>
                     </div>
                 </section>
 

@@ -1056,6 +1056,11 @@ def default_config() -> Dict[str, Any]:
         "resource_sources": [],
         "resource_quick_links": [],
         "resource_favorite_dirs": {"115": [], "quark": []},
+        "local_storages": [],
+        "cross_copy_temp_storage": "",
+        "cross_copy_temp_subdir": "cross_copy_tmp",
+        "cross_copy_notify": True,
+        "cross_copy_delete_source_after": True,
         "scraper_noise_phrases": [],
         "scraper_standalone_noise_words": [],
     }
@@ -2159,6 +2164,46 @@ SUBSCRIPTION_ORGANIZE_OPTION_DEFAULTS: Dict[str, Any] = {
 }
 
 
+# === 跨盘补源（订阅任务字段归一化） ===
+SUBSCRIPTION_CROSS_COPY_MODES = ("off", "fallback", "prefer")
+SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS = ("quark",)
+
+
+def normalize_subscription_cross_copy_mode(value: Any) -> str:
+    """跨盘补源模式：off=关闭；fallback=自家盘未命中才补源；prefer=命中即复制。"""
+    mode = str(value or "").strip().lower()
+    if mode in {"off", "disabled", "none", "false", "0"}:
+        return "off"
+    if mode in {"fallback", "backup", "reserve"}:
+        return "fallback"
+    if mode in {"prefer", "priority", "preferred"}:
+        return "prefer"
+    return "off"
+
+
+def normalize_subscription_cross_copy_sources(value: Any, task_provider: str = "") -> List[str]:
+    """跨盘补源的「源网盘」列表：去重、保序、排除任务自身 provider。"""
+    own = normalize_subscription_provider(task_provider or "", fallback="") if task_provider else ""
+    raw_items: List[Any] = []
+    if isinstance(value, list):
+        raw_items = list(value)
+    elif isinstance(value, str):
+        raw_items = [token for token in re.split(r"[,\n，|/]+", value) if token.strip()]
+    normalized: List[str] = []
+    for raw in raw_items:
+        token = str(raw or "").strip().lower()
+        if not token:
+            continue
+        provider = normalize_subscription_provider(token, fallback="")
+        if not provider or provider not in SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS:
+            continue
+        if own and provider == own:
+            continue
+        if provider not in normalized:
+            normalized.append(provider)
+    return normalized
+
+
 def _normalize_subscription_organize_options(raw: Any) -> Dict[str, Any]:
     """订阅「入库后整理」选项：复用刮削引擎的批量偏好归一化，只补默认值。
 
@@ -2333,6 +2378,11 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
     organize_on_import = normalize_bool(task.get("organize_on_import", True), default=True)
     raw_organize_options = task.get("organize_options")
     organize_options = _normalize_subscription_organize_options(raw_organize_options)
+    cross_copy_mode = normalize_subscription_cross_copy_mode(task.get("cross_copy_mode", "off"))
+    cross_copy_sources = normalize_subscription_cross_copy_sources(
+        task.get("cross_copy_sources", []),
+        task_provider=provider,
+    )
     return {
         "name": name,
         "provider": provider,
@@ -2352,6 +2402,8 @@ def normalize_subscription_task(task: Dict[str, Any]) -> Dict[str, Any]:
         "share_subdir": share_subdir,
         "share_subdir_cid": share_subdir_cid,
         "fixed_link_channel_search": fixed_link_channel_search if use_fixed_share_link else False,
+        "cross_copy_mode": cross_copy_mode,
+        "cross_copy_sources": cross_copy_sources,
         "enabled": normalize_bool(task.get("enabled", True), default=True),
         # 兼容旧前端字段：cron_minutes 保留为“时段内查询间隔”镜像值。
         "cron_minutes": schedule_interval_minutes,
@@ -2642,6 +2694,29 @@ def normalize_mount_points(value: Any) -> List[Dict[str, str]]:
         push(item.get("provider", ""), item.get("prefix", ""))
 
     return normalized
+
+
+def _normalize_local_storages_config(value: Any) -> List[Dict[str, Any]]:
+    """归一化 local_storages 配置（导入放在函数内避免顶层循环依赖）。"""
+    from .services.local_storage import (
+        ensure_default_storage,
+        normalize_local_storages,
+    )
+
+    return ensure_default_storage(normalize_local_storages(value))
+
+
+def _normalize_cross_copy_temp_subdir(value: Any) -> str:
+    """归一化跨盘复制暂存子目录；不合法回落默认值。"""
+    from .services.local_storage import CROSS_COPY_TEMP_SUBDIR
+
+    raw = str(value or "").strip()
+    if not raw:
+        return CROSS_COPY_TEMP_SUBDIR
+    cleaned = raw.replace("\\", "/").strip("/")
+    if not cleaned or ".." in cleaned.split("/"):
+        return CROSS_COPY_TEMP_SUBDIR
+    return cleaned[:128]
 
 
 def get_mount_prefix(cfg: Dict[str, Any], provider: str) -> str:
@@ -2938,6 +3013,13 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged["resource_quick_links"] = normalize_resource_quick_links(merged.get("resource_quick_links", []))
     merged["resource_favorite_dirs"] = normalize_resource_favorite_dirs(merged.get("resource_favorite_dirs", {}))
     merged["mount_points"] = normalize_mount_points(merged.get("mount_points", []))
+    merged["local_storages"] = _normalize_local_storages_config(merged.get("local_storages", []))
+    merged["cross_copy_temp_storage"] = str(merged.get("cross_copy_temp_storage", "") or "").strip()[:64]
+    merged["cross_copy_temp_subdir"] = _normalize_cross_copy_temp_subdir(merged.get("cross_copy_temp_subdir", ""))
+    merged["cross_copy_notify"] = normalize_bool(merged.get("cross_copy_notify", True), default=True)
+    merged["cross_copy_delete_source_after"] = normalize_bool(
+        merged.get("cross_copy_delete_source_after", True), default=True
+    )
     merged["strm_proxy_base_url"] = normalize_http_base_url(merged.get("strm_proxy_base_url", ""))
     merged["api_115_rate_limit_seconds"] = _clamp_api_115_rate_limit_seconds(
         merged.get("api_115_rate_limit_seconds", API_115_RATE_LIMIT_SECONDS),

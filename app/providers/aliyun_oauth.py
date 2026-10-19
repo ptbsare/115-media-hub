@@ -24,7 +24,12 @@ from ..http_utils import http_request_form_json
 
 ALIYUN_OPEN_AUTHORIZE_URL = "https://openapi.alipan.com/oauth/authorize"
 ALIYUN_OPEN_TOKEN_URL = "https://openapi.alipan.com/oauth/access_token"
-ALIYUN_OPEN_SCOPE = "user:base"
+# 官方权限（https://www.yuque.com/aliyundrive/zpfszx/dspik0）：
+#   user:base      用户ID/头像/昵称、容量信息
+#   file:all:read  文件列表、详情、下载地址
+#   file:all:write 上传、更新、移动、复制、删除
+# 缺 file:all:* 时文件操作全部 403 PermissionDenied（仅 token 有效）。
+ALIYUN_OPEN_SCOPE = "user:base,file:all:read,file:all:write"
 ALIYUN_OPEN_REDIRECT_URI = "oob"
 # 阿里云盘"网页版"公开客户端 ID（无后端公开客户端 + PKCE，无需 secret）
 ALIYUN_OPEN_CLIENT_ID = "55091393987b4cc090b090ee17e85e0a"

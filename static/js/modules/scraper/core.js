@@ -943,14 +943,32 @@ function renderMoveBuffer() {
     const modeText = mode === 'copy' ? '复制' : '移动';
     const actionName = mode === 'copy' ? 'copy-here' : 'move-here';
     const clearName = mode === 'copy' ? 'clear-copy' : 'clear-move';
+    const crossCloud = !!buffer.provider && buffer.provider !== state.provider;
+    // 跨网盘移动不可用：移动要删源文件，跨盘做不到可靠回滚，明确只提供复制。
+    const moveBlocked = mode === 'move' && crossCloud;
+    const actionLabel = moveBlocked
+        ? '不能跨网盘移动'
+        : (crossCloud ? '跨网盘复制到此' : `${modeText}到当前目录`);
+    let hint = '';
+    if (moveBlocked) {
+        hint = `<div class="scraper-move-hint">移动只能在同一个网盘内使用。要把文件搬到另一个网盘，请改用复制：复制完成后源文件仍然保留，确认没问题再回源网盘自己删。</div>`;
+    } else if (crossCloud) {
+        hint = `<div class="scraper-move-hint">目标网盘是${escapeHtml(getProviderLabel(state.provider))}，跨网盘复制需先下载到本地再上传，大文件会慢一些</div>`;
+    }
+    const convertBtn = moveBlocked
+        ? `<button type="button" class="scraper-compact-btn" data-scraper-action="convert-move-to-copy">改用复制</button>`
+        : '';
+    const actionAttrs = moveBlocked ? ' disabled aria-disabled="true"' : '';
     el.classList.remove('hidden');
     el.innerHTML = `
         <div>
             <strong>待${modeText} ${escapeHtml(String(buffer.entries.length))} 项</strong>
             <span>来源：${escapeHtml(buffer.source_path || '根目录')}</span>
+            ${hint}
         </div>
         <div class="scraper-move-actions">
-            <button type="button" class="scraper-compact-btn scraper-primary-soft" data-scraper-action="${actionName}">${modeText}到当前目录</button>
+            ${convertBtn}
+            <button type="button" class="scraper-compact-btn scraper-primary-soft${moveBlocked ? ' btn-disabled' : ''}" data-scraper-action="${actionName}"${actionAttrs}>${escapeHtml(actionLabel)}</button>
             <button type="button" class="scraper-compact-btn" data-scraper-action="${clearName}">取消</button>
         </div>
     `;
@@ -2060,7 +2078,7 @@ function prepareMove() {
     };
     clearSelection();
     renderEntries();
-    showToast('已记录待移动条目，请进入目标目录后执行移动', { tone: 'info', duration: 3000, placement: 'top-center' });
+    showToast('已记录待移动条目，请进入目标目录后执行移动（移动只在同一个网盘内可用）', { tone: 'info', duration: 3400, placement: 'top-center' });
 }
 
 function prepareCopy() {
@@ -2089,7 +2107,12 @@ async function moveHere() {
     const buffer = state.moveBuffer;
     if (!buffer || !buffer.entries?.length) return;
     if (buffer.provider !== state.provider) {
-        showToast('待移动条目与当前网盘不一致', { tone: 'warn', duration: 2600, placement: 'top-center' });
+        // 跨网盘移动会删源文件，一旦出错无法回滚，所以只提供复制。
+        showToast('移动只能在同一个网盘内使用。跨网盘请改用「复制」，复制完成后源文件仍会保留。', {
+            tone: 'warn',
+            duration: 4600,
+            placement: 'top-center',
+        });
         return;
     }
     if (normalizeCid(buffer.source_cid) === normalizeCid(state.cid)) {
@@ -2105,6 +2128,7 @@ async function moveHere() {
         const data = await window.MediaHubApi.postJson(`/scraper/${encodeURIComponent(state.provider)}/move`, {
             entry_ids: buffer.entries.map(item => item.id),
             source_cid: buffer.source_cid,
+            source_provider: buffer.provider,
             target_cid: state.cid,
             entries: buffer.entries.map(buildMonitorEntrySnapshot),
             target_parent_path: currentParentPath(),
@@ -2118,11 +2142,136 @@ async function moveHere() {
     }
 }
 
+function joinScraperPanPath(dir, name) {
+    const segments = [];
+    [dir, name].forEach(part => {
+        const text = String(part == null ? '' : part).trim().replace(/^\/+|\/+$/g, '');
+        if (text) segments.push(text);
+    });
+    return segments.length ? `/${segments.join('/')}` : '';
+}
+
+function formatScraperSize(value) {
+    const size = Number(value || 0) || 0;
+    if (size <= 0) return '';
+    const units = ['B', 'KB', 'MB', 'GB', 'TB'];
+    let next = size;
+    let unit = 0;
+    while (next >= 1024 && unit < units.length - 1) {
+        next /= 1024;
+        unit += 1;
+    }
+    return `${next >= 100 || unit === 0 ? Math.round(next) : next.toFixed(1)}${units[unit]}`;
+}
+
+/**
+ * 跨网盘粘贴：把当前剪贴板（来源网盘）里的文件/文件夹复制到当前网盘目录。
+ * 跨盘必须先把文件下载到本地暂存再上传（秒传命中时只下载），
+ * 所以这里先明确告诉用户"会比同盘复制慢"，再逐个建任务。
+ * 文件夹也支持：一个文件夹 = 一个任务，任务内部会逐个文件复制。
+ */
+async function crossCopyHere(buffer) {
+    const entries = Array.isArray(buffer.entries) ? buffer.entries : [];
+    const folders = entries.filter(item => item && item.is_dir);
+    const files = entries.filter(item => item && !item.is_dir);
+    if (!entries.length) {
+        showToast('没有可复制的文件', { tone: 'warn', duration: 2400, placement: 'top-center' });
+        return;
+    }
+    const sourceLabel = getProviderLabel(buffer.provider);
+    const targetLabel = getProviderLabel(state.provider);
+    const targetDir = currentParentPath() || '根目录';
+    const totalBytes = files.reduce((sum, item) => sum + (Number(item.size) || 0), 0);
+
+    // 能力矩阵：源必须能取直链、目标必须能上传，不满足时直接说清原因
+    let capabilities = null;
+    try {
+        capabilities = await window.MediaHubApi.getJson('/cross_copy/capabilities');
+    } catch (error) {
+        capabilities = null;
+    }
+    const providerState = name => (Array.isArray(capabilities?.providers) ? capabilities.providers : [])
+        .find(item => String(item?.name || '') === String(name));
+    const sourceState = providerState(buffer.provider);
+    const targetState = providerState(state.provider);
+    if (sourceState && !sourceState.can_be_source) {
+        showToast(`${sourceLabel} 暂不支持作为跨盘复制源`, { tone: 'warn', duration: 3600, placement: 'top-center' });
+        return;
+    }
+    if (targetState && !targetState.can_be_target) {
+        showToast(`${targetLabel} 暂不支持作为跨盘复制目标`, { tone: 'warn', duration: 3600, placement: 'top-center' });
+        return;
+    }
+
+    const whatText = folders.length
+        ? `${files.length ? `${files.length} 个文件、` : ''}${folders.length} 个文件夹`
+        : `${files.length} 个文件`;
+    const message = [
+        `将 ${whatText}从 ${sourceLabel} 复制到 ${targetLabel} 的「${targetDir}」${totalBytes > 0 ? `（文件合计约 ${formatScraperSize(totalBytes)}）` : ''}。`,
+        '',
+        '跨网盘复制需要先把文件下载到本地暂存，再上传到目标网盘；',
+        '大文件会明显比同盘复制慢，速度取决于源网盘的下载速度。',
+        folders.length ? '文件夹会逐个文件复制，大文件夹会比较慢。' : '',
+        '目标网盘已有同一文件时会命中秒传，只下载、不上传。',
+        '任务在后台执行，可在「任务 → 跨盘复制」查看进度，期间可以继续做别的事。',
+    ].filter(line => line !== '').join('\n');
+    const ok = await showConfirm(message, { title: '跨网盘复制', confirmText: '创建任务' });
+    if (!ok) return;
+
+    const sourceDir = String(buffer.source_path || '').replace(/^\/+|\/+$/g, '');
+    let created = 0;
+    const failures = [];
+    for (const item of entries) {
+        const isDir = !!item.is_dir;
+        try {
+            await window.MediaHubApi.postJson('/cross_copy/jobs', {
+                source_provider: buffer.provider,
+                target_provider: state.provider,
+                source_file_id: item.id,
+                source_is_dir: isDir,
+                target_dir_id: state.cid || '0',
+                target_savepath: currentParentPath(),
+                source_path: joinScraperPanPath(sourceDir, item.name),
+                target_path: joinScraperPanPath(currentParentPath(), item.name),
+                filename: item.name,
+                file_size: isDir ? 0 : (Number(item.size) || 0),
+                title: item.name,
+                origin_ref: 'file-manager-paste',
+            });
+            created += 1;
+        } catch (error) {
+            failures.push(`${item.name}：${error?.message || '创建失败'}`);
+        }
+    }
+    state.copyBuffer = null;
+    renderMoveBuffer();
+    renderEntries();
+    if (created && !failures.length) {
+        showToast(`已创建 ${created} 个跨盘复制任务，进度见任务中心`, {
+            tone: 'success',
+            duration: 3600,
+            placement: 'top-center',
+        });
+    } else if (created) {
+        showToast(`已创建 ${created} 个任务，${failures.length} 个失败：${failures[0]}`, {
+            tone: 'warn',
+            duration: 4600,
+            placement: 'top-center',
+        });
+    } else {
+        showToast(`创建跨盘复制任务失败：${failures[0] || '未知错误'}`, {
+            tone: 'error',
+            duration: 4600,
+            placement: 'top-center',
+        });
+    }
+}
+
 async function copyHere() {
     const buffer = state.copyBuffer;
     if (!buffer || !buffer.entries?.length) return;
     if (buffer.provider !== state.provider) {
-        showToast('待复制条目与当前网盘不一致', { tone: 'warn', duration: 2600, placement: 'top-center' });
+        await crossCopyHere(buffer);
         return;
     }
     if (normalizeCid(buffer.source_cid) === normalizeCid(state.cid)) {
@@ -3683,6 +3832,15 @@ function handleClick(event) {
     if (action === 'monitor-scan') void scanMonitorDir();
     if (action === 'copy-here') void copyHere();
     if (action === 'move-here') void moveHere();
+    if (action === 'convert-move-to-copy') {
+        // 跨网盘移动被禁用，一键把待移动清单转成待复制清单，省得用户重新选一遍
+        if (state.moveBuffer) {
+            state.copyBuffer = { ...state.moveBuffer };
+            state.moveBuffer = null;
+            renderEntries();
+            showToast('已改为复制，确认目标目录后点「跨网盘复制到此」', { tone: 'info', duration: 3200, placement: 'top-center' });
+        }
+    }
     if (action === 'clear-copy') {
         state.copyBuffer = null;
         renderEntries();

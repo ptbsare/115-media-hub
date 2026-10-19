@@ -1399,6 +1399,7 @@
                 setSubscriptionShareSubdirSelection('', '');
                 resetSubscriptionShareFolderBrowser();
             }
+            syncSubscriptionCrossCopyUI();
         }
 
         function syncSubscriptionTypeUI({ forceSuggestTotal = false } = {}) {
@@ -1469,6 +1470,125 @@
             if (Array.isArray(trail) && trail.length) {
                 subscriptionFolderTrail = trail;
             }
+        }
+
+        const SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES = [{ name: 'quark', label: '夸克网盘' }];
+        let subscriptionCrossCopySourcesCache = null;
+        let subscriptionCrossCopySourcesPromise = null;
+        let subscriptionCrossCopyPendingSources = [];
+
+        function getSubscriptionCrossCopyMode() {
+            const checked = document.querySelector('input[name="subscription_cross_copy_mode"]:checked');
+            const value = String(checked?.value || 'off').trim().toLowerCase();
+            return ['off', 'fallback', 'prefer'].includes(value) ? value : 'off';
+        }
+
+        function setSubscriptionCrossCopyMode(mode = 'off') {
+            const normalized = ['off', 'fallback', 'prefer'].includes(String(mode || '').trim().toLowerCase())
+                ? String(mode || '').trim().toLowerCase()
+                : 'off';
+            const inputs = document.querySelectorAll('input[name="subscription_cross_copy_mode"]');
+            inputs.forEach(input => {
+                input.checked = String(input.value) === normalized;
+            });
+        }
+
+        function getSelectedSubscriptionCrossCopySources() {
+            return Array.from(document.querySelectorAll('[data-subscription-cross-copy-source]'))
+                .filter(input => input.checked && !input.disabled)
+                .map(input => String(input.dataset.subscriptionCrossCopySource || '').trim())
+                .filter(Boolean);
+        }
+
+        function setSubscriptionCrossCopySources(sources = []) {
+            const selected = new Set((Array.isArray(sources) ? sources : []).map(item => String(item || '').trim()));
+            subscriptionCrossCopyPendingSources = Array.from(selected);
+            document.querySelectorAll('[data-subscription-cross-copy-source]').forEach(input => {
+                input.checked = selected.has(String(input.dataset.subscriptionCrossCopySource || '').trim());
+            });
+        }
+
+        async function loadSubscriptionCrossCopySources() {
+            if (subscriptionCrossCopySourcesCache) return subscriptionCrossCopySourcesCache;
+            if (subscriptionCrossCopySourcesPromise) return subscriptionCrossCopySourcesPromise;
+            subscriptionCrossCopySourcesPromise = (async () => {
+                try {
+                    const capabilities = await window.fetchCrossCopyCapabilities?.();
+                    const providers = Array.isArray(capabilities?.providers) ? capabilities.providers : [];
+                    const sources = providers
+                        .filter(item => item?.can_be_source)
+                        .map(item => ({ name: String(item.name || ''), label: String(item.label || item.name || '') }));
+                    subscriptionCrossCopySourcesCache = sources.length ? sources : SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES;
+                } catch (e) {
+                    subscriptionCrossCopySourcesCache = SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES;
+                } finally {
+                    subscriptionCrossCopySourcesPromise = null;
+                }
+                return subscriptionCrossCopySourcesCache;
+            })();
+            return subscriptionCrossCopySourcesPromise;
+        }
+
+        function renderSubscriptionCrossCopySources(sources = []) {
+            const container = document.getElementById('subscription-cross-copy-sources');
+            if (!container) return;
+            const provider = getCurrentSubscriptionProvider();
+            const list = Array.isArray(sources) && sources.length ? sources : SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES;
+            const previous = new Set(getSelectedSubscriptionCrossCopySources());
+            const pending = new Set(subscriptionCrossCopyPendingSources);
+            subscriptionCrossCopyPendingSources = [];
+            container.innerHTML = list.map(item => {
+                const isSelf = String(item.name) === String(provider);
+                const checked = (previous.has(String(item.name)) || pending.has(String(item.name))) && !isSelf;
+                return `
+                    <label class="flex items-center gap-2 rounded-xl border border-slate-700 bg-slate-950/40 px-3 py-2 text-sm ${isSelf ? 'opacity-50' : ''}" title="${escapeHtml(isSelf ? '该网盘是本任务的目标盘，不能作为源网盘' : '从该网盘复制资源')}">
+                        <input
+                            type="checkbox"
+                            class="ui-checkbox"
+                            data-subscription-cross-copy-source="${escapeHtml(item.name)}"
+                            ${checked ? 'checked' : ''}
+                            ${isSelf ? 'disabled' : ''}
+                            onchange="syncSubscriptionCrossCopyUI()"
+                        >
+                        <span>${escapeHtml(item.label || item.name)}</span>
+                    </label>
+                `;
+            }).join('');
+        }
+
+        function syncSubscriptionCrossCopyUI() {
+            const mode = getSubscriptionCrossCopyMode();
+            const disabled = mode === 'off';
+            document.querySelectorAll('[data-subscription-cross-copy-source]').forEach(input => {
+                const isSelf = String(input.dataset.subscriptionCrossCopySource || '') === String(getCurrentSubscriptionProvider());
+                input.disabled = disabled || isSelf;
+            });
+            const container = document.getElementById('subscription-cross-copy-sources');
+            if (container) container.classList.toggle('opacity-50', disabled);
+            const hintEl = document.getElementById('subscription-cross-copy-hint');
+            if (hintEl) {
+                if (disabled) {
+                    hintEl.textContent = '已关闭：只用自家网盘候选，不做跨盘复制。';
+                } else if (!getSelectedSubscriptionCrossCopySources().length) {
+                    hintEl.textContent = '请至少勾选一个源网盘。勾选后，任务才会从该网盘补源。';
+                } else {
+                    hintEl.textContent = '复制只读取源网盘，不会删除源文件；暂存位置和空间预检在参数配置的「存储位置」中设置。';
+                }
+            }
+            void loadSubscriptionCrossCopySources().then(sources => {
+                const containerEl = document.getElementById('subscription-cross-copy-sources');
+                if (containerEl && !containerEl.dataset.renderedFor) {
+                    renderSubscriptionCrossCopySources(sources);
+                    containerEl.dataset.renderedFor = '1';
+                    syncSubscriptionCrossCopyUI();
+                    return;
+                }
+                if (containerEl && containerEl.dataset.renderedFor !== String(getCurrentSubscriptionProvider())) {
+                    renderSubscriptionCrossCopySources(sources);
+                    containerEl.dataset.renderedFor = String(getCurrentSubscriptionProvider());
+                    syncSubscriptionCrossCopyUI();
+                }
+            });
         }
 
         function currentSubscriptionFormData() {
@@ -1558,6 +1678,8 @@
                 tmdb_episode_mode: tmdbBinding.tmdb_episode_mode,
                 organize_on_import: !!document.getElementById('subscription_organize_on_import')?.checked,
                 organize_options: collectSubscriptionOrganizeOptions(),
+                cross_copy_mode: getSubscriptionCrossCopyMode(),
+                cross_copy_sources: getSelectedSubscriptionCrossCopySources(),
             };
         }
 
@@ -1584,6 +1706,9 @@
             const organizeToggleEl = document.getElementById('subscription_organize_on_import');
             if (organizeToggleEl) organizeToggleEl.checked = true;
             applySubscriptionOrganizeOptions({});
+            setSubscriptionCrossCopyMode('off');
+            setSubscriptionCrossCopySources([]);
+            syncSubscriptionCrossCopyUI();
             setSubscriptionSavepath('0', '');
             const shareLinkInput = document.getElementById('subscription_share_link_url');
             if (shareLinkInput) shareLinkInput.value = '';
@@ -1669,6 +1794,15 @@
         async function saveSubscriptionTask() {
             const task = currentSubscriptionFormData();
             task.provider = normalizeSubscriptionProvider(task.provider, '115');
+            const crossCopyMode = String(task.cross_copy_mode || 'off').trim().toLowerCase();
+            const crossCopySources = (Array.isArray(task.cross_copy_sources) ? task.cross_copy_sources : [])
+                .map(item => String(item || '').trim())
+                .filter(item => item && item !== task.provider);
+            if (crossCopyMode !== 'off' && !crossCopySources.length) {
+                return showToast('已开启跨盘补源，请至少勾选一个源网盘', { tone: 'warn', duration: 3000, placement: 'top-center' });
+            }
+            task.cross_copy_mode = crossCopyMode === 'off' ? 'off' : crossCopyMode;
+            task.cross_copy_sources = task.cross_copy_mode === 'off' ? [] : crossCopySources;
             const _taskP = (window.providerMeta || []).find(m => m.name === task.provider);
             const _hasFixedShare = _taskP && _taskP.supports_fixed_share_link;
             const _hasOffline = _taskP && _taskP.supports_offline;
@@ -1798,6 +1932,9 @@
             const organizeToggleEl = document.getElementById('subscription_organize_on_import');
             if (organizeToggleEl) organizeToggleEl.checked = task.organize_on_import !== false;
             applySubscriptionOrganizeOptions(task.organize_options || {});
+            setSubscriptionCrossCopyMode(task.cross_copy_mode || 'off');
+            setSubscriptionCrossCopySources(Array.isArray(task.cross_copy_sources) ? task.cross_copy_sources : []);
+            syncSubscriptionCrossCopyUI();
             subscriptionFolderTrail = [{ id: '0', name: '根目录' }];
             setSubscriptionSavepath('0', task.savepath || '');
             const shareLinkInput = document.getElementById('subscription_share_link_url');
@@ -2259,6 +2396,13 @@
                     ? '<span class="subscription-strict-match-badge">精准</span>'
                     : '';
                 const lastHitBadgeHtml = buildSubscriptionLastHitBadge(task);
+                const crossCopyMode = String(task?.cross_copy_mode || 'off').trim().toLowerCase();
+                const crossCopySourceNames = Array.isArray(task?.cross_copy_sources)
+                    ? task.cross_copy_sources.map(name => String(name || '').trim()).filter(Boolean)
+                    : [];
+                const crossCopyBadgeHtml = crossCopyMode !== 'off' && crossCopySourceNames.length
+                    ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-400/25" title="${escapeHtml(crossCopyMode === 'prefer' ? '优先跨盘：每次命中都从源网盘复制' : '兜底：自家网盘没命中才跨盘复制')}">补源：${escapeHtml(crossCopySourceNames.map(name => getSubscriptionProviderLabel(name)).join('、'))}</span>`
+                    : '';
                 const running = subscriptionState.running && subscriptionState.current_task === taskName;
                 const queued = (subscriptionState.queued || []).includes(taskName);
                 const status = running ? 'running' : (task.status || 'idle');
@@ -2360,6 +2504,7 @@
                                     <div class="flex flex-wrap items-center gap-2">
                                         <span class="text-lg font-black text-white break-all leading-tight">${escapeHtml(displayTitle)}</span>
                                         ${providerBadgeHtml}
+                                        ${crossCopyBadgeHtml}
                                         ${strictBadgeHtml}
                                         ${lastHitBadgeHtml}
                                     </div>

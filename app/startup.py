@@ -23,6 +23,7 @@ from .services.resource import (
 from .services.sign115 import refresh_sign115_status, run_sign115_job
 from .services.subscription import queue_subscription_job
 from .services.scraper import requeue_scraper_jobs_on_startup
+from .services.cross_copy_jobs import requeue_cross_copy_jobs_on_startup
 from .services.monitor_runs import (
     cleanup_runs,
     reconcile_waiting_runs,
@@ -119,6 +120,10 @@ async def startup() -> None:
         requeue_scraper_jobs_on_startup()
     except Exception:
         logging.exception("Failed to requeue scraper jobs on startup")
+    try:
+        requeue_cross_copy_jobs_on_startup()
+    except Exception:
+        logging.exception("Failed to requeue cross-copy jobs on startup")
     os.makedirs(LOG_DIR, exist_ok=True)
     restore_runtime_logs_from_files()
 

@@ -285,7 +285,7 @@
             resource: { title: '资源中心' },
             recommendation: { title: '资源推荐' },
             subscription: { title: '影视订阅' },
-            scraper: { title: '刮削管理' },
+            scraper: { title: '文件管理' },
             monitor: { title: '文件夹监控' },
             task: { title: '目录树同步' },
             settings: { title: '参数配置' },

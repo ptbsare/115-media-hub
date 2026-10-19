@@ -1,7 +1,91 @@
 import threading
 import time
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Protocol, runtime_checkable
+
+
+class UploadError(RuntimeError):
+    """上传失败。
+
+    message 为面向用户的文案（错误码映射见复制引擎的人话映射表）；
+    retriable=True 表示瞬时故障（限流/网络），值得按退避策略重试。
+    """
+
+    def __init__(self, message: str, *, retriable: bool = False, provider: str = ""):
+        super().__init__(str(message))
+        self.retriable = bool(retriable)
+        self.provider = str(provider or "")
+
+
+class UploadResult:
+    """单文件上传结果。
+
+    status:
+        - "rapid"     秒传命中（目标网盘已有同哈希文件，零上传流量）
+        - "uploaded"  实际上传完成
+    """
+
+    __slots__ = ("status", "file_id", "pick_code", "name", "size", "sha1", "message")
+
+    def __init__(
+        self,
+        *,
+        status: str,
+        file_id: str = "",
+        pick_code: str = "",
+        name: str = "",
+        size: int = 0,
+        sha1: str = "",
+        message: str = "",
+    ):
+        self.status = str(status or "")
+        self.file_id = str(file_id or "")
+        self.pick_code = str(pick_code or "")
+        self.name = str(name or "")
+        self.size = int(size or 0)
+        self.sha1 = str(sha1 or "").upper()
+        self.message = str(message or "")
+
+    @property
+    def is_rapid(self) -> bool:
+        return self.status == "rapid"
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {key: getattr(self, key) for key in self.__slots__}
+
+    def __repr__(self) -> str:  # pragma: no cover - 调试用
+        return f"<UploadResult {self.status} name={self.name!r} size={self.size} sha1={self.sha1[:12]}>"
+
+
+@runtime_checkable
+class UploadSink(Protocol):
+    """上传数据源协议（鸭子类型，不要求显式继承）。
+
+    复制引擎以两种形态实现：
+        - 内存流（io.BytesIO，小文件）
+        - 临时文件（大文件，可断点续传）
+
+    必需：
+        read(n) -> bytes      顺序读取
+        seek(off, whence)     定位（ whence: 0=开头 1=当前 2=结尾 ）
+        tell() -> int         当前位置
+        size: int             总大小
+
+    可选：
+        sha1: str             上层已同步计算的 SHA1（大写十六进制）；
+                              提供则可避免 provider 重复读取一遍
+        name: str             文件名（sink 来自临时文件时有用）
+    """
+
+    def read(self, n: int = -1) -> bytes: ...
+
+    def seek(self, offset: int, whence: int = 0) -> int: ...
+
+    def tell(self) -> int: ...
+
+    @property
+    def size(self) -> int: ...
+
 
 class CloudProvider(ABC):
     # === 元数据（子类覆盖） ===
@@ -26,6 +110,10 @@ class CloudProvider(ABC):
     supports_move: bool = False
     supports_copy: bool = False
     supports_delete: bool = False
+    # NEW — upload / rapid upload (秒传)
+    supports_upload: bool = False
+    supports_rapid_upload: bool = False
+    supports_upload_resume: bool = False
 
     # === 限流 ===
     rate_limit_seconds: float = 0.0
@@ -91,6 +179,38 @@ class CloudProvider(ABC):
 
     def delete_entries(self, cookie: str, entry_ids: List[str], parent_id: str = "") -> Dict[str, Any]:
         raise NotImplementedError(f"{self.label} 不支持删除")
+
+    # === 上传（可选，子类按能力覆写） ===
+    def upload_file(
+        self,
+        cookie: str,
+        sink: "UploadSink",
+        filename: str,
+        target_dir_id: str = "0",
+        *,
+        sha1: str = "",
+        md5: str = "",
+        size: int = -1,
+        progress_cb=None,
+        cancel_check=None,
+        **kwargs: Any,
+    ) -> "UploadResult":
+        """把 sink 中的数据上传到网盘目录。
+
+        :param sink: 数据源（见 UploadSink 协议，内存流或临时文件均可）
+        :param filename: 保存的文件名
+        :param target_dir_id: 目标目录 id（"0" 为根目录）
+        :param sha1: 上层已计算的 SHA1（大写十六进制）；为空则实现自行读取计算
+        :param md5: 上层已计算的 MD5（小写十六进制）；夸克秒传需要，其余网盘可忽略
+        :param size: 文件总大小；为 -1 时由 sink.size 提供
+        :param progress_cb: 进度回调 fn(sent_bytes, total_bytes)
+        :param cancel_check: 取消检查 fn() -> bool，返回 True 时中止上传
+        """
+        raise NotImplementedError(f"{self.label} 不支持上传")
+
+    def abort_upload(self, cookie: str, upload_handle: Dict[str, Any]) -> bool:
+        """尽力中止一次进行中的上传（取消语义见设计文档 §4.5）。默认不支持。"""
+        return False
 
     # === 限流工具 ===
     def throttle(self) -> None:

@@ -9,6 +9,8 @@ services:
       - /Users/xianer/Documents/docker/115strmxianer/strm:/app/strm
       - /Users/xianer/Documents/docker/115strmxianer/logs:/app/logs
       - /Users/xianer/Documents/docker/115strmxianer/config:/app/config
+      # 额外存储（跨盘复制暂存区用；按需改为你的机械硬盘/NAS 路径，不映射则暂存落在 config 卷）
+      # - /Volumes/media:/app/storage
 
     ports:
       - "18080:18080"

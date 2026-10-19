@@ -1,12 +1,19 @@
+import base64
+import hashlib
+import hmac
 import http.client
 import logging
+import re
 import socket
 import threading
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 
 from .common import parse_int
-from .base import CloudProvider
+from .base import CloudProvider, UploadError, UploadResult
+from .pan115_cipher import decode_upload_response, make_upload_payload
+from .pan115_downurl import is_115_size_limit_error, resolve_115_download_url_by_downurl
 from .registry import register
 from ..share_selection import normalize_share_selection_meta
 from ..core import *  # noqa: F401,F403
@@ -329,6 +336,32 @@ def get_115_file_sha1_by_id(cookie: str, file_id: str, attempts: int = 3) -> str
     return ""
 
 
+def get_115_file_hash(cookie: str, file_id: str) -> Dict[str, Any]:
+    """按 id 取 115 文件的 SHA1 + 大小（跨盘复制秒传探测用，不下载文件）。
+
+    115 的文件信息接口本来就返回 ``sha1``，所以源端是 115 时跨盘复制只需一次
+    元信息请求就能拿到秒传所需的 ``sha1 + size``，整文件下载可以被省掉。
+    传 pick_code 时先换成真实 fid；目录 / 拿不到哈希时返回 ``{}``。
+    """
+    cookie = str(cookie or "").strip()
+    token = str(file_id or "").strip()
+    if not cookie or not token:
+        return {}
+    fid = ensure_115_file_id(cookie, token, action="读取文件哈希")
+    info = get_115_file_info(cookie, fid)
+    if not isinstance(info, dict) or bool(info.get("is_dir")):
+        return {}
+    sha1 = str(info.get("sha1", "") or "").strip().upper()
+    size = parse_int(info.get("size", 0), default=0)
+    if not sha1 or size <= 0:
+        return {}
+    return {
+        "sha1": sha1,
+        "size": size,
+        "name": str(info.get("name", "") or "").strip(),
+    }
+
+
 def get_115_file_info(cookie: str, file_id: str) -> Dict[str, Any]:
     """按 file_id 直查 115 文件信息（即时，不受目录列表缓存延迟影响）。"""
     cookie = str(cookie or "").strip()
@@ -372,6 +405,316 @@ def get_115_file_info(cookie: str, file_id: str) -> Dict[str, Any]:
             "is_dir": not bool(item_fid),
         }
     raise RuntimeError(f"115 文件不存在或已删除：{normalized_id}")
+
+
+# ============================================================
+# pick_code → file_id 推导
+#
+# 115 的分享接收、离线任务、导出目录树等接口有的只回 pick_code（pc），
+# 上层把它当 entry id 用时，删除 / 取直链 / 上传回调定位都会失败。
+# 这里用 web 版文件信息接口按 pick_code 反查真实 fid：
+#   GET https://webapi.115.com/files/get_info?pick_code=<pick_code>
+# 响应 {"state": true, "data": [{"fid": "...", "pc": "...", ...}]}。
+# 出处：xhofe/115driver pkg/driver/api.go 的 ApiFileInfo 常量，
+# 以及 AList drivers/115 中 getFileInfoWithThumb("pick_code", pickCode) 的调用方式；
+# 官方开放接口 /open/ufile/downurl 的响应同样以 file_id 作为 map key，
+# 可交叉印证 pick_code 对应的就是该 fid。
+# ============================================================
+
+_115_PICK_CODE_FID_CACHE_TTL_SECONDS = 10 * 60
+_115_PICK_CODE_FID_CACHE_MAX_ROWS = 2000
+_115_PICK_CODE_PATTERN = re.compile(r"^[0-9a-z]{6,64}$", re.IGNORECASE)
+
+_115_pick_code_fid_cache: Dict[str, Dict[str, Any]] = {}
+_115_pick_code_fid_cache_lock = threading.Lock()
+
+
+def is_115_pick_code_like(value: Any) -> bool:
+    """判断 entry id 是否像 pick_code。
+
+    115 的 fid 是纯数字；pick_code 是 6-64 位字母数字混合串（实际约 17-20 位）。
+    纯数字直接透传，避免给正常 fid 平白多发一次请求。
+    """
+    token = str(value or "").strip()
+    if (not token) or token.isdigit():
+        return False
+    return bool(_115_PICK_CODE_PATTERN.fullmatch(token))
+
+
+def _prune_115_pick_code_fid_cache_locked(now_ts: float) -> None:
+    if not _115_pick_code_fid_cache:
+        return
+    expired_keys = [
+        key
+        for key, payload in _115_pick_code_fid_cache.items()
+        if now_ts >= float((payload or {}).get("expires_at", 0.0) or 0.0)
+    ]
+    for key in expired_keys:
+        _115_pick_code_fid_cache.pop(key, None)
+    max_rows = max(200, int(_115_PICK_CODE_FID_CACHE_MAX_ROWS or 2000))
+    if len(_115_pick_code_fid_cache) <= max_rows:
+        return
+    ordered = sorted(
+        _115_pick_code_fid_cache.items(),
+        key=lambda item: float((item[1] or {}).get("updated_at", 0.0) or 0.0),
+    )
+    for key, _ in ordered[: len(_115_pick_code_fid_cache) - max_rows]:
+        _115_pick_code_fid_cache.pop(key, None)
+
+
+def _get_cached_115_file_id(pick_code: str) -> str:
+    now_ts = time.time()
+    with _115_pick_code_fid_cache_lock:
+        _prune_115_pick_code_fid_cache_locked(now_ts)
+        payload = _115_pick_code_fid_cache.get(pick_code)
+        if not payload:
+            return ""
+        if now_ts >= float(payload.get("expires_at", 0.0) or 0.0):
+            _115_pick_code_fid_cache.pop(pick_code, None)
+            return ""
+        return str(payload.get("file_id", "") or "").strip()
+
+
+def _store_cached_115_file_id(pick_code: str, file_id: str) -> None:
+    if (not pick_code) or (not file_id):
+        return
+    now_ts = time.time()
+    with _115_pick_code_fid_cache_lock:
+        _115_pick_code_fid_cache[pick_code] = {
+            "file_id": file_id,
+            "expires_at": now_ts + _115_PICK_CODE_FID_CACHE_TTL_SECONDS,
+            "updated_at": now_ts,
+        }
+        _prune_115_pick_code_fid_cache_locked(now_ts)
+
+
+def invalidate_115_pick_code_fid_cache() -> None:
+    """清空 pick_code → fid 缓存（换账号、删除文件后重试时用）。"""
+    with _115_pick_code_fid_cache_lock:
+        _115_pick_code_fid_cache.clear()
+
+
+def _extract_115_file_id_from_get_info(payload: Dict[str, Any], pick_code: str) -> str:
+    """从 get_info 响应里取 fid；目录没有 fid，视为无法定位（返回空串）。"""
+    data = (payload or {}).get("data")
+    items = data if isinstance(data, list) else ([data] if isinstance(data, dict) else [])
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_pick_code = str(item.get("pc") or item.get("pick_code") or "").strip()
+        if item_pick_code and item_pick_code != pick_code:
+            continue
+        # 只认 fid/file_id：文件的父目录在 cid，绝不能拿 cid 当文件 id。
+        file_id = str(item.get("fid") or item.get("file_id") or "").strip()
+        if file_id:
+            return file_id
+    return ""
+
+
+def resolve_file_id_by_pick_code(cookie: str, pick_code: str) -> str:
+    """按 pick_code 反查 115 file_id（fid）。
+
+    成功返回 fid，失败 / 接口异常返回空串（调用方负责降级），不抛异常。
+    结果缓存 10 分钟，避免同一文件反复查询。
+    """
+    cookie = str(cookie or "").strip()
+    normalized_pick_code = str(pick_code or "").strip()
+    if (not cookie) or (not normalized_pick_code):
+        return ""
+    if not is_115_pick_code_like(normalized_pick_code):
+        return ""
+
+    cached_file_id = _get_cached_115_file_id(normalized_pick_code)
+    if cached_file_id:
+        return cached_file_id
+
+    try:
+        throttle_115_api_requests()
+        url = "https://webapi.115.com/files/get_info?pick_code=" + urllib.parse.quote(normalized_pick_code)
+        result = _request_115_webapi_json(url, headers=_build_115_webapi_headers(cookie))
+    except Exception as exc:
+        logging.warning(
+            "115 按 pick_code 查询 file_id 失败 pick_code=%s: %s",
+            normalized_pick_code[:8] + "***" if len(normalized_pick_code) > 8 else normalized_pick_code,
+            exc,
+        )
+        mark_cookie_health_failure("115", exc, trigger="runtime:resolve_file_id_by_pick_code")
+        return ""
+
+    if not bool((result or {}).get("state", False)):
+        detail = (
+            str((result or {}).get("error", "")).strip()
+            or str((result or {}).get("msg", "")).strip()
+            or str((result or {}).get("message", "")).strip()
+            or "115 文件信息查询失败"
+        )
+        logging.info("115 按 pick_code 查不到文件 pick_code=%s: %s", normalized_pick_code, detail)
+        return ""
+
+    file_id = _extract_115_file_id_from_get_info(result, normalized_pick_code)
+    if not file_id:
+        logging.info("115 按 pick_code 未取到 fid（可能是目录或文件已删除） pick_code=%s", normalized_pick_code)
+        return ""
+
+    _store_cached_115_file_id(normalized_pick_code, file_id)
+    mark_cookie_health_success("115", trigger="runtime:resolve_file_id_by_pick_code")
+    return file_id
+
+
+def resolve_file_ids_by_pick_codes(cookie: str, pick_codes: List[str]) -> Dict[str, str]:
+    """批量版：逐个解析但复用缓存，返回 {pick_code: fid}（失败的值为空串）。
+
+    get_info 没有可靠的批量参数，这里只做去重 + 缓存复用，避免重复请求。
+    """
+    resolved: Dict[str, str] = {}
+    for raw_code in pick_codes or []:
+        pick_code = str(raw_code or "").strip()
+        if (not pick_code) or pick_code in resolved:
+            continue
+        resolved[pick_code] = resolve_file_id_by_pick_code(cookie, pick_code)
+    return resolved
+
+
+def ensure_115_file_id(cookie: str, entry_id: str, *, action: str = "定位文件") -> str:
+    """把可能是 pick_code 的 entry id 换成真正的 fid。
+
+    fid 原样返回；pick_code 换不到时报人话错误，不拿 pick_code 硬发请求。
+    """
+    token = str(entry_id or "").strip()
+    if not token:
+        raise RuntimeError(f"缺少文件 ID，无法{action}")
+    if not is_115_pick_code_like(token):
+        return token
+    file_id = resolve_file_id_by_pick_code(cookie, token)
+    if not file_id:
+        raise RuntimeError("无法从 pick_code 定位文件，请刷新目录后重试")
+    return file_id
+
+
+def _collect_115_download_urls(payload: Any) -> List[str]:
+    """从 115 下载接口响应里递归收集 http(s) 链接。"""
+    urls: List[str] = []
+    seen = set()
+
+    def push(value: Any) -> None:
+        token = str(value or "").strip()
+        if (not token) or (not token.lower().startswith(("http://", "https://"))) or token in seen:
+            return
+        seen.add(token)
+        urls.append(token)
+
+    def walk(node: Any) -> None:
+        if isinstance(node, str):
+            push(node)
+            return
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        for key in ("file_url", "url", "download_url", "download_url_web", "download_url_web2"):
+            walk(node.get(key))
+        for key in ("data", "urls", "result", "info"):
+            walk(node.get(key))
+
+    walk(payload)
+    return urls
+
+
+def resolve_115_download_info(cookie: str, file_id: str) -> Dict[str, Any]:
+    """取 115 文件下载直链 + 元信息（两段式取链）。
+
+    入口先做 pick_code → fid 归一：传进来的是 pick_code 时先换 fid，
+    换不到就报明确错误；传 fid 时按 fid 查 pickcode 再取链。
+
+    第一段走 webapi ``/files/download``（小文件快且稳）；如果 115 明确拒绝
+    大文件（errno ``50028``「文件大小超出限制，请用电脑端下载」），第二段改走
+    电脑端的加密 downurl 通道（见 ``pan115_downurl``），满足 GB 级影片的取链。
+    """
+    cookie = str(cookie or "").strip()
+    token = str(file_id or "").strip()
+    if not cookie:
+        raise RuntimeError("115 Cookie 未配置")
+    if not token:
+        raise RuntimeError("缺少文件 ID，无法获取下载地址")
+
+    file_name = ""
+    size = 0
+    sha1 = ""
+    if is_115_pick_code_like(token):
+        fid = ensure_115_file_id(cookie, token, action="获取下载地址")
+        pick_code = token
+    else:
+        fid = token
+        info = get_115_file_info(cookie, fid)
+        pick_code = str(info.get("pick_code", "") or "").strip()
+        file_name = str(info.get("name", "") or "").strip()
+        size = parse_int(info.get("size", 0), default=0)
+        sha1 = str(info.get("sha1", "") or "").strip()
+        if not pick_code:
+            raise RuntimeError("115 文件信息里没有 pickcode，无法获取下载地址，请刷新目录后重试")
+
+    try:
+        throttle_115_api_requests()
+        url = "https://webapi.115.com/files/download?pickcode=" + urllib.parse.quote(pick_code)
+        result = _request_115_webapi_json(url, headers=_build_115_webapi_headers(cookie))
+    except Exception as exc:
+        mark_cookie_health_failure("115", exc, trigger="runtime:resolve_115_download_info")
+        raise RuntimeError(f"115 下载地址获取失败：{exc}") from exc
+
+    if not bool((result or {}).get("state", False)):
+        detail = (
+            str((result or {}).get("error", "")).strip()
+            or str((result or {}).get("msg", "")).strip()
+            or str((result or {}).get("message", "")).strip()
+            or "115 下载地址解析失败"
+        )
+        # 大文件被 webapi 拒绝时改走电脑端 downurl：115 对超过阈值（实际就是
+        # 绝大多数影片）的文件只给 errno 50028，webapi 这条路永远拿不到直链。
+        if is_115_size_limit_error(result):
+            try:
+                downurl_info = resolve_115_download_url_by_downurl(
+                    cookie,
+                    pick_code=pick_code,
+                    file_id=fid,
+                )
+            except Exception as exc:
+                mark_cookie_health_failure("115", exc, trigger="runtime:resolve_115_download_info_downurl")
+                raise RuntimeError(
+                    f"115 拒绝取链：{detail}；该文件需要走电脑端下载通道，但 downurl 回退失败（{exc}）"
+                ) from exc
+            downurl_url = str(downurl_info.get("url", "") or "").strip()
+            if not downurl_url:
+                raise RuntimeError(
+                    f"115 拒绝取链：{detail}；该文件需要走电脑端下载通道，但 downurl 回退未返回下载地址"
+                )
+            mark_cookie_health_success("115", trigger="runtime:resolve_115_download_info_downurl")
+            # 返回结构保持与第一段一致，只把 downurl 能补的文件名/大小补上。
+            return {
+                "url": downurl_url,
+                "file_id": fid,
+                "pick_code": pick_code,
+                "name": file_name or str(downurl_info.get("file_name", "") or "").strip(),
+                "size": size or parse_int(downurl_info.get("size", 0), default=0),
+                "sha1": sha1,
+            }
+        raise RuntimeError(detail)
+
+    download_urls = _collect_115_download_urls(result)
+    download_url = str(download_urls[0] if download_urls else "").strip()
+    if not download_url:
+        raise RuntimeError("115 返回成功但没有解析到下载链接，请稍后重试")
+
+    mark_cookie_health_success("115", trigger="runtime:resolve_115_download_info")
+    return {
+        "url": download_url,
+        "file_id": fid,
+        "pick_code": pick_code,
+        "name": file_name,
+        "size": size,
+        "sha1": sha1,
+    }
 
 
 def resolve_115_folder_path(cookie: str, cid: str) -> Dict[str, Any]:
@@ -513,7 +856,11 @@ def _normalize_115_file_entry(item: Dict[str, Any]) -> Dict[str, Any]:
     file_id = str(source.get("fid") or source.get("file_id") or source.get("id") or "").strip()
     sha1 = str(source.get("sha1") or source.get("sha") or "").strip()
     is_dir = bool(folder_id) and not file_id and not sha1
-    entry_id = folder_id if is_dir else (file_id or str(source.get("pick_code") or source.get("pc") or sha1).strip())
+    # 只回 pick_code 的接口（分享接收 / 离线结果 / 导出目录树）先用 pc 兜底 entry_id，
+    # 保持旧调用方行为；payload 里单独保留 pick_code，真正需要 fid 时
+    # （取下载直链等）再由 ensure_115_file_id() 反查，列表 normalize 不发网络请求。
+    pick_code = str(source.get("pick_code") or source.get("pc") or "").strip()
+    entry_id = folder_id if is_dir else (file_id or pick_code or sha1)
     if not name or not entry_id:
         return {}
     payload = {
@@ -522,7 +869,7 @@ def _normalize_115_file_entry(item: Dict[str, Any]) -> Dict[str, Any]:
         "name": name,
         "is_dir": is_dir,
         "size": parse_int(source.get("s") or source.get("size") or 0),
-        "pick_code": str(source.get("pick_code") or source.get("pc") or "").strip(),
+        "pick_code": pick_code,
         "sha1": sha1,
         "modified_at": str(source.get("te") or source.get("t") or source.get("tp") or source.get("tu") or "").strip(),
     }
@@ -2389,10 +2736,13 @@ class Pan115Provider(CloudProvider):
     supports_move = True
     supports_copy = True
     supports_delete = True
+    supports_upload = True
+    supports_rapid_upload = True
+    supports_upload_resume = True
     rate_limit_seconds = 0.35
 
-    def list_entries_payload(self, cookie, cid="0", folders_only=False):
-        return list_115_entries_payload(cookie, cid, False, folders_only)
+    def list_entries_payload(self, cookie, cid="0", folders_only=False, force_refresh=False):
+        return list_115_entries_payload(cookie, cid, force_refresh, folders_only)
 
     def list_entries(self, cookie, cid="0"):
         return list_115_entries(cookie, cid)
@@ -2473,7 +2823,16 @@ class Pan115Provider(CloudProvider):
             return False
 
     def resolve_download_url(self, cookie, file_id):
-        raise NotImplementedError  # STRM 后续实现
+        """取 115 下载直链；传入 pick_code 时先换成真实 fid。"""
+        return str(resolve_115_download_info(cookie, file_id).get("url", "") or "")
+
+    def resolve_download_info(self, cookie, file_id):
+        """下载直链 + 元信息（复制引擎用：URL 过期时重取、校验大小）。"""
+        return resolve_115_download_info(cookie, file_id)
+
+    def get_file_hash(self, cookie, file_id):
+        """取文件的 SHA1 + 大小（跨盘复制零流量秒传探测用；不下载文件）。"""
+        return get_115_file_hash(cookie, file_id)
 
     def rename_entry(self, cookie, entry_id, new_name, parent_id=""):
         return rename_115_entry(cookie, entry_id, new_name, parent_id)
@@ -2486,6 +2845,652 @@ class Pan115Provider(CloudProvider):
 
     def delete_entries(self, cookie, entry_ids, parent_id=""):
         return delete_115_entries(cookie, entry_ids, parent_id)
+
+    def upload_file(
+        self,
+        cookie,
+        sink,
+        filename,
+        target_dir_id="0",
+        *,
+        sha1="",
+        md5="",
+        size=-1,
+        progress_cb=None,
+        cancel_check=None,
+        **kwargs,
+    ):
+        return upload_115_file(
+            cookie,
+            sink,
+            filename,
+            target_dir_id,
+            sha1=sha1,
+            md5=md5,
+            size=size,
+            progress_cb=progress_cb,
+            cancel_check=cancel_check,
+            **kwargs,
+        )
+
+    def abort_upload(self, cookie, upload_handle):
+        return abort_115_upload(cookie, upload_handle)
+
+
+# ============================================================
+# 上传 / 秒传（P0-A 跨盘复制地基）
+#
+# 链路：uplb 4.0/initupload（秒传探测，ECDH+AES 加密载荷）
+#   ├─ status=2 秒传命中 → 零上传流量，直接拿到 pickcode
+#   ├─ status=7 二次验证 → 读文件指定字节段算 SHA1 后重试
+#   └─ status=1 未命中   → gettoken 拿 OSS STS → 阿里云 OSS 上传
+#         （小文件单次 PUT，大文件分片 + 断点续传）
+# ============================================================
+
+_115_UPLOAD_APP_VERSION = "36.2.28"
+_115_UPLOAD_DEFAULT_BASE_URL = "https://uplb.115.com"
+_115_OSS_DEFAULT_BUCKET = "fhnfile"
+_115_OSS_DEFAULT_ENDPOINT = "https://oss-cn-shenzhen.aliyuncs.com"
+_115_OSS_MIN_PART_SIZE = 100 * 1024
+_115_UPLOAD_USER_INFO_TTL_SECONDS = 6 * 3600
+_115_UPLOAD_RETRY_BASE_SECONDS = 2.0
+_115_UPLOAD_RETRY_MAX_ROUNDS = 4
+
+_115_upload_user_info_cache: Dict[str, Any] = {}
+_115_upload_base_url_cache: Dict[str, Tuple[float, str]] = {}
+_115_upload_user_info_lock = threading.Lock()
+
+_UPLOAD_BROWSER_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0"
+)
+
+
+class _UploadRateLimited(Exception):
+    """上传接口返回 405/429，需要退避重试。"""
+
+
+def get_115_user_upload_info(cookie: str) -> Tuple[int, str]:
+    """获取 115 上传必需的 userid 与 userkey（进程内缓存 6 小时）。
+
+    接口：https://proapi.115.com/app/uploadinfo （只需 Cookie）
+    实测响应把 user_id/userkey/url_upload 等放在**顶层**（部分旧账号形态在 data 下，
+    两种都兼容）。
+    """
+    cookie = str(cookie or "").strip()
+    if not cookie:
+        raise UploadError("115 Cookie 未配置", provider="115")
+    now = time.monotonic()
+    with _115_upload_user_info_lock:
+        cached = _115_upload_user_info_cache.get(cookie)
+        if cached and cached[0] > now:
+            return int(cached[1]), str(cached[2])
+    try:
+        payload = http_request_json(
+            "https://proapi.115.com/app/uploadinfo",
+            extra_headers={
+                "Cookie": cookie,
+                "User-Agent": _UPLOAD_BROWSER_UA,
+                "Referer": "https://115.com/",
+            },
+            timeout=20,
+        )
+    except Exception as exc:
+        mark_cookie_health_failure("115", exc, trigger="runtime:get_115_user_upload_info")
+        raise UploadError("115 上传信息获取失败（网络错误）", retriable=True, provider="115") from exc
+    data = payload if isinstance(payload, dict) else {}
+    nested = data.get("data") if isinstance(data.get("data"), dict) else {}
+    userid = int(data.get("user_id") or data.get("userid") or nested.get("user_id") or nested.get("userid") or 0)
+    userkey = str(
+        data.get("userkey") or data.get("user_key") or nested.get("userkey") or nested.get("user_key") or ""
+    ).strip()
+    if not userid or not userkey:
+        mark_cookie_health_failure("115", payload, trigger="runtime:get_115_user_upload_info")
+        raise UploadError("115 登录已失效，请更新 Cookie 后重试", provider="115")
+    base_url = str(data.get("url_upload") or nested.get("url_upload") or "").strip().rstrip("/")
+    if not base_url.startswith("https://"):
+        base_url = _115_UPLOAD_DEFAULT_BASE_URL
+    with _115_upload_user_info_lock:
+        _115_upload_user_info_cache[cookie] = (
+            now + _115_UPLOAD_USER_INFO_TTL_SECONDS,
+            userid,
+            userkey,
+        )
+        _115_upload_base_url_cache[cookie] = (now + _115_UPLOAD_USER_INFO_TTL_SECONDS, base_url)
+    return userid, userkey
+
+
+def _get_115_upload_base_url(cookie: str) -> str:
+    """上传基站 URL：取 uploadinfo 返回 url_upload 的 origin（协议+主机），
+    兜底内置默认值。
+
+    注意：url_upload 是 legacy 2.0 上传端点的**完整地址**（实测为
+    https://uplb.115.com/2.0/upload.php），不能直接当路径前缀拼接
+    /4.0/initupload.php——那样会产出 .../2.0/upload.php/4.0/initupload.php
+    的畸形 URL，服务端回 414「客户端版本太低」。参考实现
+    （p115client/p115oss）的 initupload/gettoken 固定在
+    https://uplb.115.com 根路径下；这里保留 origin 提取仅为兼容
+    极端情况下上传主机变更，路径段一律丢弃。
+    """
+    cookie = str(cookie or "").strip()
+    now = time.monotonic()
+    with _115_upload_user_info_lock:
+        cached = _115_upload_base_url_cache.get(cookie)
+        if cached and cached[0] > now and cached[1]:
+            raw = str(cached[1]).strip()
+            try:
+                from urllib.parse import urlsplit
+
+                parsed = urlsplit(raw)
+                if parsed.scheme == "https" and parsed.hostname:
+                    return f"{parsed.scheme}://{parsed.hostname}"
+            except Exception:
+                pass
+            return _115_UPLOAD_DEFAULT_BASE_URL
+    return _115_UPLOAD_DEFAULT_BASE_URL
+
+
+def _115_upload_resp_fields(resp: Dict[str, Any]) -> Dict[str, Any]:
+    """把 uplb initupload 响应拍平，便于统一读取字段。
+
+    cookie 模式（POST uplb.115.com/4.0/initupload.php）的响应是**扁平结构**：
+    status/pickcode/bucket/object/callback/sign_key/sign_check 全部在顶层
+    （参考实现 p115oss.upload_file_init 对非 open 客户端直接读顶层，
+    ``data = resp`` 不做解包）。这里顶层优先，仅在缺失时回退到 data 子对象
+    （兼容 open 接口形态与历史 mock）。
+    """
+    flat = dict(resp)
+    nested = resp.get("data")
+    if isinstance(nested, dict):
+        for key in (
+            "status", "pickcode", "pick_code", "bucket", "object",
+            "callback", "sign_key", "sign_check", "statuscode", "statusmsg",
+        ):
+            flat.setdefault(key, nested.get(key))
+    return flat
+
+
+def _upload_115_initupload(
+    cookie: str,
+    userid: int,
+    userkey: str,
+    payload: Dict[str, Any],
+) -> Dict[str, Any]:
+    """调用 uplb 4.0/initupload.php（加密请求，解密响应）。"""
+    request_payload = {
+        "userid": userid,
+        "userkey": userkey,
+        "appversion": _115_UPLOAD_APP_VERSION,
+        "appid": 0,
+        "topupload": "true",
+        **payload,
+    }
+    packed = make_upload_payload(request_payload)
+    session = _get_115_webapi_session()
+    response = session.post(
+        f"{_get_115_upload_base_url(cookie)}/4.0/initupload.php",
+        params=packed["params"],
+        data=packed["data"],
+        headers={
+            "Cookie": cookie,
+            "content-type": "application/x-www-form-urlencoded",
+            "user-agent": (
+                f"Mozilla/5.0 115disk/{_115_UPLOAD_APP_VERSION} "
+                f"115Browser/{_115_UPLOAD_APP_VERSION} "
+                f"115wangpan_android/{_115_UPLOAD_APP_VERSION}"
+            ),
+            "Referer": "https://115.com/",
+        },
+        timeout=60,
+    )
+    if response.status_code in (405, 429):
+        raise _UploadRateLimited(f"115 上传接口限流（HTTP {response.status_code}）")
+    response.raise_for_status()
+    try:
+        result = decode_upload_response(response.content)
+    except ValueError as exc:
+        raise UploadError("115 上传响应解密失败，请稍后重试", retriable=True, provider="115") from exc
+    return result
+
+
+def _upload_115_get_token(cookie: str) -> Dict[str, Any]:
+    """获取 OSS STS 临时凭证（gettoken.php）。"""
+    response = _get_115_webapi_session().get(
+        f"{_get_115_upload_base_url(cookie)}/3.0/gettoken.php",
+        headers={
+            "Cookie": cookie,
+            "User-Agent": (
+                f"Mozilla/5.0 115disk/{_115_UPLOAD_APP_VERSION} "
+                f"115Browser/{_115_UPLOAD_APP_VERSION} "
+                f"115wangpan_android/{_115_UPLOAD_APP_VERSION}"
+            ),
+            "Referer": "https://115.com/",
+        },
+        timeout=30,
+    )
+    if response.status_code in (405, 429):
+        raise _UploadRateLimited(f"115 token 接口限流（HTTP {response.status_code}）")
+    response.raise_for_status()
+    token = response.json()
+    if not isinstance(token, dict) or not token.get("AccessKeyId"):
+        raise UploadError("115 上传凭证获取失败", retriable=True, provider="115")
+    return token
+
+
+def _oss_sign(token: Dict[str, Any], method: str, url: str, extra_headers: Optional[Dict[str, str]] = None) -> Dict[str, str]:
+    """OSS V1（HMAC-SHA1）签名，返回完整请求头。"""
+    from email.utils import formatdate
+    from urllib.parse import parse_qsl, urlencode as _urlencode, urlsplit
+
+    urlp = urlsplit(url)
+    bucket = (urlp.hostname or "").partition(".")[0]
+    headers = {str(k).lower(): str(v) for k, v in (extra_headers or {}).items()}
+    headers["x-oss-security-token"] = str(token["SecurityToken"])
+    date = headers["date"] = formatdate(usegmt=True)
+    path = urlp.path or "/"
+    sub_keys = (
+        "uploads", "sequential", "partNumber", "uploadId", "x-oss-process",
+    )
+    query = urlp.query or ""
+    if query:
+        query = _urlencode(sorted((k, v) for k, v in parse_qsl(query) if k in sub_keys))
+    if query:
+        query = "?" + query
+    canonical = (
+        f"{method.upper()}\n"
+        f"{headers.get('content-md5', '')}\n"
+        f"{headers.get('content-type', '')}\n"
+        f"{date}\n"
+        + "\n".join(f"{k}:{v}" for k, v in sorted(headers.items()) if k.startswith("x-oss-"))
+        + f"\n/{bucket}{path}{query}"
+    )
+    signature = base64.b64encode(
+        hmac.new(str(token["AccessKeySecret"]).encode("utf-8"), canonical.encode("utf-8"), "sha1").digest()
+    ).decode("ascii")
+    headers["authorization"] = f"OSS {token['AccessKeyId']}:{signature}"
+    return headers
+
+
+def _oss_request(
+    token: Dict[str, Any],
+    method: str,
+    url: str,
+    *,
+    data=None,
+    headers: Optional[Dict[str, str]] = None,
+    timeout: int = 120,
+) -> requests.Response:
+    """签名后直连阿里云 OSS。"""
+    signed = _oss_sign(token, method, url, headers or {})
+    return _get_115_webapi_session().request(
+        method,
+        url,
+        data=data,
+        headers=signed,
+        timeout=timeout,
+    )
+
+
+def _oss_object_url(bucket: str, endpoint: str, key: str) -> str:
+    host = endpoint.replace("https://", "").replace("http://", "").rstrip("/")
+    scheme = "https" if endpoint.startswith("https") else "http"
+    return f"{scheme}://{bucket}.{host}/{key}"
+
+
+def _oss_upload_whole(
+    token: Dict[str, Any],
+    bucket: str,
+    endpoint: str,
+    key: str,
+    data: bytes,
+    callback: Dict[str, Any],
+) -> None:
+    """小文件单次 PUT（≤ 分片大小）。"""
+    url = _oss_object_url(bucket, endpoint, key)
+    headers = {
+        "x-oss-callback": base64.b64encode(str(callback.get("callback", "")).encode("utf-8")).decode("ascii"),
+        "x-oss-callback-var": base64.b64encode(str(callback.get("callback_var", "")).encode("utf-8")).decode("ascii"),
+    }
+    response = _oss_request(token, "PUT", url, data=data, headers=headers)
+    if response.status_code >= 300:
+        raise UploadError(
+            f"115 上传失败（OSS HTTP {response.status_code}）", retriable=True, provider="115"
+        )
+
+
+def _oss_multipart_init(token: Dict[str, Any], bucket: str, endpoint: str, key: str) -> str:
+    """初始化分片上传，返回 uploadId。"""
+    url = _oss_object_url(bucket, endpoint, key)
+    url = f"{url}?sequential=1&uploads=1"
+    response = _oss_request(token, "POST", url)
+    if response.status_code >= 300:
+        raise UploadError(
+            f"115 分片上传初始化失败（OSS HTTP {response.status_code}）", retriable=True, provider="115"
+        )
+    import xml.etree.ElementTree as ET
+
+    try:
+        root = ET.fromstring(response.content)
+        upload_id = (root.findtext("UploadId") or "").strip()
+    except ET.ParseError as exc:
+        raise UploadError("115 分片上传初始化响应解析失败", retriable=True, provider="115") from exc
+    if not upload_id:
+        raise UploadError("115 分片上传初始化未返回 UploadId", retriable=True, provider="115")
+    return upload_id
+
+
+def _oss_upload_part(
+    token: Dict[str, Any],
+    bucket: str,
+    endpoint: str,
+    key: str,
+    upload_id: str,
+    part_number: int,
+    data: bytes,
+) -> str:
+    """上传单个分片，返回 ETag。"""
+    url = f"{_oss_object_url(bucket, endpoint, key)}?partNumber={part_number}&uploadId={upload_id}"
+    response = _oss_request(token, "PUT", url, data=data)
+    if response.status_code >= 300:
+        raise _UploadRateLimited(
+            f"115 分片 {part_number} 上传失败（OSS HTTP {response.status_code}）"
+        ) if response.status_code in (405, 429) else UploadError(
+            f"115 分片 {part_number} 上传失败（OSS HTTP {response.status_code}）",
+            retriable=True,
+            provider="115",
+        )
+    etag = (response.headers.get("ETag") or "").strip().strip('"')
+    if not etag:
+        raise UploadError(f"115 分片 {part_number} 上传未返回 ETag", retriable=True, provider="115")
+    return etag
+
+
+def _oss_multipart_complete(
+    token: Dict[str, Any],
+    bucket: str,
+    endpoint: str,
+    key: str,
+    upload_id: str,
+    parts: List[Dict[str, Any]],
+    callback: Dict[str, Any],
+) -> None:
+    """完成分片上传（带 115 回调，回调负责把 OSS 对象转存到网盘）。"""
+    url = f"{_oss_object_url(bucket, endpoint, key)}?uploadId={upload_id}"
+    body = b"<CompleteMultipartUpload>" + b"".join(
+        f"<Part><PartNumber>{p['PartNumber']}</PartNumber><ETag>{p['ETag']}</ETag></Part>".encode("ascii")
+        for p in parts
+    ) + b"</CompleteMultipartUpload>"
+    headers = {
+        "x-oss-callback": base64.b64encode(str(callback.get("callback", "")).encode("utf-8")).decode("ascii"),
+        "x-oss-callback-var": base64.b64encode(str(callback.get("callback_var", "")).encode("utf-8")).decode("ascii"),
+        "content-type": "text/xml",
+    }
+    response = _oss_request(token, "POST", url, data=body, headers=headers)
+    if response.status_code >= 300:
+        raise UploadError(
+            f"115 分片上传合并失败（OSS HTTP {response.status_code}）", retriable=True, provider="115"
+        )
+
+
+def _oss_abort_multipart(token: Dict[str, Any], bucket: str, endpoint: str, key: str, upload_id: str) -> bool:
+    """取消分片上传（尽力而为，失败仅记日志）。"""
+    try:
+        url = f"{_oss_object_url(bucket, endpoint, key)}?uploadId={upload_id}"
+        response = _oss_request(token, "DELETE", url, timeout=30)
+        return response.status_code < 300
+    except Exception as exc:  # pragma: no cover - 取消路径尽力而为
+        logging.warning("115 上传取消失败（OSS abort）: %s", exc)
+        return False
+
+
+def _oss_list_parts(token: Dict[str, Any], bucket: str, endpoint: str, key: str, upload_id: str) -> List[Dict[str, Any]]:
+    """查询已上传分片（断点续传）。"""
+    import xml.etree.ElementTree as ET
+
+    url = f"{_oss_object_url(bucket, endpoint, key)}?uploadId={upload_id}"
+    response = _oss_request(token, "GET", url, timeout=30)
+    if response.status_code >= 300:
+        return []
+    try:
+        root = ET.fromstring(response.content)
+    except ET.ParseError:
+        return []
+    parts = []
+    for el in root.iterfind("Part"):
+        try:
+            parts.append({
+                "PartNumber": int(el.findtext("PartNumber")),
+                "ETag": str(el.findtext("ETag") or "").strip().strip('"'),
+                "Size": int(el.findtext("Size") or 0),
+            })
+        except (TypeError, ValueError):
+            continue
+    return sorted(parts, key=lambda p: p["PartNumber"])
+
+
+def _read_sign_check_range(sink: Any, sign_check: str) -> bytes:
+    """二次验证：读取 sign_check 指定的文件字节段（格式 "start-end"）。"""
+    try:
+        start, end = (int(x) for x in str(sign_check).split("-", 1))
+    except (TypeError, ValueError) as exc:
+        raise UploadError("115 二次验证参数无效", provider="115") from exc
+    sink.seek(start)
+    data = sink.read(end - start + 1)
+    if len(data) != end - start + 1:
+        raise UploadError("115 二次验证读取文件片段失败", provider="115")
+    return data
+
+
+def upload_115_file(
+    cookie: str,
+    sink: Any,
+    filename: str,
+    target_dir_id: str = "0",
+    *,
+    sha1: str = "",
+    md5: str = "",
+    size: int = -1,
+    progress_cb=None,
+    cancel_check=None,
+    part_size_mb: int = 10,
+) -> UploadResult:
+    """把 sink 上传到 115 网盘（秒传优先，未命中走 OSS 分片）。
+
+    详见模块头部链路注释。sha1/size 由复制引擎在下载时同步算出；
+    缺省时本函数自行读取 sink 计算（会多读一遍）。
+    """
+    cookie = str(cookie or "").strip()
+    filename = str(filename or "").strip()
+    if not cookie:
+        raise UploadError("115 Cookie 未配置", provider="115")
+    if not filename:
+        raise UploadError("上传文件名为空", provider="115")
+    if sink is None:
+        raise UploadError("上传数据源为空", provider="115")
+
+    total = int(size if size is not None and size >= 0 else getattr(sink, "size", -1) or -1)
+    if total < 0:
+        raise UploadError("无法确定上传文件大小", provider="115")
+    file_sha1 = str(sha1 or getattr(sink, "sha1", "") or "").strip().upper()
+    if not file_sha1:
+        sink.seek(0)
+        hasher = hashlib.sha1()
+        while True:
+            chunk = sink.read(1024 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+        file_sha1 = hasher.hexdigest().upper()
+        sink.seek(0)
+
+    userid, userkey = get_115_user_upload_info(cookie)
+    target = f"U_1_{str(target_dir_id or '0')}"
+    base_payload = {
+        "fileid": file_sha1,
+        "filename": filename,
+        "filesize": total,
+        "target": target,
+        "path": "",
+    }
+
+    def _check_cancel():
+        if cancel_check is not None and cancel_check():
+            raise UploadError("上传已取消", provider="115")
+
+    # ---- 秒传探测（含 405 限流退避与二次验证） ----
+    resp: Dict[str, Any] = {}
+    rounds = 0
+    payload = dict(base_payload)
+    while True:
+        try:
+            resp = _upload_115_initupload(cookie, userid, userkey, payload)
+            break
+        except _UploadRateLimited:
+            rounds += 1
+            if rounds > _115_UPLOAD_RETRY_MAX_ROUNDS:
+                raise UploadError(
+                    "115 上传接口持续限流，请稍后再试", retriable=True, provider="115"
+                )
+            time.sleep(_115_UPLOAD_RETRY_BASE_SECONDS * (2 ** (rounds - 1)))
+            continue
+
+    if not resp.get("state", True) and "status" not in resp:
+        mark_cookie_health_failure("115", resp, trigger="runtime:upload_115_file")
+        raise UploadError(_map_115_upload_error(resp), provider="115")
+
+    # cookie 模式响应为扁平结构（字段在顶层），见 _115_upload_resp_fields
+    fields = _115_upload_resp_fields(resp)
+    status = int(fields.get("status") or 0)
+
+    if status == 7:
+        # 二次验证：读指定字节段算 SHA1 后重试一次
+        sign_check = str(fields.get("sign_check") or "")
+        sign_key = str(fields.get("sign_key") or "")
+        if not sign_check:
+            raise UploadError(
+                "115 账号开启了二次验证且未提供验证参数，无法自动上传", provider="115"
+            )
+        payload = dict(base_payload)
+        payload["sign_key"] = sign_key
+        payload["sign_val"] = hashlib.sha1(_read_sign_check_range(sink, sign_check)).hexdigest().upper()
+        resp = _upload_115_initupload(cookie, userid, userkey, payload)
+        if not resp.get("state", True) and "status" not in resp:
+            raise UploadError(_map_115_upload_error(resp), provider="115")
+        fields = _115_upload_resp_fields(resp)
+        status = int(fields.get("status") or 0)
+        if status == 7:
+            raise UploadError(
+                "115 账号开启了二次验证，当前无法自动完成上传（需要人工验证）", provider="115"
+            )
+
+    if status == 2:
+        # 秒传命中：零上传流量
+        mark_cookie_health_success("115", trigger="runtime:upload_115_file")
+        pick_code = str(fields.get("pickcode") or fields.get("pick_code") or "")
+        return UploadResult(
+            status="rapid",
+            pick_code=pick_code,
+            name=filename,
+            size=total,
+            sha1=file_sha1,
+            message="秒传命中",
+        )
+
+    if status != 1:
+        raise UploadError(_map_115_upload_error(resp), provider="115")
+
+    # ---- 秒传未命中：OSS 上传 ----
+    bucket = str(fields.get("bucket") or _115_OSS_DEFAULT_BUCKET)
+    key = str(fields.get("object") or "")
+    callback = fields.get("callback") or {}
+    if not key:
+        raise UploadError("115 上传配置缺失（object 为空）", provider="115")
+
+    try:
+        token = _upload_115_get_token(cookie)
+    except _UploadRateLimited:
+        time.sleep(_115_UPLOAD_RETRY_BASE_SECONDS)
+        token = _upload_115_get_token(cookie)
+
+    endpoint = _115_OSS_DEFAULT_ENDPOINT
+    part_size = max(int(part_size_mb or 10) * 1024 * 1024, _115_OSS_MIN_PART_SIZE)
+
+    _check_cancel()
+    if total <= part_size:
+        sink.seek(0)
+        payload_bytes = sink.read(total)
+        if len(payload_bytes) != total:
+            raise UploadError("读取上传数据不完整", provider="115")
+        _oss_upload_whole(token, bucket, endpoint, key, payload_bytes, callback)
+        if progress_cb:
+            try:
+                progress_cb(total, total)
+            except Exception:
+                pass
+    else:
+        upload_id = _oss_multipart_init(token, bucket, endpoint, key)
+        parts: List[Dict[str, Any]] = []
+        sent = 0
+        part_number = 1
+        sink.seek(0)
+        while True:
+            _check_cancel()
+            chunk = sink.read(part_size)
+            if not chunk:
+                break
+            etag = _oss_upload_part(token, bucket, endpoint, key, upload_id, part_number, chunk)
+            parts.append({"PartNumber": part_number, "ETag": etag})
+            sent += len(chunk)
+            part_number += 1
+            if progress_cb:
+                try:
+                    progress_cb(sent, total)
+                except Exception:
+                    pass
+        _oss_multipart_complete(token, bucket, endpoint, key, upload_id, parts, callback)
+
+    mark_cookie_health_success("115", trigger="runtime:upload_115_file")
+    return UploadResult(
+        status="uploaded",
+        pick_code=str(fields.get("pickcode") or fields.get("pick_code") or ""),
+        name=filename,
+        size=total,
+        sha1=file_sha1,
+        message="上传完成",
+    )
+
+
+def abort_115_upload(cookie: str, upload_handle: Dict[str, Any]) -> bool:
+    """取消一次进行中的 115 上传（尽力清理 OSS 分片会话）。"""
+    handle = upload_handle or {}
+    token = handle.get("token")
+    if not token:
+        return False
+    return _oss_abort_multipart(
+        token,
+        str(handle.get("bucket") or _115_OSS_DEFAULT_BUCKET),
+        _115_OSS_DEFAULT_ENDPOINT,
+        str(handle.get("key") or ""),
+        str(handle.get("upload_id") or ""),
+    )
+
+
+def _map_115_upload_error(resp: Dict[str, Any]) -> str:
+    """把 115 上传接口错误映射为面向用户的文案。"""
+    errcode = int(resp.get("errcode", 0) or 0)
+    status = int((resp.get("data") or {}).get("status", 0) or 0)
+    message = (
+        str(resp.get("error_msg", "") or "").strip()
+        or str(resp.get("msg", "") or "").strip()
+        or str(resp.get("error", "") or "").strip()
+    )
+    if status == 7 or "二次验证" in message:
+        return "115 账号开启了二次验证，无法自动完成上传（需要人工验证）"
+    if errcode in (20000, 20001) or "登录" in message or "权限" in message:
+        return "115 登录已失效，请更新 Cookie 后重试"
+    if errcode == 10008 or "频繁" in message or "limit" in message.lower():
+        return "115 操作过于频繁，请稍后再试"
+    return message or "115 上传失败，请稍后重试"
 
 
 register(Pan115Provider())

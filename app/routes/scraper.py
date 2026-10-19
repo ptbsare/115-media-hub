@@ -129,6 +129,17 @@ async def check_scraper_folder_rename_warning_endpoint(provider: str, request: R
 @router.post("/scraper/{provider}/move")
 async def move_scraper_entries_endpoint(provider: str, request: Request) -> Dict[str, Any]:
     data = await request.json()
+    source_provider = str(data.get("source_provider", "") or "").strip()
+    # 跨网盘移动必须删源文件，出错无法回滚，所以只开放同盘移动。前端已经拦过，
+    # 这里再拦一次，避免别的调用方（脚本 / 旧页面）绕过前端直接打到接口。
+    if source_provider and source_provider != provider:
+        return JSONResponse(
+            status_code=400,
+            content={
+                "ok": False,
+                "msg": "移动只能在同一个网盘内使用。跨网盘请用复制，复制完成后源文件仍会保留。",
+            },
+        )
     entry_ids = data.get("entry_ids", [])
     target_cid = str(data.get("target_cid", "") or "").strip()
     source_cid = str(data.get("source_cid", "") or "").strip()

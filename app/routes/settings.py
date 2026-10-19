@@ -22,6 +22,16 @@ from ..providers.pan115_qr import (
 )
 from ..services.notify import send_notify_test_message
 from ..services.sign115 import refresh_sign115_status, run_sign115_job
+from ..services.local_storage import (
+    CROSS_COPY_TEMP_SUBDIR,
+    _normalize_container_path,
+    _normalize_subdir,
+    get_storage_entry,
+    list_storage_volumes,
+    normalize_local_storage_entry,
+    normalize_local_storages,
+    probe_storage_path,
+)
 
 router = APIRouter()
 
@@ -88,6 +98,129 @@ async def save_settings_endpoint(request: Request) -> Dict[str, Any]:
     schedule_ui_state_push(0)
     submit_background(_run_postsave_health_checks, label="postsave-health-checks")
     return {"ok": True, "cookie_health": cookie_health, "checks_queued": True}
+
+
+@router.get("/storage/locations")
+async def list_storage_locations(request: Request) -> Dict[str, Any]:
+    """列出本地存储位置（含运行时空间状态）。"""
+    cfg = get_config()
+    volumes = list_storage_volumes(cfg)
+    return {
+        "ok": True,
+        "locations": volumes,
+        "cross_copy_temp_storage": str(cfg.get("cross_copy_temp_storage", "") or ""),
+        "cross_copy_temp_subdir": str(cfg.get("cross_copy_temp_subdir", "") or ""),
+    }
+
+
+@router.post("/storage/locations/add")
+async def add_storage_location(request: Request) -> Dict[str, Any]:
+    """新增存储位置（保存前校验目录存在且可写）。"""
+    incoming = await request.json()
+    payload = incoming if isinstance(incoming, dict) else {}
+    entry = normalize_local_storage_entry(
+        {"path": payload.get("path", ""), "label": payload.get("label", ""), "enabled": True}
+    )
+    if entry is None:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "路径不合法：需为容器内的绝对路径"})
+    probe = probe_storage_path(entry["path"])
+    if not probe["ok"]:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": probe["error"] or "目录不可用"})
+    cfg = get_config()
+    storages = normalize_local_storages(cfg.get("local_storages", []))
+    if any(item["id"] == entry["id"] for item in storages):
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "该路径已添加过"})
+    storages.append(entry)
+    merged = {**cfg, "local_storages": storages}
+    save_config(merged)
+    return {"ok": True, "location": {**entry, **{k: probe[k] for k in ("exists", "writable", "free_bytes", "total_bytes", "ok", "error")}}}
+
+
+@router.post("/storage/locations/update")
+async def update_storage_location(request: Request) -> Dict[str, Any]:
+    """更新存储位置的 label / 启用状态（路径不可改，改路径=新增）。"""
+    incoming = await request.json()
+    payload = incoming if isinstance(incoming, dict) else {}
+    location_id = str(payload.get("id", "") or "").strip()
+    cfg = get_config()
+    storages = normalize_local_storages(cfg.get("local_storages", []))
+    target = next((item for item in storages if item["id"] == location_id), None)
+    if target is None:
+        return JSONResponse(status_code=404, content={"ok": False, "msg": "存储位置不存在"})
+    if "label" in payload:
+        target["label"] = str(payload.get("label", "") or "").strip()[:60]
+    if "enabled" in payload:
+        target["enabled"] = bool(payload.get("enabled"))
+    merged = {**cfg, "local_storages": storages}
+    save_config(merged)
+    return {"ok": True, "location": target}
+
+
+@router.post("/storage/locations/delete")
+async def delete_storage_location(request: Request) -> Dict[str, Any]:
+    """删除存储位置；若暂存目录正指向该位置则先清空引用。"""
+    incoming = await request.json()
+    payload = incoming if isinstance(incoming, dict) else {}
+    location_id = str(payload.get("id", "") or "").strip()
+    cfg = get_config()
+    storages = normalize_local_storages(cfg.get("local_storages", []))
+    if not any(item["id"] == location_id for item in storages):
+        return JSONResponse(status_code=404, content={"ok": False, "msg": "存储位置不存在"})
+    storages = [item for item in storages if item["id"] != location_id]
+    merged = {**cfg, "local_storages": storages}
+    if str(merged.get("cross_copy_temp_storage", "") or "") == location_id:
+        merged["cross_copy_temp_storage"] = ""
+    save_config(merged)
+    return {"ok": True}
+
+
+@router.post("/storage/locations/probe")
+async def probe_storage_location(request: Request) -> Dict[str, Any]:
+    """探测单个路径的可用性与剩余空间（添加前预检）。"""
+    incoming = await request.json()
+    payload = incoming if isinstance(incoming, dict) else {}
+    path = _normalize_container_path(payload.get("path", ""))
+    if not path:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "路径不合法：需为容器内的绝对路径"})
+    probe = probe_storage_path(path)
+    return {"ok": probe["ok"], "probe": probe}
+
+
+@router.post("/storage/locations/temp")
+async def save_storage_temp_location(request: Request) -> JSONResponse:
+    """保存跨盘复制的暂存位置（只写两个字段，不动位置列表）。
+
+    设置页改动暂存位置很频繁，走 /save_settings 会连带整份配置归一化和
+    保存后的健康检查，代价过大，所以单独开一个最小接口。
+    """
+    incoming = await request.json()
+    payload = incoming if isinstance(incoming, dict) else {}
+    storage_id = str(payload.get("storage_id", "") or "").strip()
+    raw_subdir = str(payload.get("subdir", "") or "").strip()
+
+    cfg = get_config()
+    if storage_id and get_storage_entry(cfg, storage_id) is None:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "存储位置不存在或已停用"})
+
+    subdir = _normalize_subdir(raw_subdir)
+    if raw_subdir and not subdir:
+        return JSONResponse(
+            status_code=400,
+            content={"ok": False, "msg": "子目录不合法：只能填相对路径，不能以 / 开头或包含 .."},
+        )
+    if not subdir:
+        subdir = CROSS_COPY_TEMP_SUBDIR
+
+    storage_id = storage_id[:64]
+    merged = {**cfg, "cross_copy_temp_storage": storage_id, "cross_copy_temp_subdir": subdir}
+    save_config(merged)
+    return JSONResponse(
+        content={
+            "ok": True,
+            "cross_copy_temp_storage": storage_id,
+            "cross_copy_temp_subdir": subdir,
+        }
+    )
 
 
 @router.get("/settings/cookies/status")

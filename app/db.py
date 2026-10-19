@@ -512,6 +512,58 @@ def ensure_db() -> None:
                 )
                 """
             )
+            cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS cross_copy_jobs (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL DEFAULT '',
+                    source_provider TEXT NOT NULL DEFAULT '',
+                    target_provider TEXT NOT NULL DEFAULT '',
+                    source_file_id TEXT NOT NULL DEFAULT '',
+                    source_mode TEXT NOT NULL DEFAULT 'save_first',
+                    source_share_url TEXT NOT NULL DEFAULT '',
+                    target_dir_id TEXT NOT NULL DEFAULT '',
+                    target_savepath TEXT NOT NULL DEFAULT '',
+                    source_path TEXT NOT NULL DEFAULT '',
+                    target_path TEXT NOT NULL DEFAULT '',
+                    filename TEXT NOT NULL DEFAULT '',
+                    file_size INTEGER NOT NULL DEFAULT 0,
+                    status TEXT NOT NULL DEFAULT 'pending',
+                    status_detail TEXT NOT NULL DEFAULT '',
+                    progress_percent INTEGER NOT NULL DEFAULT 0,
+                    phase TEXT NOT NULL DEFAULT '',
+                    result_json TEXT NOT NULL DEFAULT '{}',
+                    error_message TEXT NOT NULL DEFAULT '',
+                    retry_count INTEGER NOT NULL DEFAULT 0,
+                    origin TEXT NOT NULL DEFAULT 'manual',
+                    origin_ref TEXT NOT NULL DEFAULT '',
+                    source_is_dir INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    started_at TEXT NOT NULL DEFAULT '',
+                    finished_at TEXT NOT NULL DEFAULT ''
+                )
+                """
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_status ON cross_copy_jobs(status)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_created_at ON cross_copy_jobs(created_at DESC)"
+            )
+            cursor.execute("PRAGMA table_info(cross_copy_jobs)")
+            cross_copy_job_columns = {str(row[1]) for row in cursor.fetchall()}
+            if "source_share_url" not in cross_copy_job_columns:
+                cursor.execute("ALTER TABLE cross_copy_jobs ADD COLUMN source_share_url TEXT NOT NULL DEFAULT ''")
+            if "source_path" not in cross_copy_job_columns:
+                cursor.execute("ALTER TABLE cross_copy_jobs ADD COLUMN source_path TEXT NOT NULL DEFAULT ''")
+            if "target_path" not in cross_copy_job_columns:
+                cursor.execute("ALTER TABLE cross_copy_jobs ADD COLUMN target_path TEXT NOT NULL DEFAULT ''")
+            if "source_is_dir" not in cross_copy_job_columns:
+                # 0 = 复制单个文件，1 = 复制整个文件夹（一个任务一个文件夹）
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN source_is_dir INTEGER NOT NULL DEFAULT 0"
+                )
             cursor.execute("PRAGMA table_info(local_files)")
             local_file_columns = {str(row[1]) for row in cursor.fetchall()}
             if "scan_token" not in local_file_columns:
