@@ -504,6 +504,21 @@ class TestTransferProgress(CrossCopyJobsTestBase):
         self.assertIn("上传", job["status_detail"])
         self.assertIn("4.00MB / 8.00MB", job["status_detail"])
 
+    def test_speed_uses_previous_frame_even_with_nonpositive_timestamp(self):
+        """判断「有没有上一帧」只看有没有记录，不看时间戳是否大于 0。
+
+        沙箱/容器的 monotonic 可能从 0 附近起步，把上一帧往前拨就落到 0 以下；
+        拿 0 当哨兵会把这一帧当成不存在，速度静默变成 0、界面看不到速率。
+        """
+        job_id = self._create_job(file_size=1024 * 1024)
+        with patch.object(ccj.time, "monotonic", return_value=1.0):
+            ccj._report_progress(job_id, 512 * 1024, 1024 * 1024, "download")
+            with ccj._progress_lock:
+                ccj._job_progress[job_id]["updated_ts"] = -0.5
+            ccj._report_progress(job_id, 1024 * 1024, 1024 * 1024, "download")
+        progress = ccj.get_cross_copy_job(job_id)["progress"]
+        self.assertGreater(progress["speed"], 0)
+
     def test_speed_resets_when_phase_changes(self):
         job_id = self._create_job(file_size=1024 * 1024)
         ccj._report_progress(job_id, 512 * 1024, 1024 * 1024, "download")

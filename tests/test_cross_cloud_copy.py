@@ -229,6 +229,24 @@ class TestHappyPath(CrossCloudCopyTestBase):
         self._copy()
         self.assertEqual(self.get_calls[0]["headers"]["Cookie"], "cookie-q")
 
+    def test_download_headers_follow_provider_bound_user_agent(self):
+        """115 直链按 UA 签名：provider 返回的下载头必须原样生效，不能被默认 UA 顶掉。"""
+        provider_headers = {
+            "User-Agent": "Mozilla/5.0 115-media-hub",
+            "Referer": "https://115.com/",
+            "Cookie": "UID=abc; acw_tc=1",
+        }
+        source = _FakeProvider(
+            "115",
+            download_info={"url": "https://x/115", "size": 0, "headers": dict(provider_headers)},
+        )
+        target = _FakeProvider("quark", supports_upload=True, upload_result=_rapid_result())
+        self._copy(source_provider=source, target_provider=target)
+        sent = self.get_calls[0]["headers"]
+        self.assertEqual(sent["User-Agent"], "Mozilla/5.0 115-media-hub")
+        self.assertEqual(sent["Referer"], "https://115.com/")
+        self.assertEqual(sent["Cookie"], "UID=abc; acw_tc=1")
+
 
 class TestChannels(CrossCloudCopyTestBase):
     def setUp(self):

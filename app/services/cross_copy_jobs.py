@@ -426,7 +426,9 @@ def _report_progress(job_id: int, sent: int, total: int, phase: str, detail: str
         except (TypeError, ValueError):
             prev_ts, prev_sent, prev_speed = 0.0, 0, 0.0
         speed = 0.0
-        if prev_ts > 0 and now > prev_ts and str(prev.get("phase") or "") == phase and sent >= prev_sent:
+        # 用「有没有上一帧」判断，而不是 prev_ts > 0：monotonic 的原点不固定
+        # （容器/短命进程里可能从 0 附近开始），拿 0 当哨兵会把合法的时间戳判成缺失。
+        if prev and now > prev_ts and str(prev.get("phase") or "") == phase and sent >= prev_sent:
             instant = (sent - prev_sent) / (now - prev_ts)
             speed = prev_speed * 0.6 + instant * 0.4 if prev_speed > 0 else instant
         _job_progress[job_id] = {

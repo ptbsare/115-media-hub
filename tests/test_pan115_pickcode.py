@@ -42,8 +42,8 @@ class Pan115PickCodeResolveTest(unittest.TestCase):
             pan115, "resolve_file_id_by_pick_code", return_value=_FID
         ) as resolve_mock, mock.patch.object(
             pan115,
-            "_request_115_webapi_json",
-            return_value={"state": True, "file_url": "https://dl.115.com/file/1"},
+            "_request_115_webapi_json_with_cookies",
+            return_value=({"state": True, "file_url": "https://dl.115.com/file/1"}, []),
         ) as request_mock:
             url = provider.resolve_download_url(_COOKIE, _PICK_CODE)
 
@@ -60,8 +60,8 @@ class Pan115PickCodeResolveTest(unittest.TestCase):
             return_value={"id": _FID, "name": "a.mkv", "pick_code": _PICK_CODE, "size": 10, "sha1": "SHA"},
         ), mock.patch.object(
             pan115,
-            "_request_115_webapi_json",
-            return_value={"state": True, "file_url": "https://dl.115.com/file/2"},
+            "_request_115_webapi_json_with_cookies",
+            return_value=({"state": True, "file_url": "https://dl.115.com/file/2"}, []),
         ):
             info = provider.resolve_download_info(_COOKIE, _FID)
 

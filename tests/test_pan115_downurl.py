@@ -213,8 +213,27 @@ class Pan115DownurlModuleTests(unittest.TestCase):
             info = downurl.resolve_115_download_url_by_downurl(
                 "UID=abc", user_id="12345", pick_code="abcdefg1234567"
             )
-        self.assertEqual(info, {"url": "http://cdn.example.com/a.mkv", "file_name": "a.mkv", "size": 12})
+        self.assertEqual(info["url"], "http://cdn.example.com/a.mkv")
+        self.assertEqual(info["file_name"], "a.mkv")
+        self.assertEqual(info["size"], 12)
         self.assertEqual(mocked.call_args[0][1], "abcdefg1234567")
+
+    def test_high_level_returns_download_headers_bound_to_link_user_agent(self):
+        """直链按 UA 签名：取链用什么 UA，下载头就必须是什么 UA（否则 403）。"""
+        with patch.object(
+            downurl,
+            "resolve_115_downurl_payload",
+            return_value=("http://cdn.example.com/a.mkv", "acw_tc=1; path-hash=2", {"file_name": "a.mkv", "size": 12}),
+        ):
+            info = downurl.resolve_115_download_url_by_downurl(
+                "UID=abc; CID=def", pick_code="abcdefg1234567"
+            )
+        headers = info["headers"]
+        self.assertEqual(headers["User-Agent"], downurl._DEFAULT_115_USER_AGENT)
+        # 账号 Cookie 与取链响应下发的路径级 Cookie 都要带上
+        self.assertIn("UID=abc", headers["Cookie"])
+        self.assertIn("acw_tc=1", headers["Cookie"])
+        self.assertEqual(info["cookie"], "acw_tc=1; path-hash=2")
 
     def test_high_level_resolves_pick_code_from_file_id(self):
         with patch.object(pan115, "get_115_file_info", return_value={"pick_code": "abcdefg1234567"}):
@@ -254,10 +273,14 @@ class Pan115TwoStageResolveTests(unittest.TestCase):
         "msg": "文件大小超出限制，请用电脑端下载",
     }
 
-    def _call(self, webapi_result, downurl_side_effect):
+    def _call(self, webapi_result, downurl_side_effect, set_cookies=None):
         with patch.object(pan115, "throttle_115_api_requests", return_value=None), patch.object(
             pan115, "get_115_file_info", return_value=dict(self.FILE_INFO)
-        ), patch.object(pan115, "_request_115_webapi_json", return_value=webapi_result), patch.object(
+        ), patch.object(
+            pan115,
+            "_request_115_webapi_json_with_cookies",
+            return_value=(webapi_result, list(set_cookies or [])),
+        ), patch.object(
             pan115, "resolve_115_download_url_by_downurl", side_effect=downurl_side_effect
         ) as mocked_downurl, patch.object(pan115, "mark_cookie_health_success", return_value=None), patch.object(
             pan115, "mark_cookie_health_failure", return_value=None
@@ -272,7 +295,10 @@ class Pan115TwoStageResolveTests(unittest.TestCase):
             raise AssertionError("普通接口成功时不应触发 downurl 回退")
 
         info, mocked_downurl = self._call(
-            {"state": True, "data": {"url": "http://cdn.example.com/small.mkv"}}, boom
+            {"state": True, "data": {"url": "http://cdn.example.com/small.mkv"}},
+            boom,
+            # webapi 正常会给一条路径级 Cookie，带上就不该再回退
+            set_cookies=["abc123=xyz; path=/6ac7/"],
         )
         self.assertFalse(mocked_downurl.called)
         self.assertEqual(info["url"], "http://cdn.example.com/small.mkv")
@@ -298,11 +324,18 @@ class Pan115TwoStageResolveTests(unittest.TestCase):
         with patch.object(pan115, "throttle_115_api_requests", return_value=None), patch.object(
             pan115, "get_115_file_info", return_value=file_info
         ), patch.object(
-            pan115, "_request_115_webapi_json", return_value=self.SIZE_LIMIT_PAYLOAD
+            pan115,
+            "_request_115_webapi_json_with_cookies",
+            return_value=(self.SIZE_LIMIT_PAYLOAD, []),
         ), patch.object(
             pan115,
             "resolve_115_download_url_by_downurl",
-            return_value={"url": "http://cdn.example.com/big.mkv", "file_name": "大电影.mkv", "size": 8589934592},
+            return_value={
+                "url": "http://cdn.example.com/big.mkv",
+                "file_name": "大电影.mkv",
+                "size": 8589934592,
+                "headers": {"User-Agent": "Mozilla/5.0 115-media-hub", "Cookie": "UID=abc"},
+            },
         ), patch.object(
             pan115, "mark_cookie_health_success", return_value=None
         ), patch.object(
@@ -311,6 +344,72 @@ class Pan115TwoStageResolveTests(unittest.TestCase):
             info = pan115.resolve_115_download_info(self.COOKIE, self.FILE_ID)
         self.assertEqual(info["name"], "大电影.mkv")
         self.assertEqual(info["size"], 8589934592)
+
+    def test_webapi_path_returns_headers_matching_kuaichuan_user_agent_and_path_cookie(self):
+        """webapi 直链：下载头必须用取链那套 UA + 响应下发的路径级 Cookie。"""
+        info, _ = self._call(
+            {"state": True, "data": {"url": "http://cdn.example.com/small.mkv"}},
+            lambda *a, **k: self.fail("不该回退"),
+            set_cookies=["acw_tc=1; path=/; HttpOnly", "abc123=xyz; path=/6ac7/; domain=115.com"],
+        )
+        headers = info["headers"]
+        self.assertEqual(headers["User-Agent"], pan115._CLOUD115_WEBAPI_USER_AGENT)
+        self.assertIn("UID=abc", headers["Cookie"])
+        self.assertIn("acw_tc=1", headers["Cookie"])
+        self.assertIn("abc123=xyz", headers["Cookie"])
+        self.assertIn("acw_tc=1", info["cookie"])
+
+    def test_webapi_missing_path_cookie_falls_back_to_downurl(self):
+        """webapi 直链缺路径级 Cookie 时必然 403，此时应改走电脑端通道。"""
+        info, mocked_downurl = self._call(
+            {"state": True, "data": {"url": "http://cdn.example.com/will-403.mkv"}},
+            lambda *a, **k: {
+                "url": "http://cdn.example.com/ok.mkv",
+                "cookie": "acw_tc=7",
+                "headers": {
+                    "User-Agent": "Mozilla/5.0 115-media-hub",
+                    "Referer": "https://115.com/",
+                    "Cookie": "UID=abc; acw_tc=7",
+                },
+            },
+            set_cookies=[],
+        )
+        self.assertTrue(mocked_downurl.called)
+        self.assertEqual(info["url"], "http://cdn.example.com/ok.mkv")
+        self.assertEqual(info["headers"]["User-Agent"], "Mozilla/5.0 115-media-hub")
+
+    def test_webapi_missing_path_cookie_keeps_link_when_fallback_fails(self):
+        """回退失败也不该把已经拿到的直链判死，仍返回 webapi 结果。"""
+
+        def boom(*args, **kwargs):
+            raise downurl.Pan115DownurlError("downurl 临时不可用")
+
+        info, mocked_downurl = self._call(
+            {"state": True, "data": {"url": "http://cdn.example.com/keep.mkv"}},
+            boom,
+            set_cookies=[],
+        )
+        self.assertTrue(mocked_downurl.called)
+        self.assertEqual(info["url"], "http://cdn.example.com/keep.mkv")
+        self.assertEqual(info["headers"]["User-Agent"], pan115._CLOUD115_WEBAPI_USER_AGENT)
+
+    def test_downurl_path_returns_headers_with_link_user_agent(self):
+        info, _ = self._call(
+            self.SIZE_LIMIT_PAYLOAD,
+            lambda *a, **k: {
+                "url": "http://cdn.example.com/big.mkv",
+                "file_name": "大电影.mkv",
+                "size": 8589934592,
+                "cookie": "acw_tc=9",
+                "headers": {
+                    "User-Agent": "Mozilla/5.0 115-media-hub",
+                    "Referer": "https://115.com/",
+                    "Cookie": "UID=abc; acw_tc=9",
+                },
+            },
+        )
+        self.assertEqual(info["headers"]["User-Agent"], "Mozilla/5.0 115-media-hub")
+        self.assertIn("acw_tc=9", info["headers"]["Cookie"])
 
     def test_both_fail_message_contains_both_reasons(self):
         def downurl_boom(*args, **kwargs):

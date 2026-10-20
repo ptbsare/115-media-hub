@@ -388,7 +388,7 @@ def collect_115_download_urls(payload: Any) -> List[str]:
     return urls
 
 
-def _collect_set_cookie_pairs(response_set_cookies: List[str]) -> str:
+def collect_115_set_cookie_pairs(response_set_cookies: List[str]) -> str:
     """把响应的多条 Set-Cookie 压成一行 Cookie 头（下载 CDN 有时会下发）。"""
     extra_cookie_pairs: List[str] = []
     for raw_cookie in response_set_cookies:
@@ -446,6 +446,35 @@ def normalize_115_downurl_user_agent(value: Any) -> str:
     """downurl 请求的 UA 归一（空值兜底成项目内置 UA，和 strm 一致）。"""
     ua = str(value or "").strip()
     return ua or _DEFAULT_115_USER_AGENT
+
+
+def build_115_download_headers(cookie: str = "", user_agent: str = "", extra_cookie: str = "") -> Dict[str, str]:
+    """产出 115 直链的下载请求头（取链与下载必须共用同一份）。
+
+    两个坑（2026-10 实测）：
+
+    1. **直链按 UA 签名**。同一链接用 Chrome UA 下载 → ``403 Forbidden``，
+       用取链时的 UA（默认 ``Mozilla/5.0 115-media-hub``）→ ``206``。
+       所以下载端的 UA 不能自己另编一个。
+    2. **webapi ``/files/download`` 会下发路径级 Cookie**（形如
+       ``acw_tc=...; <hash>=...; path=/<目录 hash>/``），下载时必须带上，
+       只带账号 Cookie 同样 403。
+
+    ``extra_cookie`` 用来拼取链响应里拿到的 Set-Cookie。
+    """
+    merged_cookie = str(cookie or "").strip()
+    extra = str(extra_cookie or "").strip()
+    if extra:
+        merged_cookie = f"{merged_cookie}; {extra}" if merged_cookie else extra
+    headers = {
+        "Accept": "*/*",
+        "Referer": "https://115.com/",
+        "Origin": "https://115.com",
+        "User-Agent": normalize_115_downurl_user_agent(user_agent),
+    }
+    if merged_cookie:
+        headers["Cookie"] = merged_cookie
+    return headers
 
 
 def _throttle_115_api_requests() -> None:
@@ -519,14 +548,13 @@ def resolve_115_downurl_payload(
     timestamp = int(time.time())
     payload_text = json.dumps({"pickcode": normalized_pick_code}, ensure_ascii=False, separators=(",", ":"))
     encoded_data, decode_key = _m115_encode_downurl_payload(payload_text, timestamp)
-    headers = {
-        "Cookie": normalized_cookie,
-        "Accept": "application/json, text/plain, */*",
-        "Referer": "https://115.com/",
-        "Origin": "https://115.com",
-        "User-Agent": normalize_115_downurl_user_agent(user_agent),
-        "Content-Type": "application/x-www-form-urlencoded",
-    }
+    headers = build_115_download_headers(normalized_cookie, user_agent)
+    headers.update(
+        {
+            "Accept": "application/json, text/plain, */*",
+            "Content-Type": "application/x-www-form-urlencoded",
+        }
+    )
     body = urllib.parse.urlencode({"data": encoded_data}).encode("utf-8")
     request = urllib.request.Request(
         _DOWNURL_ENDPOINT + "?t=" + str(timestamp),
@@ -558,7 +586,7 @@ def resolve_115_downurl_payload(
     download_url = str(download_urls[0] if download_urls else "").strip()
     if not download_url:
         raise Pan115DownurlError("115 downurl 未解析到下载链接")
-    download_cookie = _collect_set_cookie_pairs(response_set_cookies)
+    download_cookie = collect_115_set_cookie_pairs(response_set_cookies)
     return download_url, download_cookie, _extract_115_downurl_file_meta(decoded_payload)
 
 
@@ -586,7 +614,7 @@ def resolve_115_download_url_by_downurl(
     if not normalized_pick_code:
         raise Pan115DownurlError("缺少 pickcode，无法调用 115 电脑端下载通道")
 
-    download_url, _download_cookie, meta = resolve_115_downurl_payload(
+    download_url, download_cookie, meta = resolve_115_downurl_payload(
         normalized_cookie,
         normalized_pick_code,
         user_agent,
@@ -595,4 +623,7 @@ def resolve_115_download_url_by_downurl(
         "url": str(download_url or "").strip(),
         "file_name": str(meta.get("file_name", "") or "").strip(),
         "size": parse_int(meta.get("size", 0), default=0),
+        # 下载端必须复用取链时的 UA + Cookie，否则 CDN 直接 403（见 build_115_download_headers）
+        "cookie": str(download_cookie or "").strip(),
+        "headers": build_115_download_headers(normalized_cookie, user_agent, download_cookie),
     }

@@ -4,6 +4,7 @@
 # 用法：
 #   scripts/check.sh                                  # 静态检查：compileall + 改动 JS 的 node --check + handoff 体积预算 + git diff --check
 #   scripts/check.sh tests.test_resource_ed2k         # 追加指定 unittest 用例（可传多个）
+#   scripts/check.sh --changed                        # 只跑与 git 改动相关的测试模块（日常提交前用）
 #   scripts/check.sh --all                            # 跑全量 unittest（发布 / 合并前用）
 #   scripts/check.sh --js static/js/index.js          # 手动指定要 node --check 的 JS（可重复）
 #   scripts/check.sh -h                               # 查看本说明
@@ -27,10 +28,20 @@ export PYTHONPYCACHEPREFIX="${PYTHONPYCACHEPREFIX:-/tmp/115-media-hub-pycache}"
 test_targets=()
 js_targets=()
 run_all=0
+run_changed=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --all) run_all=1 ;;
+    --changed)
+      run_changed="HEAD"
+      shift
+      case "${1:-}" in
+        ""|-*) ;;
+        *) run_changed="$1"; shift ;;
+      esac
+      continue
+      ;;
     --js)
       shift
       [ -n "${1:-}" ] && js_targets+=("$1")
@@ -80,15 +91,20 @@ if [ "${#js_targets[@]}" -gt 0 ]; then
   fi
 fi
 
-if [ "$run_all" = "1" ]; then
+if [ -n "$run_changed" ]; then
+  step "unittest（按改动挑选：${run_changed}）"
+  # run_tests.py 会把临时目录挪进仓库并吞掉「清理失败」噪音——本机安全中心
+  # 会拦临时文件删除，直接 discover 会刷一堆假失败。
+  "$PYTHON" scripts/run_tests.py --changed "$run_changed" || failed=1
+elif [ "$run_all" = "1" ]; then
   step "unittest（全量）"
-  "$PYTHON" -m unittest discover -s tests -p 'test_*.py' || failed=1
+  "$PYTHON" scripts/run_tests.py || failed=1
 elif [ "${#test_targets[@]}" -gt 0 ]; then
   step "unittest（${#test_targets[@]} 个用例）"
-  "$PYTHON" -m unittest "${test_targets[@]}" || failed=1
+  "$PYTHON" scripts/run_tests.py "${test_targets[@]}" || failed=1
 else
   step "unittest"
-  echo "跳过：未指定用例（用 --all 跑全量，或直接传 tests.test_xxx）"
+  echo "跳过：未指定用例（用 --changed 跑改动相关、--all 跑全量，或直接传 tests.test_xxx）"
 fi
 
 # 交接文档是「每个会话开头都要读」的文件，大了就是每个请求都重复付费。

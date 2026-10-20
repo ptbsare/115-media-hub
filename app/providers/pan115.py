@@ -13,7 +13,12 @@ import requests
 from .common import parse_int
 from .base import CloudProvider, UploadError, UploadResult
 from .pan115_cipher import decode_upload_response, make_upload_payload
-from .pan115_downurl import is_115_size_limit_error, resolve_115_download_url_by_downurl
+from .pan115_downurl import (
+    build_115_download_headers,
+    collect_115_set_cookie_pairs,
+    is_115_size_limit_error,
+    resolve_115_download_url_by_downurl,
+)
 from .registry import register
 from ..share_selection import normalize_share_selection_meta
 from ..core import *  # noqa: F401,F403
@@ -83,6 +88,35 @@ def _build_115_webapi_headers(cookie: str, referer: str = "") -> Dict[str, str]:
     }
 
 
+def _pick_115_download_headers(info: Any, account_cookie: str) -> Dict[str, str]:
+    """取链结果里带回来的下载头优先；缺了就用账号 Cookie 兜底。
+
+    115 的直链按 UA 签名，下载端绝不能自己另编 UA，所以这张表必须由
+    取链那一侧产出（``build_115_download_headers``）。
+    """
+    headers = (info or {}).get("headers") if isinstance(info, dict) else None
+    if isinstance(headers, dict) and headers:
+        return {
+            str(key): str(value)
+            for key, value in headers.items()
+            if isinstance(key, str) and isinstance(value, str)
+        }
+    extra_cookie = str((info or {}).get("cookie", "") or "").strip() if isinstance(info, dict) else ""
+    return build_115_download_headers(account_cookie, "", extra_cookie)
+
+
+def _try_115_downurl_fallback(cookie: str, pick_code: str, file_id: str) -> Dict[str, Any]:
+    """尽力走一次电脑端 downurl 通道；失败返回空字典，由调用方决定怎么兜。
+
+    只在「webapi 通道拿到了直链但缺下载 Cookie」这种尴尬场景用：此时已经有一条
+    可用直链，回退失败也不该把整个取链判死，所以这里吞掉异常。
+    """
+    try:
+        return resolve_115_download_url_by_downurl(cookie, pick_code=pick_code, file_id=file_id) or {}
+    except Exception:
+        return {}
+
+
 def _request_115_webapi_json(url: str, headers: Dict[str, str], timeout: int = 30) -> Dict[str, Any]:
     response = _get_115_webapi_session().get(
         normalize_http_url(url),
@@ -95,6 +129,48 @@ def _request_115_webapi_json(url: str, headers: Dict[str, str], timeout: int = 3
     except ValueError as exc:
         raise RuntimeError("115 返回内容不是有效 JSON") from exc
     return payload if isinstance(payload, dict) else {}
+
+
+def _response_set_cookie_pairs(response: Any) -> List[str]:
+    """取响应里的全部 Set-Cookie 原始行（requests/urllib3 两种结构都兼容）。"""
+    raw_headers = getattr(getattr(response, "raw", None), "headers", None)
+    for attr in ("getlist", "get_all"):
+        getter = getattr(raw_headers, attr, None)
+        if callable(getter):
+            try:
+                return [str(item or "") for item in (getter("Set-Cookie") or [])]
+            except Exception:
+                continue
+    single = ""
+    try:
+        single = str((getattr(response, "headers", None) or {}).get("Set-Cookie", "") or "")
+    except Exception:
+        single = ""
+    return [single] if single else []
+
+
+def _request_115_webapi_json_with_cookies(
+    url: str,
+    headers: Dict[str, str],
+    timeout: int = 30,
+) -> Tuple[Dict[str, Any], List[str]]:
+    """同 ``_request_115_webapi_json``，额外把响应 Set-Cookie 带回来。
+
+    取下载直链时必须留着它：``/files/download`` 会给一个路径级 Cookie，
+    下载端不带就 403（UA 不匹配也 403，见 ``build_115_download_headers``）。
+    """
+    response = _get_115_webapi_session().get(
+        normalize_http_url(url),
+        headers=headers,
+        timeout=max(3, int(timeout or 30)),
+    )
+    response.raise_for_status()
+    set_cookies = _response_set_cookie_pairs(response)
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise RuntimeError("115 返回内容不是有效 JSON") from exc
+    return (payload if isinstance(payload, dict) else {}), set_cookies
 
 
 def submit_115_offline_task(cookie: str, resource_url: str, folder_id: str) -> Dict[str, Any]:
@@ -658,7 +734,9 @@ def resolve_115_download_info(cookie: str, file_id: str) -> Dict[str, Any]:
     try:
         throttle_115_api_requests()
         url = "https://webapi.115.com/files/download?pickcode=" + urllib.parse.quote(pick_code)
-        result = _request_115_webapi_json(url, headers=_build_115_webapi_headers(cookie))
+        result, response_set_cookies = _request_115_webapi_json_with_cookies(
+            url, headers=_build_115_webapi_headers(cookie)
+        )
     except Exception as exc:
         mark_cookie_health_failure("115", exc, trigger="runtime:resolve_115_download_info")
         raise RuntimeError(f"115 下载地址获取失败：{exc}") from exc
@@ -698,6 +776,8 @@ def resolve_115_download_info(cookie: str, file_id: str) -> Dict[str, Any]:
                 "name": file_name or str(downurl_info.get("file_name", "") or "").strip(),
                 "size": size or parse_int(downurl_info.get("size", 0), default=0),
                 "sha1": sha1,
+                "cookie": str(downurl_info.get("cookie", "") or "").strip(),
+                "headers": _pick_115_download_headers(downurl_info, cookie),
             }
         raise RuntimeError(detail)
 
@@ -707,6 +787,24 @@ def resolve_115_download_info(cookie: str, file_id: str) -> Dict[str, Any]:
         raise RuntimeError("115 返回成功但没有解析到下载链接，请稍后重试")
 
     mark_cookie_health_success("115", trigger="runtime:resolve_115_download_info")
+    download_cookie = collect_115_set_cookie_pairs(response_set_cookies)
+    if not download_cookie:
+        # webapi 通道的直链要求带上响应下发的「路径级」Cookie，只带账号 Cookie
+        # 一样 403（实测）。拿不到就改走电脑端 downurl 通道（它只认 UA），
+        # 别让任务死在一个没法自证的 403 上。
+        downurl_info = _try_115_downurl_fallback(cookie, pick_code, fid)
+        downurl_url = str((downurl_info or {}).get("url", "") or "").strip()
+        if downurl_url:
+            return {
+                "url": downurl_url,
+                "file_id": fid,
+                "pick_code": pick_code,
+                "name": file_name or str(downurl_info.get("file_name", "") or "").strip(),
+                "size": size or parse_int(downurl_info.get("size", 0), default=0),
+                "sha1": sha1,
+                "cookie": str(downurl_info.get("cookie", "") or "").strip(),
+                "headers": _pick_115_download_headers(downurl_info, cookie),
+            }
     return {
         "url": download_url,
         "file_id": fid,
@@ -714,6 +812,9 @@ def resolve_115_download_info(cookie: str, file_id: str) -> Dict[str, Any]:
         "name": file_name,
         "size": size,
         "sha1": sha1,
+        "cookie": download_cookie,
+        # 下载端必须复用「取链时的 UA + 路径级 Cookie」，否则 403
+        "headers": build_115_download_headers(cookie, _CLOUD115_WEBAPI_USER_AGENT, download_cookie),
     }
 
 
