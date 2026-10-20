@@ -605,16 +605,22 @@ async def run_cross_copy_job(job_id: int) -> None:
         final_target_path = _join_pan_path(job.get("target_savepath"), final_name) or str(
             job.get("target_path", "") or ""
         )
+        base_detail = str(getattr(result, "message", "") or ("已完成" if final_status == STATUS_COMPLETED else "已跳过"))
+        result_payload = result.to_dict() if hasattr(result, "to_dict") else {"status": result_status}
+        note = _no_monitor_note(job.get("target_provider", ""))
+        if note:
+            # 结构化字段：前端只渲染 resultHint，光写 status_detail 用户看不到
+            result_payload["no_monitor_note"] = note
         update_cross_copy_job(
             job_id,
             status=final_status,
-            status_detail=str(getattr(result, "message", "") or ("已完成" if final_status == STATUS_COMPLETED else "已跳过")),
+            status_detail=base_detail + note,
             progress_percent=100,
             phase="done",
             finished_at=now_text(),
             filename=final_name or str(job.get("filename", "") or ""),
             target_path=final_target_path,
-            result=result.to_dict() if hasattr(result, "to_dict") else {"status": result_status},
+            result=result_payload,
         )
         _clear_job_progress(job_id)
         _push_cross_copy_notification(cfg, job, ok=True, message=str(getattr(result, "message", "") or ""))
@@ -675,6 +681,19 @@ def _ensure_target_dir_id(
     return job
 
 
+def _no_monitor_note(target_provider: str) -> str:
+    """非 115 目标补一句说明：那边没有监控任务接手，不会自动处理。
+
+    监控任务只绑在 115 上（`monitor.queue_inbox_dispatch_scan` 对非 115 直接返回），
+    所以复制到夸克/阿里/天翼后既不会生成 STRM，也不会自动整理文件名。
+    这里不替用户猜意图，只把这件事讲明白，要整理自己去「文件管理」页点。
+    """
+    name = str(target_provider or "").strip().lower()
+    if not name or name == "115":
+        return ""
+    return "（非 115 目标：不会自动生成 STRM，也不整理文件名；要整理请在「文件管理」页手动执行）"
+
+
 def _job_source_is_dir(job: Dict[str, Any]) -> bool:
     """任务源是文件夹？（老任务没有这列时为 0，走单文件逻辑）"""
     try:
@@ -698,6 +717,9 @@ def _finish_folder_job(job_id: int, job: Dict[str, Any], cfg: Dict[str, Any], re
         job.get("target_path", "") or ""
     )
     payload = result.to_dict() if hasattr(result, "to_dict") else {"status": result_status}
+    note = _no_monitor_note(job.get("target_provider", ""))
+    if note:
+        payload["no_monitor_note"] = note
     fields: Dict[str, Any] = {
         "result": payload,
         "filename": folder_name or str(job.get("filename", "") or ""),
@@ -714,7 +736,7 @@ def _finish_folder_job(job_id: int, job: Dict[str, Any], cfg: Dict[str, Any], re
     update_cross_copy_job(
         job_id,
         status=STATUS_COMPLETED,
-        status_detail=message or "复制完成",
+        status_detail=(message or "复制完成") + _no_monitor_note(job.get("target_provider", "")),
         progress_percent=100,
         phase="done",
         error_message="",

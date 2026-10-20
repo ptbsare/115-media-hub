@@ -11,6 +11,7 @@ import tempfile
 import threading
 import time
 import unittest
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from app import db
@@ -901,6 +902,59 @@ class TestStartupTempCleanup(CrossCopyJobsTestBase):
         with patch.object(xcc, "resolve_temp_dir", return_value=""):
             result = ccj.cleanup_temp_files_on_startup()
         self.assertEqual(result["removed"], 0)
+
+
+class TestNon115TargetDetail(CrossCopyJobsTestBase):
+    """非 115 目标完成文案必须说明「不会自动处理」。
+
+    监控任务只绑在 115 上，复制到夸克/阿里/天翼后既不生成 STRM 也不整理文件名。
+    2026-10-20 决策是「不自动猜用户意图去刮削」，那就必须把这件事讲明白，
+    否则用户会以为系统坏了（复制成功但库里看不到）。
+    """
+
+    def _run_to_completion(self, target_name):
+        target = FakeProvider(target_name, "阿里云盘" if target_name == "aliyun" else "115网盘")
+        mapping = {"quark": self.source_provider, "115": self.target_provider, target_name: target}
+        job_id = self._create_job(target_provider=target_name, target_dir_id="dir-t")
+        with patch.object(
+            ccj, "_get_provider_or_none", side_effect=lambda name: mapping.get(name)
+        ), patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result("uploaded")):
+            self._run(job_id)
+        return ccj.get_cross_copy_job(job_id)
+
+    def test_non_115_target_tells_user_no_auto_processing(self):
+        job = self._run_to_completion("aliyun")
+        self.assertEqual(job["status"], "completed")
+        self.assertIn("非 115", job["status_detail"])
+        self.assertIn("STRM", job["status_detail"])
+        # 必须给出可操作去处，不能只说「不行」
+        self.assertIn("文件管理", job["status_detail"])
+        # 前端只渲染 resultHint，所以必须同时给结构化字段，否则卡片上看不到
+        self.assertIn("非 115", job["result"]["no_monitor_note"])
+
+    def test_115_target_keeps_plain_detail(self):
+        job = self._run_to_completion("115")
+        self.assertEqual(job["status"], "completed")
+        self.assertNotIn("非 115", job["status_detail"])
+        self.assertNotIn("no_monitor_note", job["result"])
+
+    def test_folder_job_also_tells_user(self):
+        """文件夹任务走另一条收口函数，文案不能漏。"""
+        result = SimpleNamespace(
+            status="completed",
+            folder_name="片子",
+            target_path="/云下载/片子",
+            total_bytes=2048,
+            message="3 个文件已复制",
+        )
+        job_id = self._create_job(
+            target_provider="aliyun", target_dir_id="dir-t", source_is_dir=1, filename="片子"
+        )
+        job = ccj.get_cross_copy_job(job_id)
+        ccj._finish_folder_job(job_id, job, self.cfg, result)
+        detail = ccj.get_cross_copy_job(job_id)["status_detail"]
+        self.assertIn("非 115", detail)
+        self.assertIn("3 个文件已复制", detail)
 
 
 if __name__ == "__main__":

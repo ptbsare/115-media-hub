@@ -264,6 +264,9 @@
         const target = providerLabel(job?.target_provider);
         const filename = String(job?.filename || job?.title || `任务 #${jobId}`).trim();
         const detail = String(job?.error_message || job?.status_detail || '').trim();
+        // 非 115 目标没有监控任务接手，后端在 result 里带了说明，这里单独一行显示：
+        // resultHint 会盖住 status_detail，塞进同一行就看不见了。
+        const noMonitorNote = String(result.no_monitor_note || '').trim();
         const targetPath = String(job?.target_savepath || '').trim();
         const sourceFilePath = String(job?.source_path || '').trim() || filename;
         const targetFilePath = String(job?.target_path || '').trim()
@@ -337,6 +340,7 @@
                             </div>
                         </div>
                         <div class="resource-job-status-note">${escapeHtml(resultHint || detail || '--')}</div>
+                        ${noMonitorNote ? `<div class="resource-job-status-note">${escapeHtml(noMonitorNote)}</div>` : ''}
                     </div>
                 </div>
                 <div class="resource-job-card-actions">
