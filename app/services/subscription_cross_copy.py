@@ -197,8 +197,12 @@ def _stage_share_to_quark(
     所以返回的是列表而不是单个文件。
     """
     share_payload = quark_provider.resolve_share_payload(cookie, share_url, "", receive_code)
-    entries = quark_provider.list_share_entries(cookie, share_payload, cid="0")
-    entries = [entry for entry in (entries or []) if isinstance(entry, dict)]
+    listed = quark_provider.list_share_entries(cookie, share_payload, cid="0")
+    # 真实 provider 返回 {"entries": [...], "summary": ...}（见 base.list_share_entries
+    # 的 Dict 契约），不是裸列表；2026-10-20 真机发现这里按列表迭代导致分享永远
+    # 被判定为空，订阅补源转存整链不可用。
+    raw_entries = listed.get("entries", []) if isinstance(listed, dict) else (listed or [])
+    entries = [entry for entry in raw_entries if isinstance(entry, dict)]
     if not entries:
         raise RuntimeError("分享内没有可转存的文件")
 

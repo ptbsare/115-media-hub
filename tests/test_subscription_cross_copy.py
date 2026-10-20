@@ -50,9 +50,17 @@ class FakeQuarkProvider:
     def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
         self.calls.append(("list_share",))
         if self.empty_share:
-            return []
+            # 与真实 provider 一致：返回 dict（见 base.list_share_entries 契约）
+            return {"entries": [], "summary": {"folder_count": 0, "file_count": 0}}
         url = str(share_payload.get("url", "") or "")
-        return list(self.shares.get(url, self.default_share))
+        entries = list(self.shares.get(url, self.default_share))
+        return {
+            "entries": entries,
+            "summary": {
+                "folder_count": sum(1 for e in entries if e.get("is_dir")),
+                "file_count": sum(1 for e in entries if not e.get("is_dir")),
+            },
+        }
 
     def ensure_folder_id_by_path(self, cookie, relative_path):
         self.calls.append(("ensure_folder", relative_path))

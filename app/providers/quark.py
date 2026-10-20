@@ -1138,9 +1138,11 @@ def _list_quark_share_page(
         if cached:
             return cached
     headers = _build_quark_headers(cookie, referer=f"https://pan.quark.cn/s/{normalized_pwd_id}")
-    # Quark share detail 接口对 stoken 的解析存在双重 decode 行为；
-    # 这里先手动 quote，再交给 urlencode，等价于双编码，避免返回“非法token”。
-    stoken_query_value = urllib.parse.quote(str(stoken or "").strip(), safe="")
+    # stoken 原样交给 urlencode 做单次编码。2026-10-20 真机实测：夸克服务端已
+    # 改为单次 decode，旧的双重编码（手动 quote 再 urlencode）会让含 +/=/ 的
+    # stoken 签名失配，返回 400「非法token」；纯字母数字的 stoken 碰巧两边
+    # 相等所以时好时坏。
+    stoken_query_value = str(stoken or "").strip()
     url = _build_quark_api_url(
         "/1/clouddrive/share/sharepage/detail",
         {
@@ -1328,7 +1330,8 @@ def _list_quark_share_page_fast(
                 return cached_inner
 
         headers = _build_quark_headers(cookie, referer=f"https://pan.quark.cn/s/{normalized_pwd_id}")
-        stoken_query_value = urllib.parse.quote(str(stoken or "").strip(), safe="")
+        # 单次编码，原因同 _list_quark_share_page：服务端单次 decode，双编码会 400「非法token」。
+        stoken_query_value = str(stoken or "").strip()
         url = _build_quark_api_url(
             "/1/clouddrive/share/sharepage/detail",
             {
