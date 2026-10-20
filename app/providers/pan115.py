@@ -11,7 +11,7 @@ from typing import Any, Dict, List, Optional, Tuple
 import requests
 
 from .common import parse_int
-from .base import CloudProvider, UploadError, UploadResult
+from .base import CloudProvider, UploadError, UploadResult, upload_part_with_retry
 from .pan115_cipher import decode_upload_response, make_upload_payload
 from .pan115_downurl import (
     build_115_download_headers,
@@ -3539,7 +3539,21 @@ def upload_115_file(
             chunk = sink.read(part_size)
             if not chunk:
                 break
-            etag = _oss_upload_part(token, bucket, endpoint, key, upload_id, part_number, chunk)
+            def _send_part(_part_number=part_number, _chunk=chunk):
+                try:
+                    return _oss_upload_part(
+                        token, bucket, endpoint, key, upload_id, _part_number, _chunk
+                    )
+                except _UploadRateLimited as exc:
+                    # 405/429 是限流语义，属于可重试的瞬时故障
+                    raise UploadError(str(exc), retriable=True, provider="115") from exc
+
+            etag = upload_part_with_retry(
+                _send_part,
+                part_number=part_number,
+                label="115",
+                cancel_check=(lambda: bool(cancel_check is not None and cancel_check())),
+            )
             parts.append({"PartNumber": part_number, "ETag": etag})
             sent += len(chunk)
             part_number += 1

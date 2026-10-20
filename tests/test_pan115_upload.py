@@ -204,6 +204,38 @@ class Upload115FileTest(unittest.TestCase):
         self.assertEqual([p["PartNumber"] for p in parts], [1, 2])
         self.assertEqual([p["ETag"] for p in parts], ["e1", "e2"])
 
+    def test_flaky_part_is_retried_without_restarting_file(self):
+        """分片抖动只在分片粒度重试，不退回整文件（否则要从源盘重下一遍）。"""
+        data = b"f" * (10 * 1024 * 1024 + 1024)  # 2 片
+        sha1 = hashlib.sha1(data).hexdigest().upper()
+        init_resp = self._init_resp(
+            1,
+            bucket="fhnfile",
+            object="obj-key-retry",
+            callback={"callback": "{}", "callback_var": "{}"},
+        )
+        flaky = [
+            UploadError("115 分片 1 上传失败（OSS HTTP 500）", retriable=True, provider="115"),
+            UploadError("115 分片 1 上传失败（OSS HTTP 500）", retriable=True, provider="115"),
+            "e1",
+            "e2",
+        ]
+        with patch.object(pan115, "_upload_115_initupload", return_value=init_resp), \
+             patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_multipart_init", return_value="up-3"), \
+             patch.object(pan115, "_oss_upload_part", side_effect=flaky) as m_part, \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None) as m_done, \
+             patch("time.sleep") as sleeper:
+            result = pan115.upload_115_file(
+                "cookie", MemSink(data, sha1=sha1), "big.mkv", "0",
+                size=len(data), sha1=sha1, part_size_mb=10,
+            )
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(m_part.call_count, 4)  # 第 1 片试了 3 次 + 第 2 片 1 次
+        self.assertTrue(sleeper.called)
+        parts = m_done.call_args[0][5]
+        self.assertEqual([p["ETag"] for p in parts], ["e1", "e2"])
+
     def test_rate_limit_backoff_then_success(self):
         data = b"r" * 100
         sha1 = hashlib.sha1(data).hexdigest().upper()

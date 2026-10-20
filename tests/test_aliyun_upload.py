@@ -92,6 +92,57 @@ class AliyunUploadTestBase(unittest.TestCase):
         return resp
 
 
+class TestAliyunUploadPartRetry(AliyunUploadTestBase):
+    """分片抖动只在分片粒度重试，不能退回整文件（否则要从源盘重下一遍）。"""
+
+    def test_flaky_part_is_retried(self):
+        self.create_response = self._create_resp(part_count=2)
+        data = b"a" * (PART_SIZE + 10)
+        attempts = {"n": 0}
+
+        def flaky_put(url, data=None, timeout=None, **kwargs):
+            attempts["n"] += 1
+            if attempts["n"] == 1:
+                raise ConnectionResetError("conn reset")
+            resp = unittest.mock.MagicMock()
+            resp.status_code = 200
+            return resp
+
+        with patch("app.providers.aliyun.requests.put", side_effect=flaky_put), patch("time.sleep") as sleeper:
+            result = self.provider.upload_file(
+                "rt-1", _MemSink(data), "t.mkv", "dir-1",
+                sha1=hashlib.sha1(data).hexdigest().upper(), size=len(data),
+            )
+
+        self.assertEqual(result.status, "uploaded")
+        # 第 1 片失败 1 次 + 重试成功 1 次 + 第 2 片 1 次 = 3
+        self.assertEqual(attempts["n"], 3)
+        self.assertTrue(sleeper.called)
+
+    def test_http_error_is_retried_then_reported_with_part_number(self):
+        self.create_response = self._create_resp(part_count=1)
+        data = b"a" * 100
+        attempts = {"n": 0}
+
+        def denied(url, data=None, timeout=None, **kwargs):
+            attempts["n"] += 1
+            resp = unittest.mock.MagicMock()
+            resp.status_code = 403
+            return resp
+
+        with patch("app.providers.aliyun.requests.put", side_effect=denied), patch("time.sleep"):
+            with self.assertRaises(UploadError) as ctx:
+                self.provider.upload_file(
+                    "rt-1", _MemSink(data), "t.mkv", "dir-1",
+                    sha1=hashlib.sha1(data).hexdigest().upper(), size=len(data),
+                )
+        # 403 目前仍按瞬时故障处理（预签名 URL 偶发被 WAF 拒），重试用尽后要能说清哪一片
+        self.assertEqual(attempts["n"], 3)
+        message = str(ctx.exception)
+        self.assertIn("分片 1", message)
+        self.assertIn("403", message)
+
+
 class TestAliyunUploadHappyPath(AliyunUploadTestBase):
     def test_rapid_upload_single_round(self):
         """第一段即秒传命中（rapid_upload=true）。"""

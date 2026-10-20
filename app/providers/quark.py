@@ -8,7 +8,7 @@ import time
 
 import requests
 
-from .base import CloudProvider, UploadError, UploadResult
+from .base import CloudProvider, UploadError, UploadResult, upload_part_with_retry
 from .common import parse_int
 from .registry import register
 from ..share_selection import normalize_share_selection_entry, normalize_share_selection_meta
@@ -2301,7 +2301,13 @@ def upload_quark_file(
             chunk = sink.read(part_size)
             if not chunk:
                 break
-            etag = _quark_upload_part(cookie, pre, mime_type, part_number, chunk)
+            etag = upload_part_with_retry(
+                lambda: _quark_upload_part(cookie, pre, mime_type, part_number, chunk),
+                part_number=part_number,
+                label="quark",
+                # 分片重试期间也要能响应取消，否则用户点了取消还要等退避跑完
+                cancel_check=(lambda: bool(cancel_check is not None and cancel_check())),
+            )
             etags.append(etag)
             sent += len(chunk)
             part_number += 1

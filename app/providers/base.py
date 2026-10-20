@@ -17,6 +17,102 @@ class UploadError(RuntimeError):
         self.provider = str(provider or "")
 
 
+UPLOAD_PART_RETRY_ATTEMPTS = 3
+"""分片上传的总尝试次数（首发 1 次 + 重试 2 次）。
+
+只在**分片粒度**重试：已经传成功的分片不会重传，重新读取也不会退回 0。
+跨进程的「续传」（重启后接着上次的 uploadId 传）另说，目前三家都没做。
+"""
+
+UPLOAD_PART_RETRY_BACKOFF_SECONDS = (1.0, 3.0)
+"""分片重试的等待序列（秒），按尝试次数取，超出取最后一个。"""
+
+
+def is_retriable_upload_error(exc: BaseException) -> bool:
+    """判断一个上传异常值不值得重试。
+
+    显式 ``retriable=False`` 的业务错误（鉴权失效、参数不合法、空间不足等）
+    重试多少次都一样，直接抛给用户；网络抖动、限流、5xx 才重试。
+    """
+    if isinstance(exc, UploadError):
+        return bool(exc.retriable)
+    # 内建的网络族异常（socket 层直接抛出来的，没经过 requests 包装）
+    # 注意这里指的是内建 ConnectionError，不是本模块之外的同名类。
+    if isinstance(exc, (ConnectionError, TimeoutError)):
+        return True
+    # requests / urllib3 的网络层异常统一带 RequestException 基类；
+    # 这里不直接 import requests（providers 里各处已各自 import），用类名兜底。
+    name = type(exc).__name__
+    if name in {
+        "ConnectionError",
+        "ConnectTimeout",
+        "ReadTimeout",
+        "Timeout",
+        "ChunkedEncodingError",
+        "ContentDecodingError",
+        "ProtocolError",
+        "IncompleteRead",
+    }:
+        return True
+    module = type(exc).__module__ or ""
+    return module.startswith("requests") or module.startswith("urllib3")
+
+
+def upload_part_with_retry(
+    send_part,
+    *,
+    part_number: int,
+    label: str = "",
+    attempts: int = UPLOAD_PART_RETRY_ATTEMPTS,
+    backoff: Any = UPLOAD_PART_RETRY_BACKOFF_SECONDS,
+    sleep_fn=None,
+    cancel_check=None,
+    on_retry=None,
+):
+    """分片上传失败后按退避重试，返回 ``send_part()`` 的结果。
+
+    为什么要它：大文件动辄几百个分片，任何一个分片抖一下就整文件失败，
+    而整文件重试意味着**从源网盘重新下载一遍**（几百 GB 的量级完全不可接受）。
+    在分片这一层重试，代价只是重发那一片。
+
+    只重试瞬时故障（见 ``is_retriable_upload_error``）；业务错误立刻抛出。
+    ``cancel_check`` 在**每次重试前**问一次（首次尝试不额外问，调用方外层通常
+    已经查过一遍），这样用户点了取消就不必干等退避的几秒。
+    """
+    total_attempts = max(1, int(attempts or 1))
+    waits = tuple(backoff) if isinstance(backoff, (tuple, list)) else (float(backoff or 0),)
+    sleeper = sleep_fn or time.sleep
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return send_part()
+        except BaseException as exc:  # noqa: BLE001 - 分类后决定重抛还是重试
+            if not is_retriable_upload_error(exc):
+                raise
+            last_exc = exc
+            if attempt >= total_attempts:
+                break
+            # 退避前再问一次取消：用户点了取消，就别让他干等这几秒
+            if cancel_check is not None and cancel_check():
+                raise UploadError("上传已取消", provider=label)
+            wait_seconds = waits[min(attempt - 1, len(waits) - 1)] if waits else 0.0
+            if on_retry is not None:
+                try:
+                    on_retry(part_number, attempt, wait_seconds, exc)
+                except Exception:
+                    pass
+            if wait_seconds > 0:
+                sleeper(wait_seconds)
+
+    message = str(last_exc) if last_exc is not None else "上传失败"
+    raise UploadError(
+        f"{message}（分片 {part_number} 已重试 {total_attempts} 次仍失败）",
+        retriable=True,
+        provider=label,
+    ) from last_exc
+
+
 class UploadResult:
     """单文件上传结果。
 

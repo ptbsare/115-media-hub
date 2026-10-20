@@ -240,6 +240,53 @@ class TestQuarkUploadCancel(QuarkUploadTestBase):
         self.assertEqual(len(self.fake_session.put_calls), 1)  # 只传了第一片
 
 
+class TestQuarkUploadPartRetry(QuarkUploadTestBase):
+    """分片抖动只在分片粒度重试，不能退回整文件（否则要从源盘重下一遍）。"""
+
+    def test_flaky_part_is_retried_without_restarting_file(self):
+        data = b"q" * (4 * 1024 * 1024 + 10)  # 2 片
+        real_part = quark._quark_upload_part
+        failures = {"n": 0}
+
+        def flaky(cookie, pre, mime_type, part_number, chunk):
+            if part_number == 1 and failures["n"] < 2:
+                failures["n"] += 1
+                raise UploadError(
+                    "夸克分片 1 上传失败（网络错误）", retriable=True, provider="quark"
+                )
+            return real_part(cookie, pre, mime_type, part_number, chunk)
+
+        with patch.object(quark, "_quark_upload_part", side_effect=flaky), patch("time.sleep") as sleeper:
+            result = quark.upload_quark_file(
+                "cookie-1", io.BytesIO(data), "t.mkv", "0",
+                md5=hashlib.md5(data).hexdigest(), sha1=hashlib.sha1(data).hexdigest().upper(),
+                size=len(data),
+            )
+
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(failures["n"], 2)  # 重试了 2 次
+        self.assertTrue(sleeper.called)  # 走了退避
+        # 只有 2 片真正发出去，说明没有整文件重来
+        self.assertEqual(len(self.fake_session.put_calls), 2)
+
+    def test_part_gives_up_after_attempts_with_readable_message(self):
+        data = b"q" * (4 * 1024 * 1024 + 10)
+
+        def always_fail(cookie, pre, mime_type, part_number, chunk):
+            raise UploadError("夸克分片 1 上传失败（网络错误）", retriable=True, provider="quark")
+
+        with patch.object(quark, "_quark_upload_part", side_effect=always_fail), patch("time.sleep"):
+            with self.assertRaises(UploadError) as ctx:
+                quark.upload_quark_file(
+                    "cookie-1", io.BytesIO(data), "t.mkv", "0",
+                    md5=hashlib.md5(data).hexdigest(), sha1=hashlib.sha1(data).hexdigest().upper(),
+                    size=len(data),
+                )
+        message = str(ctx.exception)
+        self.assertIn("分片 1", message)
+        self.assertIn("重试", message)
+
+
 class TestQuarkUploadErrors(QuarkUploadTestBase):
     def test_missing_cookie(self):
         with self.assertRaises(UploadError) as ctx:

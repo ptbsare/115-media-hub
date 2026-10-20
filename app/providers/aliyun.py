@@ -10,7 +10,7 @@ from typing import Any, Dict, List
 
 import requests
 
-from .base import CloudProvider, UploadError, UploadResult
+from .base import CloudProvider, UploadError, UploadResult, upload_part_with_retry
 from .aliyun_oauth import ALIYUN_OPEN_CLIENT_ID, build_aliyun_refresh_payload
 from .registry import register
 
@@ -1173,25 +1173,36 @@ class AliyunProvider(CloudProvider):
                 chunk = sink.read(_ALIYUN_UPLOAD_PART_SIZE)
                 if not chunk:
                     raise UploadError("读取上传数据不完整", provider="aliyun")
-                self.throttle()
-                try:
-                    put_resp = requests.put(
-                        upload_url,
-                        data=chunk,
-                        timeout=max(30, min(600, 60 + len(chunk) // (1024 * 1024))),
-                    )
-                except Exception as exc:
-                    raise UploadError(
-                        f"阿里云盘分片 {index + 1} 上传失败（网络错误）",
-                        retriable=True,
-                        provider="aliyun",
-                    ) from exc
-                if int(put_resp.status_code or 0) // 100 != 2:
-                    raise UploadError(
-                        f"阿里云盘分片 {index + 1} 上传失败（HTTP {int(put_resp.status_code or 0)}）",
-                        retriable=True,
-                        provider="aliyun",
-                    )
+
+                def _send_part(_url=upload_url, _chunk=chunk, _index=index):
+                    """发一片（可被重试复用：chunk 已读在内存里，重发不再回源）。"""
+                    self.throttle()
+                    try:
+                        put_resp = requests.put(
+                            _url,
+                            data=_chunk,
+                            timeout=max(30, min(600, 60 + len(_chunk) // (1024 * 1024))),
+                        )
+                    except Exception as exc:
+                        raise UploadError(
+                            f"阿里云盘分片 {_index + 1} 上传失败（网络错误）",
+                            retriable=True,
+                            provider="aliyun",
+                        ) from exc
+                    if int(put_resp.status_code or 0) // 100 != 2:
+                        raise UploadError(
+                            f"阿里云盘分片 {_index + 1} 上传失败（HTTP {int(put_resp.status_code or 0)}）",
+                            retriable=True,
+                            provider="aliyun",
+                        )
+                    return put_resp
+
+                upload_part_with_retry(
+                    _send_part,
+                    part_number=index + 1,
+                    label="aliyun",
+                    cancel_check=(lambda: bool(cancel_check is not None and cancel_check())),
+                )
                 sent += len(chunk)
                 if progress_cb:
                     try:
