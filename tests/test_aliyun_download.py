@@ -14,6 +14,7 @@
 import unittest
 from unittest.mock import patch
 
+from app.http_utils import normalize_http_url
 from app.providers.aliyun import (
     ALIYUN_DOWNLOAD_EXPIRE_SEC,
     AliyunProvider,
@@ -279,6 +280,50 @@ class TestAliyunDownloadHelpers(unittest.TestCase):
     def test_map_error_does_not_return_empty(self):
         self.assertTrue(_map_aliyun_download_error(RuntimeError("")))
         self.assertTrue(_map_aliyun_download_error(RuntimeError("weird")))
+
+
+class TestNormalizeHttpUrlKeepsSignature(unittest.TestCase):
+    """归一化不得改坏已签名的直链（2026-10-20 真机 403 事故的回归钉）。
+
+    事故：老实现 unquote 再 quote，把 ``%3D%3D`` 还原成 ``==``；阿里云盘 / OSS
+    按原始 query 串算签名，一个字节变了就 403。阿里作源的跨盘复制必失败。
+    """
+
+    # 事故现场的 URL 形状（参数值截取）：callback base64 + OSS 签名参数
+    SIGNED = (
+        "https://dl1-v6.aliyundrive.cloud/file/abc123"
+        "?callback=eyJjYWxsYmFja1VybCI6Imh0dHA6Ly9iai5hcGkuYWxpeXVucGRzLmNvbSJ9%3D%3D"
+        "&callback-var=eyJ4OmRvbWFpbl9pZCI6ImJqMjkifQ%3D%3D"
+        "&x-oss-credential=STS.NZH66eC2wPA7M3iHbQj9hbLB%2F20261020%2Fcn-beijing%2Foss%2Faliyun_v4_request"
+        "&x-oss-security-token=CAISvgJ1q6Ft5B2yfSjIr5n9fYzRru1W54%2BOK%2Fcalq5rR4Q"
+        "&pds-params=%7B%22ap%22%3A%225509%22%7D"
+        "&response-content-disposition=attachment%3B%20filename%2A=UTF-8%27%27a.bin"
+    )
+
+    def test_existing_escapes_are_untouched(self):
+        self.assertEqual(normalize_http_url(self.SIGNED), self.SIGNED)
+
+    def test_plain_equals_and_plus_survive(self):
+        url = "https://h.example.com/a?token=a+b%2Bc&sig=x%3D%3D&v=%2Fpath"
+        self.assertEqual(normalize_http_url(url), url)
+
+    def test_non_ascii_is_encoded(self):
+        out = normalize_http_url("https://h.example.com/中文目录/文件.mp4?a=1")
+        self.assertEqual(out, "https://h.example.com/%E4%B8%AD%E6%96%87%E7%9B%AE%E5%BD%95/%E6%96%87%E4%BB%B6.mp4?a=1")
+
+    def test_idempotent(self):
+        once = normalize_http_url(self.SIGNED + "#frag%20x")
+        self.assertEqual(normalize_http_url(once), once)
+
+    def test_empty_and_blank(self):
+        self.assertEqual(normalize_http_url(""), "")
+        self.assertEqual(normalize_http_url("   "), "")
+
+    def test_space_is_encoded(self):
+        self.assertEqual(
+            normalize_http_url("https://h.example.com/a b?q=c d"),
+            "https://h.example.com/a%20b?q=c%20d",
+        )
 
 
 if __name__ == "__main__":
