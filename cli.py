@@ -29,6 +29,8 @@
                                        文件管理（刮削/重命名）
   115 watchlist list|add|remove|update  推荐清单
   115 strm orphans|cleanup|dirs         STRM 管理
+  115 cross-copy list|capabilities|create|cancel|retry|delete|clear
+                                       跨盘复制任务管理
   115 resource import|preview|quick-links|delete
                                        资源中心管理
   115 api <method> <path> [body]        通用 API 调用
@@ -1791,6 +1793,142 @@ def cmd_strm(args, c: Client):
             print(f"  📁 {str(d).strip()}")
 
 
+# ── 跨盘复制 ──────────────────────────────────────────────────────────────
+
+_CROSS_COPY_STATUS_ICON = {
+    "completed": "✅",
+    "failed": "❌",
+    "cancelled": "🚫",
+    "skipped": "⏭️",
+    "running": "🔄",
+    "pending": "⏳",
+}
+
+
+def _format_size(num) -> str:
+    try:
+        value = float(num or 0)
+    except (TypeError, ValueError):
+        return "?"
+    if value <= 0:
+        return "?"
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if value < 1024 or unit == "TB":
+            return f"{value:.1f}{unit}" if unit != "B" else f"{int(value)}B"
+        value /= 1024
+    return f"{value:.1f}TB"
+
+
+def _format_elapsed(job: Dict[str, Any]) -> str:
+    for key in ("elapsed_seconds", "duration_seconds", "elapsed"):
+        raw = job.get(key)
+        if raw not in (None, ""):
+            try:
+                return f"{float(raw):.0f}s"
+            except (TypeError, ValueError):
+                pass
+    try:
+        created = float(job.get("created_at") or 0)
+        updated = float(job.get("updated_at") or 0)
+        if created > 0 and updated >= created:
+            return f"{updated - created:.0f}s"
+    except (TypeError, ValueError):
+        pass
+    return "?"
+
+
+def cmd_cross_copy(args, c: Client):
+    """跨盘复制任务管理"""
+    if args.action == "list":
+        query = {"limit": args.limit}
+        if args.status:
+            query["status"] = args.status
+        data = c.json("GET", "/cross_copy/jobs", query)
+        jobs = data.get("jobs", []) if isinstance(data, dict) else []
+        counts = data.get("counts", {}) if isinstance(data, dict) else {}
+        if not jobs:
+            print("暂无跨盘复制任务")
+        for job in jobs:
+            status = str(job.get("status", "") or "")
+            icon = _CROSS_COPY_STATUS_ICON.get(status, "❔")
+            name = str(job.get("filename") or job.get("title") or "")
+            size = _format_size(job.get("file_size"))
+            detail = str(job.get("status_detail") or "").strip()
+            percent = job.get("progress_percent")
+            progress = f" {percent}%" if status == "running" and percent not in (None, "") else ""
+            line = (
+                f"#{job.get('id')} {icon} {status} "
+                f"{job.get('source_provider')}→{job.get('target_provider')} "
+                f"{name} ({size}) {_format_elapsed(job)}{progress}"
+            )
+            origin = str(job.get("origin") or "").strip()
+            if origin and origin != "manual":
+                line += f" [{origin}]"
+            print(line)
+            if detail:
+                print(f"    {detail}")
+        if counts:
+            print(
+                f"— 共 {counts.get('total', '?')} 条：进行中 {counts.get('active', '?')}，"
+                f"已结束 {counts.get('terminal', '?')}（清空：cross-copy clear）"
+            )
+
+    elif args.action == "capabilities":
+        data = c.json("GET", "/cross_copy/capabilities")
+        combos = data.get("combinations", []) if isinstance(data, dict) else []
+        if not combos:
+            print("暂无任何网盘支持跨盘复制")
+            return
+        print("支持的复制组合：")
+        for combo in combos:
+            flag = "✅" if combo.get("available") else "❌"
+            print(
+                f"  {flag} {combo.get('source')} → {combo.get('target')}"
+                + ("" if combo.get("available") else f"（{combo.get('reason', '不可用')}）")
+            )
+
+    elif args.action == "create":
+        source = args.source_provider or ""
+        target = args.target_provider or ""
+        source_file_id = args.source_file_id or ""
+        if not source or not target or not source_file_id:
+            sys.exit("create 需要 --source-provider、--target-provider、--source-file-id（文件 ID 用 browse ls 查）")
+        payload = {
+            "source_provider": source,
+            "target_provider": target,
+            "source_file_id": source_file_id,
+        }
+        if args.source_is_dir:
+            payload["source_is_dir"] = True
+        if args.target_dir_id:
+            payload["target_dir_id"] = args.target_dir_id
+        if args.target_savepath:
+            payload["target_savepath"] = args.target_savepath
+        if args.filename:
+            payload["filename"] = args.filename
+        if args.file_size:
+            payload["file_size"] = _require_int(args.file_size, "文件大小")
+        if args.title:
+            payload["title"] = args.title
+        data = c.json("POST", "/cross_copy/jobs", payload)
+        job_id = data.get("job_id") if isinstance(data, dict) else None
+        print(f"✅ 跨盘复制任务已创建: #{job_id}（进度：cross-copy list）")
+
+    elif args.action in ("cancel", "retry", "delete"):
+        if not args.job_id:
+            sys.exit("请指定任务 ID（--job-id）")
+        job_id = _require_int(args.job_id, "任务 ID")
+        data = c.json("POST", f"/cross_copy/jobs/{job_id}/{args.action}", {})
+        verb = {"cancel": "已取消", "retry": "已重试", "delete": "记录已删除"}[args.action]
+        print(f"✅ {verb}: #{job_id}")
+
+    elif args.action == "clear":
+        scope = args.scope or "terminal"
+        data = c.json("POST", "/cross_copy/jobs/clear", {"scope": scope})
+        print(f"✅ 已清空 {scope} 记录: {json.dumps(data, ensure_ascii=False)}")
+        print("（只删任务记录，不删网盘上的文件）")
+
+
 # ── Phase 5: resource ─────────────────────────────────────────────────────
 
 def cmd_resource(args, c: Client):
@@ -2317,6 +2455,26 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_strm = sp.add_parser("strm", help="STRM 管理")
     sp_strm.add_argument("action", choices=["orphans", "cleanup", "dirs"])
 
+    # cross-copy（跨盘复制）
+    sp_xcopy = sp.add_parser("cross-copy", help="跨盘复制任务管理")
+    sp_xcopy.add_argument(
+        "action",
+        choices=["list", "capabilities", "create", "cancel", "retry", "delete", "clear"],
+    )
+    sp_xcopy.add_argument("--job-id", default="", help="任务 ID (cancel/retry/delete)")
+    sp_xcopy.add_argument("--limit", type=int, default=50, help="列表条数 (list)")
+    sp_xcopy.add_argument("--status", default="", help="按状态过滤 (list)")
+    sp_xcopy.add_argument("--scope", default="terminal", choices=["completed", "failed", "terminal"], help="清空范围 (clear，默认 terminal=全部已结束)")
+    sp_xcopy.add_argument("--source-provider", default="", help="源网盘 (create，如 quark/aliyun)")
+    sp_xcopy.add_argument("--target-provider", default="", help="目标网盘 (create，如 115/quark)")
+    sp_xcopy.add_argument("--source-file-id", default="", help="源文件/文件夹 ID (create)")
+    sp_xcopy.add_argument("--source-is-dir", action="store_true", help="源是文件夹 (create)")
+    sp_xcopy.add_argument("--target-savepath", default="", help="目标保存路径 (create)")
+    sp_xcopy.add_argument("--target-dir-id", default="", help="目标文件夹 ID (create，与路径二选一)")
+    sp_xcopy.add_argument("--filename", default="", help="文件名 (create，仅展示用)")
+    sp_xcopy.add_argument("--file-size", default="", help="文件大小字节数 (create，仅展示用)")
+    sp_xcopy.add_argument("--title", default="", help="任务标题 (create)")
+
     # resource
     sp_rsrc = sp.add_parser("resource", help="资源中心管理")
     sp_rsrc.add_argument("action", choices=["import", "preview", "quick-links", "delete"])
@@ -2380,6 +2538,7 @@ def main():
         "scrape": cmd_scrape,
         "watchlist": cmd_watchlist,
         "strm": cmd_strm,
+        "cross-copy": cmd_cross_copy,
         "resource": cmd_resource,
         "health": cmd_health,
         "stats": cmd_stats,

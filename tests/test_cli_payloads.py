@@ -292,5 +292,108 @@ class CliPayloadTest(unittest.TestCase):
         self.assertEqual(c.requests, [])
 
 
+class CliCrossCopyTest(unittest.TestCase):
+    def test_list_uses_query_and_renders_counts(self):
+        c = _RecordingClient(
+            responses={
+                ("GET", "/cross_copy/jobs"): {
+                    "ok": True,
+                    "jobs": [
+                        {
+                            "id": 3, "status": "completed", "source_provider": "quark",
+                            "target_provider": "115", "filename": "示例.mkv", "file_size": 1048576,
+                            "status_detail": "秒传命中", "origin": "manual",
+                            "created_at": 100.0, "updated_at": 112.0,
+                        }
+                    ],
+                    "counts": {"total": 1, "active": 0, "terminal": 1},
+                }
+            }
+        )
+        cli.cmd_cross_copy(_parse(["cross-copy", "list", "--status", "completed"]), c)
+        self.assertIn(("GET", "/cross_copy/jobs", {"limit": 50, "status": "completed"}), c.requests)
+
+    def test_capabilities_renders_combinations(self):
+        c = _RecordingClient(
+            responses={
+                ("GET", "/cross_copy/capabilities"): {
+                    "ok": True,
+                    "combinations": [
+                        {"source": "quark", "target": "115", "available": True},
+                        {"source": "115", "target": "123", "available": False, "reason": "目标不支持写入"},
+                    ],
+                }
+            }
+        )
+        cli.cmd_cross_copy(_parse(["cross-copy", "capabilities"]), c)
+        self.assertIn(("GET", "/cross_copy/capabilities", None), c.requests)
+
+    def test_create_sends_minimal_payload(self):
+        c = _RecordingClient(responses={("POST", "/cross_copy/jobs"): {"ok": True, "job_id": 42}})
+        cli.cmd_cross_copy(
+            _parse(
+                [
+                    "cross-copy", "create",
+                    "--source-provider", "quark", "--target-provider", "115",
+                    "--source-file-id", "abc123", "--filename", "示例.mkv", "--file-size", "1024",
+                ]
+            ),
+            c,
+        )
+        self.assertIn(
+            (
+                "POST",
+                "/cross_copy/jobs",
+                {
+                    "source_provider": "quark",
+                    "target_provider": "115",
+                    "source_file_id": "abc123",
+                    "filename": "示例.mkv",
+                    "file_size": 1024,
+                },
+            ),
+            c.requests,
+        )
+
+    def test_create_requires_core_args(self):
+        c = _RecordingClient()
+        with self.assertRaises(SystemExit):
+            cli.cmd_cross_copy(_parse(["cross-copy", "create", "--source-provider", "quark"]), c)
+        self.assertEqual(c.requests, [])
+
+    def test_folder_create_marks_source_is_dir(self):
+        c = _RecordingClient(responses={("POST", "/cross_copy/jobs"): {"ok": True, "job_id": 43}})
+        cli.cmd_cross_copy(
+            _parse(
+                [
+                    "cross-copy", "create",
+                    "--source-provider", "aliyun", "--target-provider", "115",
+                    "--source-file-id", "dir456", "--source-is-dir",
+                    "--target-savepath", "/影视/ incoming",
+                ]
+            ),
+            c,
+        )
+        _, _, body = c.requests[0]
+        self.assertTrue(body.get("source_is_dir"))
+        self.assertEqual(body.get("target_savepath"), "/影视/ incoming")
+
+    def test_cancel_retry_delete_hit_per_job_endpoints(self):
+        for action in ("cancel", "retry", "delete"):
+            c = _RecordingClient(responses={(f"POST", f"/cross_copy/jobs/9/{action}"): {"ok": True}})
+            cli.cmd_cross_copy(_parse(["cross-copy", action, "--job-id", "9"]), c)
+            self.assertIn(("POST", f"/cross_copy/jobs/9/{action}", {}), c.requests)
+
+    def test_clear_defaults_to_terminal_scope(self):
+        c = _RecordingClient(responses={("POST", "/cross_copy/jobs/clear"): {"ok": True, "deleted": 3}})
+        cli.cmd_cross_copy(_parse(["cross-copy", "clear"]), c)
+        self.assertIn(("POST", "/cross_copy/jobs/clear", {"scope": "terminal"}), c.requests)
+
+    def test_clear_failed_scope(self):
+        c = _RecordingClient(responses={("POST", "/cross_copy/jobs/clear"): {"ok": True, "deleted": 1}})
+        cli.cmd_cross_copy(_parse(["cross-copy", "clear", "--scope", "failed"]), c)
+        self.assertIn(("POST", "/cross_copy/jobs/clear", {"scope": "failed"}), c.requests)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -210,3 +210,20 @@
 
 ### P2 — 可延后
 - 所有 🟢 级别的可选参数补齐
+
+## 补记：cross-copy 命令审计（2026-10-20，0.15.0 新增）
+
+> 本节按当前代码逐字段核对，不受上文 2026-07-09 快照时效声明影响。
+
+| 命令 | API 端点 | CLI 发送的字段 | API 读取的字段 | 问题 |
+|------|----------|---------------|---------------|------|
+| `cross-copy list` | GET /cross_copy/jobs | `limit, status`(query) | `limit, status`(query) | ✅ 无问题 |
+| `cross-copy capabilities` | GET /cross_copy/capabilities | (无) | (无) | ✅ 无问题 |
+| `cross-copy create` | POST /cross_copy/jobs | `source_provider, target_provider, source_file_id, source_is_dir, target_dir_id, target_savepath, filename, file_size, title` | 同名全部读取（`origin` 固定 manual，CLI 不传） | 🟢 缺 `origin_ref`（手动场景用不到） |
+| `cross-copy cancel` | POST /cross_copy/jobs/{id}/cancel | `{}` | (路径参数) | ✅ 无问题 |
+| `cross-copy retry` | POST /cross_copy/jobs/{id}/retry | `{}` | (路径参数) | ✅ 无问题 |
+| `cross-copy delete` | POST /cross_copy/jobs/{id}/delete | `{}` | (路径参数) | ✅ 无问题 |
+| `cross-copy clear` | POST /cross_copy/jobs/clear | `scope` | `scope`（空 body 默认 terminal） | ✅ 无问题 |
+
+注意：create 至少需要 `--source-provider`、`--target-provider`、`--source-file-id` 三个参数；
+源文件 ID 用 `browse ls --provider <盘> --cid <目录>` 查询。
