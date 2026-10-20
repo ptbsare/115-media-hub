@@ -6,6 +6,7 @@
 #   scripts/check.sh tests.test_resource_ed2k         # 追加指定 unittest 用例（可传多个）
 #   scripts/check.sh --changed                        # 只跑与 git 改动相关的测试模块（日常提交前用）
 #   scripts/check.sh --all                            # 跑全量 unittest（发布 / 合并前用）
+#   scripts/check.sh --all --container                # 全量 unittest 放到容器里跑（本机拦删除文件时用这个，零批准）
 #   scripts/check.sh --js static/js/index.js          # 手动指定要 node --check 的 JS（可重复）
 #   scripts/check.sh -h                               # 查看本说明
 #
@@ -29,10 +30,12 @@ test_targets=()
 js_targets=()
 run_all=0
 run_changed=""
+in_container=0
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --all) run_all=1 ;;
+    --container) in_container=1 ;;
     --changed)
       run_changed="HEAD"
       shift
@@ -95,13 +98,25 @@ if [ -n "$run_changed" ]; then
   step "unittest（按改动挑选：${run_changed}）"
   # run_tests.py 会把临时目录挪进仓库并吞掉「清理失败」噪音——本机安全中心
   # 会拦临时文件删除，直接 discover 会刷一堆假失败。
-  "$PYTHON" scripts/run_tests.py --changed "$run_changed" || failed=1
+  if [ "$in_container" = "1" ]; then
+    scripts/test_in_container.sh --changed "$run_changed" || failed=1
+  else
+    "$PYTHON" scripts/run_tests.py --changed "$run_changed" || failed=1
+  fi
 elif [ "$run_all" = "1" ]; then
   step "unittest（全量）"
-  "$PYTHON" scripts/run_tests.py || failed=1
+  if [ "$in_container" = "1" ]; then
+    scripts/test_in_container.sh || failed=1
+  else
+    "$PYTHON" scripts/run_tests.py || failed=1
+  fi
 elif [ "${#test_targets[@]}" -gt 0 ]; then
   step "unittest（${#test_targets[@]} 个用例）"
-  "$PYTHON" scripts/run_tests.py "${test_targets[@]}" || failed=1
+  if [ "$in_container" = "1" ]; then
+    scripts/test_in_container.sh "${test_targets[@]}" || failed=1
+  else
+    "$PYTHON" scripts/run_tests.py "${test_targets[@]}" || failed=1
+  fi
 else
   step "unittest"
   echo "跳过：未指定用例（用 --changed 跑改动相关、--all 跑全量，或直接传 tests.test_xxx）"

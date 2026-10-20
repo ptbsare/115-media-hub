@@ -6,9 +6,15 @@ capture 一启动就要 ``TemporaryFile``，直接起不来（报「No usable te
 directory」）。所以统一用标准库 unittest，并把临时目录指到仓库内的可写位置，
 再把「清理临时目录失败」这类无关噪音吞掉（拦截是环境问题，不是代码问题）。
 
-用法::
+本机拦的是「删除文件」这个系统调用本身，**跟目录归属无关**：项目文件夹也一样删不掉。
+所以「删文件」类用例在本机注定假失败。要一份完全干净的结果，用容器跑::
 
-    python scripts/run_tests.py                  # 全量（80 个模块 / 1600+ 用例，约 2~3 分钟）
+    scripts/test_in_container.sh              # 全量，零批准
+    scripts/test_in_container.sh --changed    # 只跑改动相关
+
+本机跑（快，适合开发中挑单个模块）::
+
+    python scripts/run_tests.py                  # 全量（80+ 个模块 / 1700+ 用例，约 2~3 分钟）
     python scripts/run_tests.py --changed        # 只跑与 git 改动相关的模块（开发时用，秒级~几十秒）
     python scripts/run_tests.py --changed HEAD~1 # 指定对比基线
     python scripts/run_tests.py pan115 cross     # 按关键字挑模块
@@ -271,8 +277,10 @@ def main(argv):
     _harden_tempdir()
     if not _probe_tempdir_writable():
         print(
-            "⚠️  本机安全策略拦了「删除文件」：SQLite 的 journal/wal、临时 .part 文件删不掉，\n"
-            "    本轮会刷出大量与代码无关的失败。请用已批准的执行权限重跑，结果才算数。"
+            "⚠️  本机安全策略拦了「删除文件」（跟目录无关，项目文件夹一样拦）：\n"
+            "    SQLite 的 journal/wal、临时 .part 文件删不掉，删文件类的用例会假失败。\n"
+            "    要一份干净结果，改用容器跑（一次构建、之后零批准）：\n"
+            "        scripts/test_in_container.sh [--changed|模块名...]\n"
         )
 
     loader = unittest.TestLoader()
