@@ -134,7 +134,7 @@
                 >${escapeHtml(option.label)} (${escapeHtml(String(option.count))})</button>
             `).join('');
             const clearMenu = document.getElementById('resource-job-clear-menu');
-            clearMenu?.classList.toggle('hidden', taskCenterTab !== 'resource' && taskCenterTab !== 'scraper');
+            clearMenu?.classList.toggle('hidden', !['resource', 'scraper', 'cross_copy'].includes(taskCenterTab));
             const newCopyBtn = document.getElementById('cross-copy-new-btn');
             newCopyBtn?.classList.toggle('hidden', taskCenterTab !== 'cross_copy');
             renderTaskCenterClearMenu();
@@ -155,14 +155,17 @@
             if (!menu) return;
             const isScraperTab = taskCenterTab === 'scraper';
             const isResourceTab = taskCenterTab === 'resource';
+            const isCrossCopyTab = taskCenterTab === 'cross_copy';
             const open = resourceJobClearMenuOpen;
-            const label = isScraperTab ? '清空刮削' : '清空';
+            // 跨盘复制的三种收口（成功 / 失败 / 已取消+已跳过）语义和另外两块不一样，
+            // 标签跟着改，别让用户以为"清空已回退"也能用在这。
+            const label = isScraperTab ? '清空刮削' : (isCrossCopyTab ? '清空复制' : '清空');
             const completedLabel = '清空已完成';
             const failedLabel = isScraperTab ? '清空异常' : '清空失败';
-            const terminalLabel = isScraperTab ? '清空已回退' : '清空完成+失败';
-            const completedAction = isScraperTab ? 'clearCompletedScraperJobs' : 'clearCompletedResourceJobs';
-            const failedAction = isScraperTab ? 'clearFailedScraperJobs' : 'clearFailedResourceJobs';
-            const terminalAction = isScraperTab ? 'clearRollbackScraperJobs' : 'clearTerminalResourceJobs';
+            const terminalLabel = isScraperTab ? '清空已回退' : (isCrossCopyTab ? '清空已结束' : '清空完成+失败');
+            const completedAction = isScraperTab ? 'clearCompletedScraperJobs' : (isCrossCopyTab ? 'clearCompletedCrossCopyJobs' : 'clearCompletedResourceJobs');
+            const failedAction = isScraperTab ? 'clearFailedScraperJobs' : (isCrossCopyTab ? 'clearFailedCrossCopyJobs' : 'clearFailedResourceJobs');
+            const terminalAction = isScraperTab ? 'clearRollbackScraperJobs' : (isCrossCopyTab ? 'clearTerminalCrossCopyJobs' : 'clearTerminalResourceJobs');
             menu.innerHTML = `
                 <button id="resource-job-clear-toggle" type="button" onclick="toggleResourceJobClearMenu()" class="resource-job-modal-action resource-job-clear-toggle" aria-haspopup="menu" aria-expanded="${open ? 'true' : 'false'}">${escapeHtml(label)}</button>
                 <div id="resource-job-clear-dropdown" class="resource-job-clear-dropdown ${open ? '' : 'hidden'}" role="menu" aria-label="清理任务记录">
@@ -172,7 +175,7 @@
                 </div>
             `;
             syncResourceJobClearMenuState();
-            if (!isResourceTab && !isScraperTab) closeResourceJobClearMenu();
+            if (!isResourceTab && !isScraperTab && !isCrossCopyTab) closeResourceJobClearMenu();
         }
 
         function renderResourceJobFilters(counts) {
@@ -620,17 +623,34 @@
 
         function syncResourceJobClearMenuState() {
             const isScraperTab = taskCenterTab === 'scraper';
-            const jobCounts = isScraperTab ? getScraperJobDisplayCounts(scraperJobState.jobs || []) : getResourceJobCounts(resourceState.jobs || []);
-            const completedCount = Number(isScraperTab ? jobCounts.completed ?? 0 : resourceState?.stats?.completed_job_count ?? jobCounts.completed ?? 0);
-            const failedCount = Number(isScraperTab ? jobCounts.failed ?? 0 : resourceState?.stats?.failed_job_count ?? jobCounts.failed ?? 0);
+            const isCrossCopyTab = taskCenterTab === 'cross_copy';
+            const crossCopyCounts = isCrossCopyTab && typeof window.getCrossCopyJobCounts === 'function'
+                ? window.getCrossCopyJobCounts()
+                : {};
+            const jobCounts = isCrossCopyTab
+                ? crossCopyCounts
+                : (isScraperTab ? getScraperJobDisplayCounts(scraperJobState.jobs || []) : getResourceJobCounts(resourceState.jobs || []));
+            const completedCount = Number(isCrossCopyTab
+                ? (jobCounts.completed ?? 0)
+                : (isScraperTab ? jobCounts.completed ?? 0 : resourceState?.stats?.completed_job_count ?? jobCounts.completed ?? 0));
+            const failedCount = Number(isCrossCopyTab
+                ? (jobCounts.failed ?? 0)
+                : (isScraperTab ? jobCounts.failed ?? 0 : resourceState?.stats?.failed_job_count ?? jobCounts.failed ?? 0));
             const rollbackCount = Number(isScraperTab ? jobCounts.rollback ?? 0 : 0);
-            const terminalCount = completedCount + failedCount + rollbackCount;
+            // 跨盘复制的"已结束"包含 成功 + 失败 + 已取消 + 已跳过，
+            // 服务端 counts.terminal 就是这个口径，别在前端重新加一遍。
+            const terminalCount = isCrossCopyTab
+                ? Number(jobCounts.terminal ?? (completedCount + failedCount
+                    + Number(jobCounts.cancelled || 0) + Number(jobCounts.skipped || 0)))
+                : completedCount + failedCount + rollbackCount;
 
             const toggleBtn = document.getElementById('resource-job-clear-toggle');
             if (toggleBtn) {
                 toggleBtn.textContent = isScraperTab
                     ? (terminalCount > 0 ? `清空刮削（${terminalCount}）` : '清空刮削')
-                    : (terminalCount > 0 ? `清空（${terminalCount}）` : '清空');
+                    : (isCrossCopyTab
+                        ? (terminalCount > 0 ? `清空复制（${terminalCount}）` : '清空复制')
+                        : (terminalCount > 0 ? `清空（${terminalCount}）` : '清空'));
                 toggleBtn.disabled = terminalCount <= 0;
                 toggleBtn.classList.toggle('btn-disabled', terminalCount <= 0);
             }
@@ -654,9 +674,10 @@
             const terminalBtn = document.getElementById('resource-clear-terminal-btn');
             if (terminalBtn) {
                 const terminalButtonCount = isScraperTab ? rollbackCount : terminalCount;
+                const terminalLabel = isScraperTab ? '清空已回退' : (isCrossCopyTab ? '清空已结束' : '清空完成+失败');
                 terminalBtn.textContent = terminalButtonCount > 0
-                    ? (isScraperTab ? `清空已回退（${terminalButtonCount}）` : `清空完成+失败（${terminalButtonCount}）`)
-                    : (isScraperTab ? '清空已回退' : '清空完成+失败');
+                    ? `${terminalLabel}（${terminalButtonCount}）`
+                    : terminalLabel;
                 terminalBtn.disabled = terminalButtonCount <= 0;
                 terminalBtn.classList.toggle('btn-disabled', terminalButtonCount <= 0);
             }
@@ -730,6 +751,31 @@
 
         async function clearRollbackScraperJobs() {
             await clearScraperJobs('rollback');
+        }
+
+        /** 清空跨盘复制的任务记录（只删记录，不删网盘文件、不动在跑的任务）。 */
+        async function clearCrossCopyJobRecords(scope = 'terminal') {
+            closeResourceJobClearMenu();
+            // 实际清空逻辑在 cross_copy/ui.js（那边才知道 counts 与刷新）。
+            // 这里只做任务中心这一层的收尾，不能同名导出，否则会遮住它、自己调自己。
+            if (typeof window.clearCrossCopyJobs !== 'function') return;
+            await window.clearCrossCopyJobs(scope);
+            if (taskCenterTab === 'cross_copy') {
+                renderTaskCenterTypeTabs();
+                renderResourceJobs();
+            }
+        }
+
+        async function clearCompletedCrossCopyJobs() {
+            await clearCrossCopyJobRecords('completed');
+        }
+
+        async function clearFailedCrossCopyJobs() {
+            await clearCrossCopyJobRecords('failed');
+        }
+
+        async function clearTerminalCrossCopyJobs() {
+            await clearCrossCopyJobRecords('terminal');
         }
 
         function applyScraperJobsState(data) {
@@ -847,4 +893,7 @@
             clearCompletedScraperJobs,
             clearFailedScraperJobs,
             clearRollbackScraperJobs,
+            clearCompletedCrossCopyJobs,
+            clearFailedCrossCopyJobs,
+            clearTerminalCrossCopyJobs,
         });

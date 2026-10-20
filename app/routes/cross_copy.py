@@ -5,8 +5,10 @@
 - GET  /cross_copy/jobs           任务列表
 - GET  /cross_copy/jobs/{id}      任务详情
 - POST /cross_copy/jobs           手动创建（复制到目标网盘）
+- POST /cross_copy/jobs/clear     批量清除已结束的任务记录
 - POST /cross_copy/jobs/{id}/cancel   取消
 - POST /cross_copy/jobs/{id}/retry    重试
+- POST /cross_copy/jobs/{id}/delete   删除单条已结束记录
 """
 
 from typing import Any, Dict, List
@@ -95,7 +97,26 @@ async def list_cross_copy_jobs_endpoint(request: Request) -> Dict[str, Any]:
     except (TypeError, ValueError):
         parsed_limit = 50
     jobs = ccj.list_cross_copy_jobs(limit=parsed_limit, status=status)
-    return {"ok": True, "jobs": jobs}
+    # counts 是整表统计：列表只给最近 N 条，而「清空」要清整表，
+    # 两者数字必须能对上，否则用户会看到"还有记录但清不掉"。
+    return {"ok": True, "jobs": jobs, "counts": ccj.get_cross_copy_job_counts()}
+
+
+@router.post("/cross_copy/jobs/clear")
+async def clear_cross_copy_jobs_endpoint(request: Request) -> Dict[str, Any]:
+    """批量清除已结束的任务记录（scope: completed / failed / terminal）。
+
+    只删记录：不删网盘上的文件、不影响正在跑的任务。
+    """
+    try:
+        payload = await request.json()
+    except Exception:  # noqa: BLE001 - 允许空 body，默认清全部已结束
+        payload = {}
+    scope = str((payload or {}).get("scope", "terminal") or "terminal").strip().lower()
+    if scope not in {"completed", "failed", "terminal"}:
+        return JSONResponse(status_code=400, content={"ok": False, "msg": "不支持清理范围"})
+    result = ccj.clear_cross_copy_jobs(scope)
+    return {"ok": True, **result}
 
 
 @router.get("/cross_copy/jobs/{job_id}")
@@ -171,5 +192,13 @@ async def cancel_cross_copy_job_endpoint(request: Request, job_id: int) -> Dict[
 @router.post("/cross_copy/jobs/{job_id}/retry")
 async def retry_cross_copy_job_endpoint(request: Request, job_id: int) -> Dict[str, Any]:
     result = ccj.retry_cross_copy_job(job_id)
+    status_code = 200 if result.get("ok") else 400
+    return JSONResponse(status_code=status_code, content=result)
+
+
+@router.post("/cross_copy/jobs/{job_id}/delete")
+async def delete_cross_copy_job_endpoint(request: Request, job_id: int) -> Dict[str, Any]:
+    """删除单条任务记录（仅已结束的任务；只删记录，不删网盘文件）。"""
+    result = ccj.delete_cross_copy_job(job_id)
     status_code = 200 if result.get("ok") else 400
     return JSONResponse(status_code=status_code, content=result)

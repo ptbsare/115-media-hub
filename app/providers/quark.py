@@ -2029,12 +2029,19 @@ def _quark_upload_pre(
 
 
 def _quark_upload_hash(cookie: str, task_id: str, md5: str, sha1: str) -> bool:
-    """秒传检测：finish=true 表示云端已有同哈希文件。"""
+    """秒传检测：finish=true 表示云端已有同哈希文件。
+
+    **md5 与 sha1 都必须传小写**（真机 2026-10-20 实测）：夸克这个接口在命中
+    云端已有对象时会拿小写 sha1 去比对，传大写直接返回 400
+    ``invalid file [sha1 非法]``；同一请求改成小写立刻 200 且 ``finish=true``。
+    未命中时它不校验大小写，所以大写能"看起来正常"地返回 finish=false，
+    直到哪天云端真的有这个文件才炸——这正是 115 → 夸克 复制失败的根因。
+    """
     headers = _build_quark_headers(cookie, referer="https://pan.quark.cn/")
     url = _build_quark_api_url("/1/clouddrive/file/update/hash")
     response = _request_quark_json_payload(
         url,
-        {"md5": str(md5 or "").strip().lower(), "sha1": str(sha1 or "").strip().upper(), "task_id": str(task_id or "")},
+        {"md5": str(md5 or "").strip().lower(), "sha1": str(sha1 or "").strip().lower(), "task_id": str(task_id or "")},
         headers,
         timeout=45,
         method="POST",

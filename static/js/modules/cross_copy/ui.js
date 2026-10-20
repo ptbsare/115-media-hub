@@ -46,6 +46,9 @@
         submitting: false,
         submitProgress: null,
         summaryNote: '',
+        // 整表计数（服务端给）：列表只回最近 100 条，而「清空」清的是整表，
+        // 菜单角标必须用整表数字，不然会出现"显示还有 N 条却清不掉"。
+        counts: null,
         source: createPane('source'),
         target: createPane('target'),
     };
@@ -128,6 +131,11 @@
             cancelled: list.filter(job => statusOf(job) === 'cancelled').length,
             skipped: list.filter(job => statusOf(job) === 'skipped').length,
         };
+    }
+
+    function fetchJobCounts() {
+        // 服务端数字优先；拿不到就按当前列表估算（只影响角标，不影响能否清空）
+        return state.counts || getJobCounts(state.jobs);
     }
 
     function getActiveCount() {
@@ -260,6 +268,8 @@
         const percent = getProgressPercent(job);
         const canCancel = ['pending', 'running'].includes(status);
         const canRetry = ['failed', 'cancelled', 'skipped'].includes(status) || status === 'partial';
+        // 已结束的任务才允许删记录（在跑的删了会让进度无处可写）
+        const canDelete = !canCancel;
         const source = providerLabel(job?.source_provider);
         const target = providerLabel(job?.target_provider);
         const filename = String(job?.filename || job?.title || `任务 #${jobId}`).trim();
@@ -347,6 +357,7 @@
                     <div class="flex flex-wrap gap-2 min-w-0 flex-1 justify-end">
                         <button type="button" data-cross-copy-action="cancel" data-cross-copy-job-id="${escapeHtml(String(jobId))}" class="px-4 py-2 rounded-xl text-sm font-bold ${canCancel ? 'bg-amber-600 hover:bg-amber-500 text-white' : 'bg-slate-700 text-slate-400 btn-disabled'}" ${canCancel ? '' : 'disabled'}>${canCancel ? '取消' : '不可取消'}</button>
                         <button type="button" data-cross-copy-action="retry" data-cross-copy-job-id="${escapeHtml(String(jobId))}" class="px-4 py-2 rounded-xl text-sm font-bold ${canRetry ? 'bg-emerald-600 hover:bg-emerald-500 text-white' : 'bg-slate-700 text-slate-400 btn-disabled'}" ${canRetry ? '' : 'disabled'}>${canRetry ? '重试' : '不可重试'}</button>
+                        ${canDelete ? `<button type="button" data-cross-copy-action="delete" data-cross-copy-job-id="${escapeHtml(String(jobId))}" class="px-4 py-2 rounded-xl text-sm font-bold bg-slate-700 hover:bg-rose-600 text-slate-100" title="只删除这条任务记录，不删除网盘上的文件">删除记录</button>` : ''}
                     </div>
                 </div>
             </div>
@@ -410,6 +421,7 @@
         try {
             const data = await global.MediaHubApi.getJson('/cross_copy/jobs?limit=100');
             state.jobs = Array.isArray(data?.jobs) ? data.jobs : [];
+            if (data?.counts && typeof data.counts === 'object') state.counts = data.counts;
             state.loaded = true;
         } catch (error) {
             state.error = error?.message || '读取跨盘复制任务失败';
@@ -460,6 +472,70 @@
             if (typeof global.showToast === 'function') {
                 global.showToast(`重试失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
             }
+        }
+    }
+
+    async function deleteJobRecord(jobId) {
+        const ok = await global.showAppConfirm('删除这条任务记录？只删记录，网盘上的文件不受影响。');
+        if (!ok) return;
+        try {
+            await global.MediaHubApi.postJson(`/cross_copy/jobs/${encodeURIComponent(String(jobId))}/delete`, {});
+            if (typeof global.showToast === 'function') {
+                global.showToast('已删除任务记录', { tone: 'success', duration: 2400, placement: 'top-center' });
+            }
+            await fetchJobs({ silent: true });
+        } catch (error) {
+            if (typeof global.showToast === 'function') {
+                global.showToast(`删除失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+            }
+        }
+    }
+
+    const CLEAR_SCOPE_META = {
+        completed: { label: '已完成', emptyText: '当前没有可清空的已完成复制记录' },
+        failed: { label: '失败', emptyText: '当前没有可清空的失败复制记录' },
+        terminal: { label: '已结束', emptyText: '当前没有可清空的已结束复制记录' },
+    };
+
+    function getClearScopeCount(scope) {
+        const counts = fetchJobCounts();
+        if (scope === 'completed') return Number(counts.completed || 0);
+        if (scope === 'failed') return Number(counts.failed || 0);
+        return Number(counts.terminal || 0)
+            || ['completed', 'failed', 'cancelled', 'skipped'].reduce((sum, key) => sum + Number(counts[key] || 0), 0);
+    }
+
+    /** 任务中心「清空」菜单用：按范围批量清除已结束的任务记录。 */
+    async function clearJobs(scope) {
+        const normalized = CLEAR_SCOPE_META[scope] ? scope : 'terminal';
+        const meta = CLEAR_SCOPE_META[normalized];
+        const count = getClearScopeCount(normalized);
+        if (count <= 0) {
+            if (typeof global.showToast === 'function') {
+                global.showToast(meta.emptyText, { tone: 'warn', duration: 2600, placement: 'top-center' });
+            }
+            return 0;
+        }
+        const ok = await global.showAppConfirm(
+            `将清空 ${count} 条${meta.label}的跨盘复制记录。只删除任务记录，网盘上的文件与正在执行的任务不受影响。继续吗？`
+        );
+        if (!ok) return 0;
+        try {
+            const data = await global.MediaHubApi.postJson('/cross_copy/jobs/clear', { scope: normalized });
+            await fetchJobs({ silent: true });
+            const deleted = Number(data?.deleted || 0);
+            if (typeof global.showToast === 'function') {
+                global.showToast(
+                    deleted > 0 ? `已清空 ${deleted} 条${meta.label}记录` : meta.emptyText,
+                    { tone: deleted > 0 ? 'success' : 'info', duration: 2600, placement: 'top-center' }
+                );
+            }
+            return deleted;
+        } catch (error) {
+            if (typeof global.showToast === 'function') {
+                global.showToast(`清空失败：${error?.message || '请稍后重试'}`, { tone: 'error', duration: 3200, placement: 'top-center' });
+            }
+            return 0;
         }
     }
 
@@ -1044,6 +1120,7 @@
             if (!jobId) return;
             if (action === 'cancel') void cancelJob(jobId);
             if (action === 'retry') void retryJob(jobId);
+            if (action === 'delete') void deleteJobRecord(jobId);
             return;
         }
         const entryBtn = event.target.closest('[data-cc-entry]');
@@ -1100,7 +1177,9 @@
         fetchCrossCopyCapabilities: fetchCapabilities,
         renderCrossCopyJobs: renderJobs,
         getCrossCopyActiveCount: getActiveCount,
-        getCrossCopyJobCounts: () => getJobCounts(state.jobs),
+        getCrossCopyJobCounts: () => fetchJobCounts(),
+        clearCrossCopyJobs: clearJobs,
+        getCrossCopyClearScopeCount: getClearScopeCount,
         setCrossCopyFilter: setFilter,
         openCrossCopyModal: openModal,
         closeCrossCopyModal: closeModal,

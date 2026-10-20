@@ -184,7 +184,7 @@ class TestQuarkUploadHappyPath(QuarkUploadTestBase):
         self.assertEqual(result.status, "rapid")
         hash_call = next(c for c in self.api_calls if "/file/update/hash" in c["url"])
         self.assertEqual(hash_call["payload"]["md5"], hashlib.md5(data).hexdigest())
-        self.assertEqual(hash_call["payload"]["sha1"], hashlib.sha1(data).hexdigest().upper())
+        self.assertEqual(hash_call["payload"]["sha1"], hashlib.sha1(data).hexdigest().lower())
         self.assertEqual(result.sha1, hashlib.sha1(data).hexdigest().upper())
 
     def test_sink_sha1_reused(self):
@@ -195,8 +195,27 @@ class TestQuarkUploadHappyPath(QuarkUploadTestBase):
         sink = _MemSink(data, sha1=sink_sha1)
         result = quark.upload_quark_file("cookie-1", sink, "t.bin", "0")
         hash_call = next(c for c in self.api_calls if "/file/update/hash" in c["url"])
-        self.assertEqual(hash_call["payload"]["sha1"], sink_sha1)
+        self.assertEqual(hash_call["payload"]["sha1"], sink_sha1.lower())
         self.assertEqual(result.sha1, sink_sha1)
+
+    def test_hash_payload_always_lowercase(self):
+        """秒传检测的两个哈希必须是小写。
+
+        真机 2026-10-20：夸克 ``/file/update/hash`` 遇到大写 sha1 且云端已有
+        同一文件时返回 400 ``invalid file [sha1 非法]``，改成小写立即 200 并
+        ``finish=true``。这里锁住大小写，避免以后再"顺手 upper 一下"。
+        """
+        self.hash_resp = lambda: _hash_resp(True)
+        data = b"L" * 2048
+        upper_sha1 = hashlib.sha1(data).hexdigest().upper()
+        upper_md5 = hashlib.md5(data).hexdigest().upper()
+        quark.upload_quark_file(
+            "cookie-1", _MemSink(data), "t.bin", "0",
+            md5=upper_md5, sha1=upper_sha1, size=len(data),
+        )
+        hash_call = next(c for c in self.api_calls if "/file/update/hash" in c["url"])
+        self.assertEqual(hash_call["payload"]["sha1"], upper_sha1.lower())
+        self.assertEqual(hash_call["payload"]["md5"], upper_md5.lower())
 
     def test_progress_callback(self):
         """进度回调按分片递增上报。"""

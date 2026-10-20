@@ -53,6 +53,17 @@ STATUS_SKIPPED = "skipped"
 
 ACTIVE_STATUSES = {STATUS_PENDING, STATUS_RUNNING}
 
+# 已结束的状态：这些任务不会再被调度，记录可以删。
+# 注意和 resource_jobs 的「结束」不同——跨盘复制多了「已取消」「已跳过」两种
+# 收口，它们同样是终态，清记录时必须一起收，否则用户会觉得"清不干净"。
+TERMINAL_STATUSES = {STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_SKIPPED}
+
+# 自动清理：每种收口最多留多少条。手动清空才是主入口，这里只防无限增长。
+# 数字偏大是有意的——任务记录占的空间很小，而用户回查"上周那个文件到底复制成功没"
+# 往往要翻很久。
+HISTORY_KEEP_COMPLETED = 500
+HISTORY_KEEP_FAILED = 500
+
 # 全局并发上限：同时执行的跨盘复制任务数。
 # 单个任务内部已经按 Range 分段并发下载，2 个并行基本能跑满带宽；
 # 再多只会互相抢带宽，还会把 115 秒传 / 夸克取链打出 405 与风控。
@@ -215,6 +226,152 @@ def list_cross_copy_jobs(limit: int = 50, status: str = "") -> List[Dict[str, An
         job["result"] = safe_json_loads(job.get("result_json"), {})
         jobs.append(_attach_progress(job))
     return jobs
+
+
+def get_cross_copy_job_counts() -> Dict[str, int]:
+    """按状态统计任务数（任务中心「清空」菜单的角标与可用性都靠它）。
+
+    列表接口只返回最近 N 条，而清空要清的是整表，两个数字对不上用户会以为
+    "明明还有记录却清不掉"，所以计数单独查一次全表。
+    """
+    ensure_db()
+    counts: Dict[str, int] = {
+        STATUS_PENDING: 0,
+        STATUS_RUNNING: 0,
+        STATUS_COMPLETED: 0,
+        STATUS_FAILED: 0,
+        STATUS_CANCELLED: 0,
+        STATUS_SKIPPED: 0,
+    }
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status, COUNT(*) FROM cross_copy_jobs GROUP BY status")
+        rows = cursor.fetchall()
+    total = 0
+    for row in rows:
+        status = _normalize_status(row[0])
+        count = int(row[1] or 0)
+        counts[status] = counts.get(status, 0) + count
+        total += count
+    counts["total"] = total
+    counts["active"] = counts[STATUS_PENDING] + counts[STATUS_RUNNING]
+    counts["terminal"] = sum(counts[status] for status in TERMINAL_STATUSES)
+    return counts
+
+
+def _clear_scope_statuses(scope: str) -> List[str]:
+    """把前端传来的清理范围翻译成状态列表。
+
+    - ``completed`` 只清成功的
+    - ``failed`` 只清失败的
+    - ``terminal``（默认）清所有已结束的：成功 + 失败 + 已取消 + 已跳过
+    """
+    normalized = str(scope or "").strip().lower()
+    if normalized == "completed":
+        return [STATUS_COMPLETED]
+    if normalized == "failed":
+        return [STATUS_FAILED]
+    return [STATUS_COMPLETED, STATUS_FAILED, STATUS_CANCELLED, STATUS_SKIPPED]
+
+
+def clear_cross_copy_jobs(scope: str = "terminal") -> Dict[str, Any]:
+    """批量清除已结束的任务记录（只删记录，不碰网盘文件、不中断在跑的任务）。"""
+    target_statuses = _clear_scope_statuses(scope)
+    ensure_db()
+    placeholders = ",".join(["?"] * len(target_statuses))
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f"SELECT id FROM cross_copy_jobs WHERE status IN ({placeholders})",
+            tuple(target_statuses),
+        )
+        removed_ids = [int(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
+        cursor.execute(
+            f"DELETE FROM cross_copy_jobs WHERE status IN ({placeholders})",
+            tuple(target_statuses),
+        )
+        deleted = int(cursor.rowcount or 0)
+        conn.commit()
+    for job_id in removed_ids:
+        _clear_job_progress(job_id)
+    return {
+        "scope": "completed" if target_statuses == [STATUS_COMPLETED] else (
+            "failed" if target_statuses == [STATUS_FAILED] else "terminal"
+        ),
+        "statuses": target_statuses,
+        "deleted": deleted,
+    }
+
+
+def delete_cross_copy_job(job_id: int) -> Dict[str, Any]:
+    """删除单条任务记录（只允许已结束的任务）。"""
+    job_id = int(job_id)
+    ensure_db()
+    with db_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM cross_copy_jobs WHERE id = ?", (job_id,))
+        row = cursor.fetchone()
+        if not row:
+            return {"ok": False, "msg": "任务不存在"}
+        status = _normalize_status(row[0])
+        if status not in TERMINAL_STATUSES:
+            return {"ok": False, "msg": "任务还在进行中，请先取消再删除记录"}
+        cursor.execute(
+            "DELETE FROM cross_copy_jobs WHERE id = ? AND status = ?",
+            (job_id, status),
+        )
+        deleted = int(cursor.rowcount or 0)
+        conn.commit()
+    if deleted:
+        _clear_job_progress(job_id)
+    return {"ok": bool(deleted), "job_id": job_id, "deleted": deleted, "msg": "已删除" if deleted else "任务状态已变化，请刷新后重试"}
+
+
+def prune_cross_copy_job_history(
+    completed_keep: int = HISTORY_KEEP_COMPLETED,
+    failed_keep: int = HISTORY_KEEP_FAILED,
+) -> Dict[str, int]:
+    """自动清理老记录：每组只保留最近 N 条（手动清空之外的最后一道闸）。
+
+    分组口径和「清空」菜单一致：成功一组，失败 + 已取消 + 已跳过一组。
+    跑在启动与定时任务里，删除量通常是 0，失败也只记日志不影响主流程。
+    """
+    completed_keep = max(50, min(10000, int(completed_keep or HISTORY_KEEP_COMPLETED)))
+    failed_keep = max(50, min(10000, int(failed_keep or HISTORY_KEEP_FAILED)))
+    groups = {
+        "completed": ([STATUS_COMPLETED], completed_keep),
+        "failed": ([STATUS_FAILED, STATUS_CANCELLED, STATUS_SKIPPED], failed_keep),
+    }
+    ensure_db()
+    deleted: Dict[str, int] = {}
+    try:
+        with db_connection() as conn:
+            cursor = conn.cursor()
+            for label, (statuses, keep) in groups.items():
+                placeholders = ",".join(["?"] * len(statuses))
+                cursor.execute(
+                    f"""
+                    DELETE FROM cross_copy_jobs
+                    WHERE status IN ({placeholders})
+                      AND id NOT IN (
+                        SELECT id FROM cross_copy_jobs
+                        WHERE status IN ({placeholders})
+                        ORDER BY id DESC
+                        LIMIT ?
+                      )
+                    """,
+                    tuple(statuses) + tuple(statuses) + (keep,),
+                )
+                deleted[label] = int(cursor.rowcount or 0)
+            conn.commit()
+    except Exception as exc:  # noqa: BLE001 - 清理失败不影响任务执行
+        logger.warning("cross-copy job history prune skipped: %s", exc)
+        return {"completed": 0, "failed": 0, "deleted": 0}
+    return {
+        "completed": deleted.get("completed", 0),
+        "failed": deleted.get("failed", 0),
+        "deleted": sum(deleted.values()),
+    }
 
 
 def update_cross_copy_job(job_id: int, **fields: Any) -> None:
@@ -864,11 +1021,12 @@ TEMP_CLEANUP_INTERVAL_SECONDS = 30 * 60
 
 
 async def cross_copy_temp_cleanup_watcher() -> None:
-    """定时清理半截临时文件（容器长期运行、没有重启机会时的兜底）。"""
+    """定时清理半截临时文件 + 兜底裁剪任务记录（容器长期运行、没有重启机会时）。"""
     await asyncio.sleep(60)
     while True:
         try:
             await asyncio.to_thread(cleanup_temp_files_on_startup)
+            await asyncio.to_thread(prune_cross_copy_job_history)
         except Exception as exc:  # noqa: BLE001 - 定时任务不能把循环打死
             logger.warning("跨盘复制临时文件定期清理失败：%s", exc)
         await asyncio.sleep(TEMP_CLEANUP_INTERVAL_SECONDS)

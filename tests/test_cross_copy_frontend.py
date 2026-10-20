@@ -57,9 +57,26 @@ class CrossCopyFrontendTest(unittest.TestCase):
         self.assertIn("'/cross_copy/jobs?limit=100'", ui)
         self.assertIn("`/cross_copy/jobs/${encodeURIComponent(String(jobId))}/cancel`", ui)
         self.assertIn("`/cross_copy/jobs/${encodeURIComponent(String(jobId))}/retry`", ui)
+        self.assertIn("`/cross_copy/jobs/${encodeURIComponent(String(jobId))}/delete`", ui)
+        self.assertIn("'/cross_copy/jobs/clear'", ui)
         self.assertIn("`/resource/browse/${encodeURIComponent(provider)}/folders?", ui)
         self.assertIn("source_file_id: item.id", ui)
         self.assertIn("target_dir_id: targetDirId", ui)
+
+    def test_records_can_be_cleared_like_other_tasks(self):
+        """任务中心跨盘复制页签也要有「清空」，并且只清已结束的记录。"""
+        job_modal = JOB_MODAL_JS.read_text(encoding="utf-8")
+        ui = UI_JS.read_text(encoding="utf-8")
+        self.assertIn("isCrossCopyTab", job_modal)
+        self.assertIn("['resource', 'scraper', 'cross_copy'].includes(taskCenterTab)", job_modal)
+        self.assertIn("clearCompletedCrossCopyJobs", job_modal)
+        self.assertIn("clearTerminalCrossCopyJobs", job_modal)
+        self.assertIn("清空复制", job_modal)
+        self.assertIn("清空已结束", job_modal)
+        # 单条记录删除按钮只给已结束的任务
+        self.assertIn('data-cross-copy-action="delete"', ui)
+        self.assertIn("const canDelete = !canCancel", ui)
+        self.assertIn("只删记录，网盘上的文件不受影响", ui)
 
     def test_status_texts_are_plain_language(self):
         ui = UI_JS.read_text(encoding="utf-8")

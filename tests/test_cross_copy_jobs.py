@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import json
 import os
 import shutil
 import tempfile
@@ -955,6 +956,158 @@ class TestNon115TargetDetail(CrossCopyJobsTestBase):
         detail = ccj.get_cross_copy_job(job_id)["status_detail"]
         self.assertIn("非 115", detail)
         self.assertIn("3 个文件已复制", detail)
+
+
+class TestJobRecordCleanup(CrossCopyJobsTestBase):
+    """任务记录管理：和导入/刮削任务一样，成功的、失败的都能清掉。
+
+    规矩只有一条——**只删记录**：网盘上的文件不动，正在跑的任务也不动。
+    """
+
+    def _make(self, status, **overrides):
+        job_id = self._create_job(**overrides)
+        ccj.update_cross_copy_job(job_id, status=status, finished_at="2026-10-20T10:00:00")
+        return job_id
+
+    def test_counts_group_by_status(self):
+        self._make("completed")
+        self._make("failed")
+        self._make("cancelled")
+        self._make("skipped")
+        active_id = self._create_job(source_file_id="f-active")
+        counts = ccj.get_cross_copy_job_counts()
+        self.assertEqual(counts["completed"], 1)
+        self.assertEqual(counts["failed"], 1)
+        self.assertEqual(counts["cancelled"], 1)
+        self.assertEqual(counts["skipped"], 1)
+        self.assertEqual(counts["pending"], 1)
+        self.assertEqual(counts["total"], 5)
+        self.assertEqual(counts["active"], 1)
+        # 「已结束」= 成功 + 失败 + 已取消 + 已跳过
+        self.assertEqual(counts["terminal"], 4)
+        self.assertTrue(active_id > 0)
+
+    def test_clear_completed_only(self):
+        completed_id = self._make("completed")
+        failed_id = self._make("failed")
+        cancelled_id = self._make("cancelled")
+        result = ccj.clear_cross_copy_jobs("completed")
+        self.assertEqual(result["deleted"], 1)
+        self.assertEqual(result["scope"], "completed")
+        self.assertIsNone(ccj.get_cross_copy_job(completed_id))
+        self.assertIsNotNone(ccj.get_cross_copy_job(failed_id))
+        self.assertIsNotNone(ccj.get_cross_copy_job(cancelled_id))
+
+    def test_clear_failed_only(self):
+        self._make("completed")
+        failed_id = self._make("failed")
+        result = ccj.clear_cross_copy_jobs("failed")
+        self.assertEqual(result["deleted"], 1)
+        self.assertIsNone(ccj.get_cross_copy_job(failed_id))
+        self.assertEqual(ccj.get_cross_copy_job_counts()["completed"], 1)
+
+    def test_clear_terminal_includes_cancelled_and_skipped(self):
+        """「清空已结束」必须把取消/跳过也收走，否则用户会觉得清不干净。"""
+        for status in ("completed", "failed", "cancelled", "skipped"):
+            self._make(status)
+        running_id = self._create_job(source_file_id="f-running")
+        ccj.update_cross_copy_job(running_id, status="running")
+        result = ccj.clear_cross_copy_jobs("terminal")
+        self.assertEqual(result["deleted"], 4)
+        counts = ccj.get_cross_copy_job_counts()
+        self.assertEqual(counts["total"], 1)
+        self.assertEqual(counts["running"], 1)
+
+    def test_clear_never_touches_active_jobs(self):
+        pending_id = self._create_job(source_file_id="f-pending")
+        ccj.clear_cross_copy_jobs("terminal")
+        self.assertIsNotNone(ccj.get_cross_copy_job(pending_id))
+
+    def test_delete_single_terminal_record(self):
+        job_id = self._make("failed")
+        result = ccj.delete_cross_copy_job(job_id)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 1)
+        self.assertIsNone(ccj.get_cross_copy_job(job_id))
+
+    def test_delete_rejects_active_job(self):
+        job_id = self._create_job(source_file_id="f-active-2")
+        result = ccj.delete_cross_copy_job(job_id)
+        self.assertFalse(result["ok"])
+        self.assertIn("进行中", result["msg"])
+        self.assertIsNotNone(ccj.get_cross_copy_job(job_id))
+
+    def test_delete_missing_job(self):
+        result = ccj.delete_cross_copy_job(999999)
+        self.assertFalse(result["ok"])
+        self.assertIn("不存在", result["msg"])
+
+    def test_prune_keeps_recent_records(self):
+        for index in range(5):
+            self._make("completed", source_file_id=f"f-c-{index}")
+        for index in range(3):
+            self._make("failed", source_file_id=f"f-x-{index}")
+        ccj.prune_cross_copy_job_history(completed_keep=50, failed_keep=50)
+        # keep 有下限 50，5 条不会被裁
+        self.assertEqual(ccj.get_cross_copy_job_counts()["total"], 8)
+
+    def test_prune_removes_overflow(self):
+        for index in range(60):
+            self._make("completed", source_file_id=f"f-overflow-{index}")
+        result = ccj.prune_cross_copy_job_history(completed_keep=50, failed_keep=50)
+        self.assertEqual(result["completed"], 10)
+        self.assertEqual(ccj.get_cross_copy_job_counts()["completed"], 50)
+
+    def test_clear_route(self):
+        self._make("completed")
+        self._make("failed")
+        result = asyncio.run(
+            cross_copy_routes.clear_cross_copy_jobs_endpoint(FakeJsonRequest({"scope": "terminal"}))
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 2)
+        self.assertEqual(ccj.get_cross_copy_job_counts()["total"], 0)
+
+    def test_clear_route_rejects_unknown_scope(self):
+        result = asyncio.run(
+            cross_copy_routes.clear_cross_copy_jobs_endpoint(FakeJsonRequest({"scope": "everything"}))
+        )
+        self.assertEqual(result.status_code, 400)
+
+    def test_clear_route_without_body_defaults_to_terminal(self):
+        self._make("cancelled")
+        result = asyncio.run(cross_copy_routes.clear_cross_copy_jobs_endpoint(FakeJsonRequest({})))
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["deleted"], 1)
+
+    def test_delete_route(self):
+        job_id = self._make("completed")
+        result = asyncio.run(
+            cross_copy_routes.delete_cross_copy_job_endpoint(FakeJsonRequest({}), job_id)
+        )
+        # 路由统一用 JSONResponse 回包（和 cancel / retry 一致），body 里才是结果
+        self.assertEqual(result.status_code, 200)
+        self.assertTrue(json.loads(result.body)["ok"])
+        self.assertIsNone(ccj.get_cross_copy_job(job_id))
+
+    def test_delete_route_rejects_running(self):
+        job_id = self._create_job(source_file_id="f-running-route")
+        ccj.update_cross_copy_job(job_id, status="running")
+        result = asyncio.run(
+            cross_copy_routes.delete_cross_copy_job_endpoint(FakeJsonRequest({}), job_id)
+        )
+        self.assertEqual(result.status_code, 400)
+
+    def test_list_endpoint_returns_table_wide_counts(self):
+        """列表只回最近 N 条，但 counts 必须是整表数字，否则「清空」按钮的角标会骗人。"""
+        self._make("completed")
+        self._make("failed")
+        result = asyncio.run(
+            cross_copy_routes.list_cross_copy_jobs_endpoint(FakeQueryRequest({"limit": "1"}))
+        )
+        self.assertEqual(len(result["jobs"]), 1)
+        self.assertEqual(result["counts"]["total"], 2)
+        self.assertEqual(result["counts"]["terminal"], 2)
 
 
 if __name__ == "__main__":

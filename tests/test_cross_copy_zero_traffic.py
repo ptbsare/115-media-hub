@@ -176,6 +176,28 @@ class ZeroTrafficTestBase(unittest.TestCase):
         return xcc.copy_file_across_clouds(**kwargs)
 
 
+class _TargetThatNeedsMd5(_Target):
+    """目标端必须先拿到 md5（夸克秒传探测就是这么要求的）。
+
+    源端只给 sha1，provider 只能读 sink 算 md5 —— 这一读就会把惰性 sink
+    拉下来，下载真实发生了，虽然上传仍然是零流量。
+    """
+
+    def upload_file(self, cookie, sink, filename, target_dir_id="0", *, sha1="", md5="", size=-1, **kwargs):
+        sink.seek(0)
+        import hashlib
+
+        hasher = hashlib.md5()
+        while True:
+            chunk = sink.read(256 * 1024)
+            if not chunk:
+                break
+            hasher.update(chunk)
+        sink.seek(0)
+        self.calls.append({"md5": hasher.hexdigest(), "downloaded": getattr(sink, "downloaded", None)})
+        return UploadResult(status="rapid", name=filename, size=size, sha1=sha1, message="秒传命中")
+
+
 class TestZeroTrafficEngine(ZeroTrafficTestBase):
     def test_known_hash_makes_no_download_request(self):
         source = _Source(
@@ -197,6 +219,22 @@ class TestZeroTrafficEngine(ZeroTrafficTestBase):
         self.assertEqual(call["filename"], "movie.mkv")
         self.assertEqual(call["sink_size"], len(DATA))  # size 属性不触发下载
         self.assertFalse(call["downloaded"])  # 惰性 sink 从未落地
+
+    def test_rapid_after_md5_forced_download_does_not_claim_zero_download(self):
+        """目标端要 md5 时必须下载一遍，文案不能说"未产生下载流量"。
+
+        真机 2026-10-20：115 → 夸克 的 2.6GB 文件走了 267 秒下载（只为算 md5），
+        然后在夸克命中秒传。上传确实零流量，下载并不为零，文案要如实说。
+        """
+        source = _Source(
+            name="115", file_hash={"sha1": SHA1.lower(), "size": len(DATA), "name": "movie.mkv"}
+        )
+        result = self._copy(source=source, target=_TargetThatNeedsMd5(name="quark"))
+
+        self.assertEqual(result.status, "rapid")
+        self.assertNotIn("未产生下载流量", result.message)
+        self.assertIn("未消耗上传流量", result.message)
+        self.assertTrue(self.get_calls)  # 下载真的发生了
 
     def test_explicit_source_hash_skips_provider_probe(self):
         source = _Source(name="aliyun", file_hash=RuntimeError("不该被调用"))

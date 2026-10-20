@@ -27,6 +27,7 @@ from .services.cross_copy_jobs import (
     requeue_cross_copy_jobs_on_startup,
     cleanup_temp_files_on_startup,
     cross_copy_temp_cleanup_watcher,
+    prune_cross_copy_job_history,
 )
 from .services.monitor_runs import (
     cleanup_runs,
@@ -133,6 +134,11 @@ async def startup() -> None:
         cleanup_temp_files_on_startup()
     except Exception:
         logging.exception("Failed to clean cross-copy temp files on startup")
+    try:
+        # 任务记录兜底裁剪：手动清空之外的第二道闸，防止表无限增长
+        prune_cross_copy_job_history()
+    except Exception:
+        logging.exception("Failed to prune cross-copy job history on startup")
     os.makedirs(LOG_DIR, exist_ok=True)
     restore_runtime_logs_from_files()
 

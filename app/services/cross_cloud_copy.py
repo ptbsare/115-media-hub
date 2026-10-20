@@ -1087,17 +1087,25 @@ def copy_file_across_clouds(
 
             status = str(getattr(upload_result, "status", "") or "uploaded")
             message = str(getattr(upload_result, "message", "") or "")
+            # 「零流量」只在下游真的没读数据时成立。夸克做目标时秒传探测必须带 md5，
+            # 而 115 / 阿里只给 sha1 —— 惰性 sink 会被迫下载一遍算 md5，此时上传确实
+            # 零流量，但下载已经发生了，不能对用户说"未产生下载流量"。
+            lazy_downloaded = bool(attempt_lazy is not None and attempt_lazy.downloaded)
             if use_zero_traffic and status == "rapid":
-                message = "秒传命中，未产生下载流量"
+                if lazy_downloaded:
+                    message = "秒传命中，未消耗上传流量（源端只有 SHA1，为算 MD5 下载了一遍）"
+                else:
+                    message = "秒传命中，未产生下载流量"
                 logger.info(
-                    "cross-cloud zero-traffic hit: %s->%s file_id=%s size=%s sha1=%s",
+                    "cross-cloud zero-traffic hit: %s->%s file_id=%s size=%s sha1=%s downloaded=%s",
                     source_name,
                     target_name,
                     source_file_id,
                     attempt_total,
                     attempt_sha1[:12],
+                    lazy_downloaded,
                 )
-            elif use_zero_traffic and attempt_lazy is not None and attempt_lazy.downloaded:
+            elif use_zero_traffic and lazy_downloaded:
                 logger.info(
                     "cross-cloud zero-traffic missed rapid, downloaded on demand: file_id=%s size=%s",
                     source_file_id,

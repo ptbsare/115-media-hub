@@ -106,7 +106,7 @@
 | `app/routes/tmdb.py` | TMDB 搜索 / 详情 / 类型 / 排行榜 / discover 接口 |
 | `app/routes/strm.py` | 播放代理（`/strm/proxy`、`/strm/relay`）与孤儿刮削元数据清理 |
 | `app/routes/events.py` | SSE 状态推送 `/events` 与 `/status-summary` |
-| `app/routes/cross_copy.py` | 跨盘复制：源×目标能力矩阵、任务增查、取消 / 重试 |
+| `app/routes/cross_copy.py` | 跨盘复制：源×目标能力矩阵、任务增查、取消 / 重试、清除记录（批量 + 单条） |
 
 ### 服务（业务逻辑层）`app/services/`
 
@@ -135,7 +135,7 @@
 | `app/services/cross_cloud_copy_folder.py` | 整文件夹跨盘复制：BFS 递归建清单（上限 2000 文件 / 20 层，超限拒绝）、目标端逐级建目录、字节加权进度、单文件失败继续并汇总 partial |
 | `app/services/media_hash_cache.py` | 文件哈希备忘录（media_hash_cache）：按 (provider, file_id) 沉淀已确认的 SHA1，查缓存校验 size、30 天过期，供跨盘复制复用零流量秒传；缓存故障不影响复制主流程 |
 | `app/services/local_storage.py` | 本地存储位置管理：位置列表归一化/去重、目录可用性探测、暂存目录解析、磁盘空间预检 |
-| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知 |
+| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知 / 记录清除与自动裁剪 |
 | `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |
 
 ### 网盘与外部 provider `app/providers/`
