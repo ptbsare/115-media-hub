@@ -96,10 +96,10 @@ class CrossCopyJobsTestBase(unittest.TestCase):
             ccj._running.clear()
 
         self.cfg = {
-            "cross_copy_notify": True,
+            "cross_copy_notify_subscription": True,
+            "cross_copy_notify_manual": True,
             "cross_copy_delete_source_after": True,
             "provider_enabled": {"quark": True, "115": True, "aliyun": True},
-            "local_storages": [],
         }
         self.source_provider = FakeProvider("quark", "夸克网盘")
         self.target_provider = FakeProvider("115", "115网盘")
@@ -108,6 +108,7 @@ class CrossCopyJobsTestBase(unittest.TestCase):
             patch.object(ccj, "get_config", return_value=self.cfg),
             patch.object(ccj, "_get_provider_or_none", side_effect=self._fake_get_provider),
             patch.object(ccj, "_send_notify_content", MagicMock()),
+            patch.object(ccj, "notify_channel_ready", return_value=True),
             patch.object(
                 ccj,
                 "build_notify_runtime_config",
@@ -307,12 +308,75 @@ class TestJobExecution(CrossCopyJobsTestBase):
             self._run(job_id)
         self.assertEqual(self.source_provider.delete_calls, [])
 
-    def test_notify_disabled(self):
-        self.cfg["cross_copy_notify"] = False
+    def test_notify_disabled_for_manual_origin(self):
+        """手动复制开关关掉后，手动任务不再推送（默认 origin=manual）。"""
+        self.cfg["cross_copy_notify_manual"] = False
         job_id = self._create_job()
         with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
             self._run(job_id)
         ccj._send_notify_content.assert_not_called()
+
+    def test_notify_disabled_for_subscription_origin(self):
+        """订阅补源开关关掉后，订阅任务不再推送。"""
+        self.cfg["cross_copy_notify_subscription"] = False
+        job_id = self._create_job(origin="subscription")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        ccj._send_notify_content.assert_not_called()
+
+    def test_notify_switches_are_per_origin(self):
+        """两个开关互不影响：关一个不影响另一个来源的任务。"""
+        self.cfg["cross_copy_notify_subscription"] = False
+        self.cfg["cross_copy_notify_manual"] = True
+        sub_job = self._create_job(origin="subscription", title="订阅来的")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(sub_job)
+        ccj._send_notify_content.assert_not_called()
+
+        ccj._send_notify_content.reset_mock()
+        manual_job = self._create_job(origin="manual", title="手动来的")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(manual_job)
+        ccj._send_notify_content.assert_called_once()
+
+    def test_notify_skipped_when_channel_not_ready(self):
+        """开关都开着但通知渠道没配好（如 webhook 未填）时静默跳过。"""
+        with patch.object(ccj, "notify_channel_ready", return_value=False):
+            job_id = self._create_job()
+            with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+                self._run(job_id)
+        ccj._send_notify_content.assert_not_called()
+
+    def test_notify_independent_of_other_scene_switches(self):
+        """跨盘复制通知不依赖订阅成功推送开关（历史 bug：曾被 notify_push_enabled 挡掉）。"""
+        self.cfg["notify_push_enabled"] = False
+        job_id = self._create_job()
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        ccj._send_notify_content.assert_called_once()
+
+    def test_failure_notify_respects_origin_switch(self):
+        """失败通知同样按来源开关控制。"""
+        self.cfg["cross_copy_notify_manual"] = False
+        job_id = self._create_job()
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=xcc.CrossCloudCopyError("失败")):
+            self._run(job_id)
+        ccj._send_notify_content.assert_not_called()
+
+    def test_notify_content_marks_trigger_origin(self):
+        """通知文案标明触发方式，用户能看出是订阅补源还是手动复制。"""
+        sub_job = self._create_job(origin="subscription")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(sub_job)
+        content = ccj._send_notify_content.call_args[0][1]
+        self.assertIn("触发：订阅补源", content)
+
+        ccj._send_notify_content.reset_mock()
+        manual_job = self._create_job(origin="manual")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(manual_job)
+        content = ccj._send_notify_content.call_args[0][1]
+        self.assertIn("触发：手动复制", content)
 
     def test_missing_cookie_fails(self):
         self.target_provider._cookie = ""
@@ -1108,6 +1172,247 @@ class TestJobRecordCleanup(CrossCopyJobsTestBase):
         self.assertEqual(len(result["jobs"]), 1)
         self.assertEqual(result["counts"]["total"], 2)
         self.assertEqual(result["counts"]["terminal"], 2)
+
+
+class TestResumeTaskLayer(CrossCopyJobsTestBase):
+    """任务层断点续传（F2）：引擎契约参数、终态清/留、删记录联动删临时文件。
+
+    引擎 copy_file_across_clouds 由并行实施的另一方负责，这里一律 monkeypatch
+    记录 kwargs；build_resume_state 也 patch 掉，隔离源端哈希复探。
+    """
+
+    def _resume_state(self, temp_path=None):
+        path = temp_path or os.path.join(self.tmp, "xcopy-resume.part")
+        # 落一个真实文件：可继承性判断要求 temp_path 在磁盘上存在
+        with open(path, "wb") as fh:
+            fh.write(b"x" * 512)
+        return {
+            "temp_path": path,
+            "size": 1024,
+            "sha1": "",
+            "md5": "",
+            "downloaded_bytes": 512,
+            "upload": {},
+        }
+
+    def test_single_file_job_passes_resume_to_engine(self):
+        job_id = self._create_job()
+        state = self._resume_state()
+        captured = {}
+
+        def fake_engine(**kwargs):
+            captured.update(kwargs)
+            return _uploaded_result()
+
+        with patch.object(ccj, "build_resume_state", return_value=state), \
+             patch.object(xcc, "copy_file_across_clouds", side_effect=fake_engine):
+            self._run(job_id)
+        self.assertIs(captured.get("resume"), state)
+        self.assertTrue(callable(captured.get("on_resume_update")))
+
+    def test_no_resume_state_passes_skeleton(self):
+        """没有可继承断点时也传空骨架 + 落库回调（bootstrap 续传链）。"""
+        job_id = self._create_job()
+        captured = {}
+
+        def fake_engine(**kwargs):
+            captured.update(kwargs)
+            return _uploaded_result()
+
+        with patch.object(ccj, "build_resume_state", return_value=None), \
+             patch.object(xcc, "copy_file_across_clouds", side_effect=fake_engine):
+            self._run(job_id)
+        resume = captured.get("resume")
+        self.assertIsInstance(resume, dict)
+        self.assertEqual(resume.get("temp_path"), "")
+        self.assertTrue(callable(captured.get("on_resume_update")))
+
+    def test_success_clears_resume_state(self):
+        job_id = self._create_job()
+        ccj.update_cross_copy_job(job_id, resume=self._resume_state())
+        with patch.object(ccj, "build_resume_state", return_value=self._resume_state()), \
+             patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        job = ccj.get_cross_copy_job(job_id)
+        self.assertEqual(job["status"], "completed")
+        self.assertEqual(job["resume"], {})
+
+    def test_cancel_keeps_resume_state_with_hint(self):
+        job_id = self._create_job()
+        ccj.update_cross_copy_job(job_id, resume=self._resume_state())
+
+        def cancelled_engine(**kwargs):
+            raise xcc.CrossCloudCopyCancelled("已取消")
+
+        with patch.object(ccj, "build_resume_state", return_value=self._resume_state()), \
+             patch.object(xcc, "copy_file_across_clouds", side_effect=cancelled_engine):
+            self._run(job_id)
+        job = ccj.get_cross_copy_job(job_id)
+        self.assertEqual(job["status"], "cancelled")
+        # 断点被保留（终态保底落库），文案告诉用户可以重试续传
+        self.assertEqual(job["resume"]["downloaded_bytes"], 512)
+        self.assertIn("已保留断点，重试可续传", job["status_detail"])
+
+    def test_failure_keeps_resume_state(self):
+        job_id = self._create_job()
+        ccj.update_cross_copy_job(job_id, resume=self._resume_state())
+        with patch.object(ccj, "build_resume_state", return_value=self._resume_state()), \
+             patch.object(
+                 xcc, "copy_file_across_clouds", side_effect=xcc.CrossCloudCopyError("网络错误")
+             ):
+            self._run(job_id)
+        job = ccj.get_cross_copy_job(job_id)
+        self.assertEqual(job["status"], "failed")
+        self.assertEqual(job["resume"]["downloaded_bytes"], 512)
+
+    def test_folder_job_passes_no_resume(self):
+        """文件夹任务不继承断点：check_existing 跳过已完成文件，进行中的重下。"""
+        from app.services import cross_cloud_copy_folder as xccf
+        from types import SimpleNamespace
+
+        job_id = self._create_job(source_is_dir=True, filename="剧集文件夹")
+        captured = {}
+
+        def fake_folder(**kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(
+                status="completed",
+                folder_name="剧集文件夹",
+                total_bytes=10,
+                message="ok",
+                to_dict=lambda: {"status": "completed"},
+            )
+
+        with patch.object(xccf, "copy_folder_across_clouds", side_effect=fake_folder):
+            self._run(job_id)
+        self.assertNotIn("resume", captured)
+        self.assertNotIn("on_resume_update", captured)
+
+    def test_delete_job_removes_resume_temp_file(self):
+        temp_path = os.path.join(self.tmp, "xcopy-del.part")
+        with open(temp_path, "wb") as fh:
+            fh.write(b"x")
+        job_id = self._create_job()
+        ccj.update_cross_copy_job(job_id, resume=self._resume_state(temp_path))
+        ccj.update_cross_copy_job(job_id, status="failed", finished_at=ccj.now_text())
+        with patch("os.remove") as m_remove:
+            result = ccj.delete_cross_copy_job(job_id)
+        self.assertTrue(result["ok"])
+        m_remove.assert_called_once_with(temp_path)
+
+    def test_clear_jobs_removes_resume_temp_files(self):
+        paths = []
+        for index in range(2):
+            temp_path = os.path.join(self.tmp, f"xcopy-clear-{index}.part")
+            with open(temp_path, "wb") as fh:
+                fh.write(b"x")
+            paths.append(temp_path)
+            job_id = self._create_job(title=f"J{index}")
+            ccj.update_cross_copy_job(job_id, resume=self._resume_state(temp_path))
+            ccj.update_cross_copy_job(job_id, status="failed", finished_at=ccj.now_text())
+        with patch("os.remove") as m_remove:
+            result = ccj.clear_cross_copy_jobs("failed")
+        self.assertEqual(result["deleted"], 2)
+        removed = [call.args[0] for call in m_remove.call_args_list]
+        self.assertEqual(sorted(removed), sorted(paths))
+
+
+class TestCrossCopyNotifyConfig(unittest.TestCase):
+    """core 的配置归一化：跨盘复制通知按任务来源分两个开关，旧字段一次性迁移。"""
+
+    def _normalize(self, cfg):
+        from app import core
+
+        merged = dict(cfg)
+        core._normalize_cross_copy_notify_config(merged)
+        return merged
+
+    def test_defaults_on(self):
+        """新安装默认两个开关都开（与旧版 cross_copy_notify 默认行为一致）。"""
+        merged = self._normalize({})
+        self.assertIs(merged["cross_copy_notify_subscription"], True)
+        self.assertIs(merged["cross_copy_notify_manual"], True)
+
+    def test_legacy_true_migrates_to_both(self):
+        merged = self._normalize({"cross_copy_notify": True})
+        self.assertIs(merged["cross_copy_notify_subscription"], True)
+        self.assertIs(merged["cross_copy_notify_manual"], True)
+        self.assertNotIn("cross_copy_notify", merged)
+
+    def test_legacy_false_migrates_to_both(self):
+        merged = self._normalize({"cross_copy_notify": False})
+        self.assertIs(merged["cross_copy_notify_subscription"], False)
+        self.assertIs(merged["cross_copy_notify_manual"], False)
+        self.assertNotIn("cross_copy_notify", merged)
+
+    def test_explicit_values_win_over_legacy(self):
+        """新旧字段同时存在时以新字段为准，旧字段只补缺省的那一个。"""
+        merged = self._normalize({
+            "cross_copy_notify": False,
+            "cross_copy_notify_subscription": True,
+        })
+        self.assertIs(merged["cross_copy_notify_subscription"], True)
+        self.assertIs(merged["cross_copy_notify_manual"], False)
+
+    def test_string_values_coerced(self):
+        merged = self._normalize({
+            "cross_copy_notify_subscription": "true",
+            "cross_copy_notify_manual": "off",
+        })
+        self.assertIs(merged["cross_copy_notify_subscription"], True)
+        self.assertIs(merged["cross_copy_notify_manual"], False)
+
+
+class TestNotifyChannelReady(unittest.TestCase):
+    """notify_channel_ready：只看渠道配置，与场景开关无关。"""
+
+    def test_webhook_configured(self):
+        from app.services.notify import notify_channel_ready
+
+        self.assertTrue(notify_channel_ready({
+            "notify_channel": "wecom_bot",
+            "notify_wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc",
+        }))
+
+    def test_webhook_missing(self):
+        from app.services.notify import notify_channel_ready
+
+        self.assertFalse(notify_channel_ready({"notify_channel": "wecom_bot", "notify_wecom_webhook": ""}))
+
+    def test_wecom_app_complete(self):
+        from app.services.notify import notify_channel_ready
+
+        self.assertTrue(notify_channel_ready({
+            "notify_channel": "wecom_app",
+            "notify_wecom_app_corp_id": "ww123",
+            "notify_wecom_app_agent_id": "1000002",
+            "notify_wecom_app_secret": "secret",
+            "notify_wecom_app_touser": "zhangsan",
+        }))
+
+    def test_wecom_app_missing_secret(self):
+        from app.services.notify import notify_channel_ready
+
+        self.assertFalse(notify_channel_ready({
+            "notify_channel": "wecom_app",
+            "notify_wecom_app_corp_id": "ww123",
+            "notify_wecom_app_agent_id": "1000002",
+            "notify_wecom_app_secret": "",
+            "notify_wecom_app_touser": "zhangsan",
+        }))
+
+    def test_ignores_scene_switches(self):
+        """场景开关全关也不影响渠道就绪判断（开关在各自场景里检查）。"""
+        from app.services.notify import notify_channel_ready
+
+        self.assertTrue(notify_channel_ready({
+            "notify_push_enabled": False,
+            "notify_monitor_enabled": False,
+            "cross_copy_notify_subscription": False,
+            "cross_copy_notify_manual": False,
+            "notify_channel": "wecom_bot",
+            "notify_wecom_webhook": "https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=abc",
+        }))
 
 
 if __name__ == "__main__":

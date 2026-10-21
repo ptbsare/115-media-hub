@@ -276,24 +276,22 @@ def resume_upload(self, cookie, session) -> Dict: ...   # 可选，断点续传
 - 订阅场景的任务层去重：订阅每轮扫描可能反复命中同一候选，需在订阅侧记录"该候选已发起补源"（task × candidate 维度），避免每轮重复创建复制任务；复制任务内的幂等检查兜底（详见 §4.7 执行链路第 6 步）。
 - 复制前空间预检：临时目录所在卷剩余空间 < 待复制文件大小 → 任务直接失败并提示（避免下到一半磁盘满）。
 
-**存储位置管理（`local_storages`，2026-10-18 新增）**
+**存储位置管理（2026-10-18 新增位置列表；2026-10-21 简化为单暂存目录）**
 
-容器通常跑在固态上，而跨盘复制的暂存文件是大块顺序写，落机械硬盘更合理（SSD 磨损 + 容量）。但 Docker 容器外的任何主机路径都必须 bind mount 进来才能用——没有捷径。为此提供一层「存储位置」抽象，用户不用手改路径字符串：
+容器通常跑在固态上，而跨盘复制的暂存文件是大块顺序写，落机械硬盘更合理（SSD 磨损 + 容量）。但 Docker 容器外的任何主机路径都必须 bind mount 进来才能用——没有捷径。为此提供一层「暂存目录」抽象，用户不用手改路径字符串：
 
-- 设置页维护位置列表：`[{id, label, path}]`，默认一条 `{id: "config", label: "默认（config 卷）", path: "/app/config"}`；
-- 添加/编辑位置时校验：路径存在、可写（`os.access(W_OK)`）、`shutil.disk_usage` 可读；任一不满足给出明确错误，不允许保存；
-- `cross_copy_temp_dir` 的 UI 从"填路径"改为"选位置 + 填子目录"（如位置 `storage` + 子目录 `cross_copy_tmp`），存储时合成完整路径；保留高级模式可直接填任意路径；
-- 设置页与任务中心展示各位置剩余空间（`shutil.disk_usage`）；复制任务详情显示本次使用的存储位置；
+- 2026-10-18 初版：设置页维护位置列表 `[{id, label, path}]` + 「选位置 + 填子目录」，默认一条 config 卷位置；添加/编辑时校验路径存在、可写、`shutil.disk_usage` 可读，任一不满足不允许保存。
+- **2026-10-21 简化（现行模型）**：一个配置项 `cross_copy_temp_dir`（容器内绝对路径），空 = 默认 `/app/config/cross_copy_tmp`（config 卷是 compose 默认挂载的，不映射大盘也能工作）。设置页只回答「当前暂存目录是哪个、状态如何、要换就填容器内路径」，保存前同样校验存在/可写/剩余空间。旧配置 `local_storages` + `cross_copy_temp_storage` + `cross_copy_temp_subdir` 在读取时一次性迁移（`local_storage.resolve_temp_dir`），保存新值后由 `core._normalize_cross_copy_temp_dir_config` 清除；接口相应从 `/storage/locations/*` 六个端点收敛为 `GET/POST /storage/temp-dir`。
 - 位置被卸载/硬盘弹出时：任务失败并明确报错（不静默无限重试），孤儿清理兜底。
 
-> 适用范围说明：项目其他本地写入都很小——STRM 是几 KB 的文本文件、日志、SQLite、图片代理缓存（默认 32MB 上限），唯一的大块本地磁盘消耗就是跨盘复制暂存。因此「存储位置」首先服务 `cross_copy_temp_dir`；接口按通用设计，未来的本地缓存/离线下载保存位置可直接复用同一套位置管理。
+> 适用范围说明：项目其他本地写入都很小——STRM 是几 KB 的文本文件、日志、SQLite、图片代理缓存（默认 32MB 上限），唯一的大块本地磁盘消耗就是跨盘复制暂存。因此「暂存目录」只服务 `cross_copy_temp_dir`；将来若出现第二类大块本地写入（离线下载保存位置等），再评估是否恢复多位置模型。
 
 ### 4.6 任务接入（2026-10-18 已落地：独立表 `cross_copy_jobs`）
 
 实现时放弃"复用 `resource_jobs`"，改为独立任务表——原因：`resource_jobs` 与 magnet/share 导入语义强耦合（`resource_id NOT NULL`、`run_resource_job` 按 link_type 分发），跨盘复制任务没有 resource 项，复用会污染资源导入链路。项目本身存在多任务表模式（`scraper_jobs` / `tree_export_jobs` / `monitor_runs`），跨盘复制遵循同一模式：
 
 - 表 `cross_copy_jobs`（`app/db.py`）：标题、源/目标 provider、`source_file_id`、`source_share_url`（save_first 去重键）、`source_mode`（direct / save_first）、目标目录/路径、文件名/大小、状态机（pending → running → completed / failed / cancelled / skipped）、进度（percent + phase + status_detail）、`origin`（manual / subscription）+ `origin_ref`（订阅任务名）、重试计数；
-- service `app/services/cross_copy_jobs.py`：创建 / 查询 / 取消（内存取消集合 + DB 双保险）/ 重试（整任务重来）/ 启动恢复（`requeue_cross_copy_jobs_on_startup`，重启残留任务重新入队）/ 进度上报 / 完成与失败通知（`cross_copy_notify` 开关控制）；
+- service `app/services/cross_copy_jobs.py`：创建 / 查询 / 取消（内存取消集合 + DB 双保险）/ 重试（整任务重来）/ 启动恢复（`requeue_cross_copy_jobs_on_startup`，重启残留任务重新入队）/ 进度上报 / 完成与失败通知（2026-10-21 起按任务来源选开关：`cross_copy_notify_subscription` / `cross_copy_notify_manual`，替代原单字段 `cross_copy_notify`）；
 - 路由 `app/routes/cross_copy.py`：`GET /cross_copy/capabilities`（源×目标矩阵，UI 置灰依据）、任务列表/详情、`POST /cross_copy/jobs`（手动入口）、`/cancel`、`/retry`；
 - 前端任务中心页面接入（网盘浏览"复制到 <目标网盘>"按钮）随 UI 迭代补齐，API 已就绪。
 
@@ -341,16 +339,18 @@ def resume_upload(self, cookie, session) -> Dict: ...   # 可选，断点续传
 |---|---|---|
 | `cross_copy_enabled` | `true` | 总开关 |
 | `cross_copy_max_concurrent` | `1` | 同时进行的复制任务数 |
-| `cross_copy_temp_storage` | `""` | 暂存所在存储位置 id（空 = 默认位置；与 `cross_copy_temp_subdir` 合成完整路径，见 §4.5/§4.10） |
-| `cross_copy_temp_subdir` | `cross_copy_tmp` | 暂存子目录（位置内的相对路径） |
-| `local_storages` | `[{"id":"st-xxx","label":"默认（config 卷）","path":"/app/config"}]` | 存储位置列表（`app/services/local_storage.py`）；添加/编辑时校验路径存在且可写；id 由路径派生（同路径同 id，天然去重） |
+| `cross_copy_temp_dir` | `""` | 暂存目录（容器内绝对路径；空 = 默认 `/app/config/cross_copy_tmp`）。**2026-10-21 起为现行字段**，取代下方的 `cross_copy_temp_storage` / `cross_copy_temp_subdir` / `local_storages` 三字段（旧配置读取时自动迁移，保存新值后清除，见 §4.5） |
+| `cross_copy_temp_storage` | — | 【已废弃 2026-10-21】旧暂存位置 id，迁移后清除 |
+| `cross_copy_temp_subdir` | — | 【已废弃 2026-10-21】旧暂存子目录，迁移后清除 |
+| `local_storages` | — | 【已废弃 2026-10-21】旧位置列表，迁移后清除 |
 | `cross_copy_memory_threshold_mb` | `64` | 小于该值走内存缓冲，不落盘 |
 | `cross_copy_source_mode` | `save_first` | 取数方式：`save_first`（先转存源网盘再下载，推荐）\| `share_direct`（分享直下，小文件可用）。全局默认；手动入口可按次选择，订阅任务可按任务覆盖 |
 | `cross_copy_delete_source_after` | `true` | 复制成功后删除源网盘中转目录里的临时文件（节省空间；仅删本项目转存产生的文件，见 §4.7 安全边界） |
 | `cross_copy_part_size_mb` | `10` | OSS 分片大小（按目标规范取值：115=10MB、夸克=4MB（服务端 part_size）；**阿里实测 10MB/片**，此配置对阿里不生效） |
 | `cross_copy_verify_sha1` | `true` | 完成后 SHA1 校验 |
 | `cross_copy_orphan_cleanup_hours` | `24` | 孤儿临时文件清理阈值 |
-| `cross_copy_notify` | `true` | 手动复制任务完成/失败是否推送通知（订阅补源的成功/失败通知不受此开关影响，见 §4.11-G） |
+| `cross_copy_notify_subscription` | `true` | 订阅补源（`origin=subscription`）任务完成/失败是否推送通知（2026-10-21 修订：原单字段 `cross_copy_notify` 拆成按来源的两个开关，旧值一次性迁移到两个新字段；开关位于设置页「通知推送」分区） |
+| `cross_copy_notify_manual` | `true` | 手动复制任务完成/失败是否推送通知（同上，按来源区分） |
 
 ### 4.10 部署说明（compose 挂载）
 
@@ -374,9 +374,9 @@ services:
     restart: always
 ```
 
-设置页 → 存储位置 → 添加 `{label: "机械硬盘", path: "/app/storage"}` → 跨盘复制设置里临时目录选该位置 + 子目录 `cross_copy_tmp`。label 是给人看的（“机械硬盘”“NAS 仓库”随意写），容器内路径保持中立——挂的到底是什么盘由 label 表达，不与路径耦合。
+设置页 → 本地存储位置 → 暂存目录填 `/app/storage/cross_copy_tmp`（容器内路径，保存前会检查存在/可写/剩余空间）。不映射、不配置也能用：暂存默认落在 config 卷的 `/app/config/cross_copy_tmp`。
 
-- 有多块额外磁盘就挂多个（`/app/storage`、`/app/storage2`……），在设置页分别添加位置，复制时按需选；
+- 2026-10-21 起为单目录模型：一块盘一个容器内路径，要换盘就改这一个字段（旧版「多位置 + 选位置」已下线，见 §4.5）；
 - macOS Docker Desktop 首次访问外部卷会弹权限授权，需允许；
 - NAS（NFS/SMB）同理：先在主机挂好，再 bind 进容器；
 - 硬盘卸载/弹出时位置校验失败，任务明确报错，不会写坏盘。
@@ -438,7 +438,9 @@ services:
 - 接入现有 `push_subscription_success_notification` / `push_monitor_success_notification` 同款通道（企业微信机器人/应用），新增跨盘复制事件：
   - 订阅自动补源**成功**：随订阅成功通知一并发送（含"跨盘补源：夸克 → 115，N 个文件"）；
   - **失败必须通知**：标题含任务名 + 错误摘要 + 建议动作；
-  - 手动复制任务：完成/失败按通知设置推送（开关 `cross_copy_notify`，默认开）；
+  - 手动复制任务：完成/失败按通知设置推送（开关 `cross_copy_notify_manual`，默认开）；
+  - 订阅补源任务：完成/失败用独立开关 `cross_copy_notify_subscription`（2026-10-21 修订：原设计引用的 §4.11-G「随订阅成功通知一并发送」未落地，实际按来源独立开关，均在设置页「通知推送」分区维护）；
+  - 2026-10-21 修正：渠道就绪检查（webhook / 应用凭证）与场景开关解耦，跨盘复制通知不再被 `notify_push_enabled`（订阅成功开关）误挡；
 - 去重复用现有 dedupe 表思路，避免同一任务重复轰炸。
 
 **H. 用户文档与帮助**
@@ -535,7 +537,7 @@ services:
   - 存储位置管理 `app/services/local_storage.py`：位置列表（label + 容器内路径，id 由路径派生天然去重）+ 目录探测（存在/可写/剩余空间）+ 暂存目录解析（选位置 + 填子目录）+ 空间预检；设置路由 `/storage/locations`（增改删/probe）；
   - 任务接入：独立表 `cross_copy_jobs` + service（状态机/取消/重试/启动恢复/进度/通知）+ 路由 `/cross_copy/*`（capabilities/jobs/cancel/retry）——放弃复用 resource_jobs 的理由见 §4.6；
   - 订阅补源 `app/services/subscription_cross_copy.py`：save_first（分享 → 夸克中转目录 `云下载/跨盘中转/<任务名>` → fid → 注册任务）+ task × share_url 去重 + 单轮上限 3 + 异步收尾 + 删源安全边界；
-  - 界面提示：错误人话映射（provider 层）、任务状态机文案、通知接线（`cross_copy_notify` 开关）。
+  - 界面提示：错误人话映射（provider 层）、任务状态机文案、通知接线（按 origin 区分的两个通知开关：订阅补源 / 手动复制）。
   - **已补齐**：README「跨盘复制（跨网盘补源）」章节；设置页「参数配置 → 本地存储位置」（增删改、启停、空间探测、暂存位置与子目录选择，`data-settings-section="storage"`）。
 - **P0-C（体验收敛，2026-10-20）✅ 已落地**：
   - 新建复制弹窗支持多选（勾选 / 全选本页 / 清空，串行建任务，失败保留弹窗只重试失败项）；

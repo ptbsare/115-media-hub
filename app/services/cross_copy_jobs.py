@@ -6,7 +6,8 @@
 生命周期：pending → running → completed / failed / cancelled / skipped
 - 排队：全局同时只跑 MAX_CONCURRENT_JOBS 个任务，其余 pending 排 FIFO 队列
 - 取消：内存取消集合 + DB 状态双保险；取消后不自动重试（显式 retry 才重来）
-- 重试：整任务重来（断点续传由各 provider 自行处理，当前三家均为 False）
+- 重试：整任务重来；失败/取消/服务重启后保留本地断点（暂存数据 + 115 上传
+  会话，见 cross_copy_resume），重试与 requeue 走同一入口自动继承
 - 启动恢复：把残留的 running/pending 任务重新入队（防重启丢任务）
 """
 
@@ -24,9 +25,18 @@ from ..providers.registry import get_or_none as _get_provider_or_none
 from ..providers.registry import label_for as _provider_label
 from . import cross_cloud_copy as xcc
 from . import cross_cloud_copy_folder as xccf
+from .cross_copy_resume import (
+    build_resume_state,
+    clear_resume_state,
+    new_resume_skeleton,
+    prune_resume_for_missing_files,
+    resume_state_for_db,
+    resume_state_is_inheritable,
+)
 from .notify import (
     _send_notify_content,
     build_notify_runtime_config,
+    notify_channel_ready,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,6 +53,15 @@ _job_detail: Dict[int, str] = {}
 # 进度写库节流：内存每块都更新，DB 最多 ~1 秒一次（2.6GB 会有数千次回调）
 _PROGRESS_DB_MIN_INTERVAL = 0.8
 _last_db_progress: Dict[int, float] = {}
+
+# 断点续传状态写库节流：引擎每完成一段下载 / 一个上传分片就地更新 resume 并
+# 触发 on_resume_update，DB 最多 ~1 秒一次（与进度节流同思路）；终态由失败 /
+# 取消分支无条件保底写一次（_persist_final_resume）。
+_RESUME_DB_MIN_INTERVAL = 1.0
+_last_resume_persist: Dict[int, float] = {}
+
+# 失败/取消且本次保留了断点时追加的文案（设计文档 §3.2）
+_RESUME_KEPT_SUFFIX = "（已保留断点，重试可续传）"
 
 STATUS_PENDING = "pending"
 STATUS_RUNNING = "running"
@@ -191,6 +210,16 @@ def _attach_progress(job: Dict[str, Any]) -> Dict[str, Any]:
     return job
 
 
+def _decode_resume_json(raw: Any) -> Dict[str, Any]:
+    """把 resume_json 列解析成断点续传状态字典。
+
+    损坏 / 非对象 JSON（老库默认 '{}'、手改坏的值）一律按「无断点」处理，
+    宁可重传也不能拿着错状态续传。
+    """
+    value = safe_json_loads(raw, {})
+    return value if isinstance(value, dict) else {}
+
+
 def get_cross_copy_job(job_id: int) -> Optional[Dict[str, Any]]:
     ensure_db()
     with db_connection() as conn:
@@ -201,6 +230,7 @@ def get_cross_copy_job(job_id: int) -> Optional[Dict[str, Any]]:
         return None
     job = sqlite_row_to_dict(row)
     job["result"] = safe_json_loads(job.get("result_json"), {})
+    job["resume"] = _decode_resume_json(job.get("resume_json"))
     return _attach_progress(job)
 
 
@@ -224,6 +254,7 @@ def list_cross_copy_jobs(limit: int = 50, status: str = "") -> List[Dict[str, An
     for row in rows:
         job = sqlite_row_to_dict(row)
         job["result"] = safe_json_loads(job.get("result_json"), {})
+        job["resume"] = _decode_resume_json(job.get("resume_json"))
         jobs.append(_attach_progress(job))
     return jobs
 
@@ -282,10 +313,11 @@ def clear_cross_copy_jobs(scope: str = "terminal") -> Dict[str, Any]:
     with db_connection() as conn:
         cursor = conn.cursor()
         cursor.execute(
-            f"SELECT id FROM cross_copy_jobs WHERE status IN ({placeholders})",
+            f"SELECT id, resume_json FROM cross_copy_jobs WHERE status IN ({placeholders})",
             tuple(target_statuses),
         )
-        removed_ids = [int(row[0]) for row in cursor.fetchall() if row and row[0] is not None]
+        removed = cursor.fetchall()
+        removed_ids = [int(row[0]) for row in removed if row and row[0] is not None]
         cursor.execute(
             f"DELETE FROM cross_copy_jobs WHERE status IN ({placeholders})",
             tuple(target_statuses),
@@ -294,6 +326,9 @@ def clear_cross_copy_jobs(scope: str = "terminal") -> Dict[str, Any]:
         conn.commit()
     for job_id in removed_ids:
         _clear_job_progress(job_id)
+    # 断点临时文件没人再认领，顺手删掉（失败仅日志，不阻塞清记录）
+    for row in removed:
+        _remove_resume_temp_file(row[1] if len(row) > 1 else "")
     return {
         "scope": "completed" if target_statuses == [STATUS_COMPLETED] else (
             "failed" if target_statuses == [STATUS_FAILED] else "terminal"
@@ -303,13 +338,30 @@ def clear_cross_copy_jobs(scope: str = "terminal") -> Dict[str, Any]:
     }
 
 
+def _remove_resume_temp_file(raw_resume: Any) -> None:
+    """尽力删掉断点状态里的本地临时文件（删任务记录时联动；失败仅日志）。
+
+    红线不变：只删自己暂存的 xcopy-*.part，绝不碰任何网盘文件。
+    """
+    state = _decode_resume_json(raw_resume)
+    temp_path = str(state.get("temp_path") or "").strip()
+    if not temp_path:
+        return
+    try:
+        os.remove(temp_path)
+    except OSError as exc:
+        logger.info("cross-copy resume temp file removal skipped: %s (%s)", temp_path, exc)
+
+
 def delete_cross_copy_job(job_id: int) -> Dict[str, Any]:
     """删除单条任务记录（只允许已结束的任务）。"""
     job_id = int(job_id)
     ensure_db()
     with db_connection() as conn:
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM cross_copy_jobs WHERE id = ?", (job_id,))
+        cursor.execute(
+            "SELECT status, resume_json FROM cross_copy_jobs WHERE id = ?", (job_id,)
+        )
         row = cursor.fetchone()
         if not row:
             return {"ok": False, "msg": "任务不存在"}
@@ -324,6 +376,8 @@ def delete_cross_copy_job(job_id: int) -> Dict[str, Any]:
         conn.commit()
     if deleted:
         _clear_job_progress(job_id)
+        # 断点临时文件没人再认领，顺手删掉（失败仅日志，不阻塞删记录）
+        _remove_resume_temp_file(row[1] if len(row) > 1 else "")
     return {"ok": bool(deleted), "job_id": job_id, "deleted": deleted, "msg": "已删除" if deleted else "任务状态已变化，请刷新后重试"}
 
 
@@ -381,6 +435,15 @@ def update_cross_copy_job(job_id: int, **fields: Any) -> None:
     payload = dict(fields)
     if "result" in payload and isinstance(payload["result"], dict):
         payload["result_json"] = safe_json_dumps(payload.pop("result"))
+    if "resume" in payload:
+        # 断点续传状态：调用方传 dict，落库 json；非 dict（None 等）按「清空断点」处理。
+        # 先过 resume_state_for_db：引擎挂进上传会话的 on_part_done 是闭包，
+        # 不过滤会让 json.dumps 抛 TypeError 被本函数上层的 try/except 吞掉，
+        # 断点状态静默停在旧值（重启后续传全丢）。
+        resume_value = payload.pop("resume")
+        payload["resume_json"] = safe_json_dumps(
+            resume_state_for_db(resume_value) if isinstance(resume_value, dict) else {}
+        )
     if "status" in payload:
         payload["status"] = _normalize_status(payload["status"])
     payload["updated_at"] = now_text()
@@ -410,7 +473,11 @@ def cancel_cross_copy_job(job_id: int) -> Dict[str, Any]:
     return {"ok": True, "msg": "已请求取消"}
 
 
-def _finalize_cancelled(job_id: int, detail: str) -> None:
+def _finalize_cancelled(job_id: int, detail: str, resume_state: Optional[Dict[str, Any]] = None) -> None:
+    if resume_state_is_inheritable(resume_state):
+        # 本次运行确有断点被保留：保底落库 + 文案告诉用户可以重试续传
+        _persist_final_resume(job_id, resume_state)
+        detail = f"{detail}{_RESUME_KEPT_SUFFIX}"
     update_cross_copy_job(
         job_id,
         status=STATUS_CANCELLED,
@@ -519,7 +586,49 @@ def _clear_job_progress(job_id: int) -> None:
     with _progress_lock:
         _job_progress.pop(int(job_id), None)
         _last_db_progress.pop(int(job_id), None)
+        _last_resume_persist.pop(int(job_id), None)
         _job_detail.pop(int(job_id), None)
+
+
+def _make_resume_persister(job_id: int, state: Dict[str, Any]):
+    """构造 on_resume_update 回调：把引擎就地更新的断点状态节流落库。
+
+    引擎传回的 snapshot 与闭包持有的 state 是同一个对象（就地更新契约），
+    优先用传入的快照。写库失败只记日志——后续回调还会把最新状态带过来。
+    """
+    job_id = int(job_id)
+
+    def _persist(snapshot: Any = None) -> None:
+        current = snapshot if isinstance(snapshot, dict) else state
+        if not isinstance(current, dict) or not current:
+            return
+        now = time.monotonic()
+        with _progress_lock:
+            # 「从未写过」必须用 None 哨兵，不能图省事用 0：monotonic 时钟
+            # 在刚启动的环境里可能小于节流阈值（实测 0.8s < 1.0s），用 0
+            # 会把首次写库误吞——断点状态迟迟不落库，重启后续传全丢。
+            last_persist = _last_resume_persist.get(job_id)
+            if last_persist is not None and now - last_persist < _RESUME_DB_MIN_INTERVAL:
+                return
+            _last_resume_persist[job_id] = now
+        try:
+            update_cross_copy_job(job_id, resume=current)
+        except Exception as exc:  # noqa: BLE001 - 落库失败不影响复制主流程
+            logger.info("cross-copy resume persist skipped (job=%s): %s", job_id, exc)
+
+    return _persist
+
+
+def _persist_final_resume(job_id: int, resume_state: Optional[Dict[str, Any]]) -> None:
+    """终态保底：把已知的最新断点状态无条件写库（on_resume_update 是节流的）。"""
+    if not isinstance(resume_state, dict) or not resume_state:
+        return
+    try:
+        update_cross_copy_job(job_id, resume=resume_state)
+    except Exception as exc:  # noqa: BLE001 - 保底写失败只记日志
+        # warning 级别：这是失败/取消路径上最后一次写库机会，吞了就意味着
+        # 本次的断点白留了，用户侧不该毫无痕迹
+        logger.warning("cross-copy final resume persist skipped (job=%s): %s", job_id, exc)
 
 
 def format_transfer_size(value: Any) -> str:
@@ -652,6 +761,8 @@ def _is_cancel_requested(job_id: int) -> bool:
 async def run_cross_copy_job(job_id: int) -> None:
     """执行单个跨盘复制任务（进度/取消/通知/状态收口）。"""
     job_id = int(job_id)
+    # 断点续传状态（单文件分支赋值）：失败/取消的 except 要靠它决定是否保底落库
+    resume_state: Optional[Dict[str, Any]] = None
     with _running_lock:
         if job_id in _running:
             return
@@ -700,7 +811,9 @@ async def run_cross_copy_job(job_id: int) -> None:
                 job["target_path"] = early_target_path
                 update_cross_copy_job(job_id, target_path=early_target_path)
 
-        # 源是文件夹：整个文件夹一个任务，内部逐个文件复制
+        # 源是文件夹：整个文件夹一个任务，内部逐个文件复制。
+        # 文件夹分支显式不传 resume：check_existing 已跳过目标端已存在的文件，
+        # 进行中的那个文件重新下载，不做 per-file 断点（设计文档 §5.3）。
         if _job_source_is_dir(job):
             folder_result = await asyncio.to_thread(
                 xccf.copy_folder_across_clouds,
@@ -721,6 +834,15 @@ async def run_cross_copy_job(job_id: int) -> None:
             _finish_folder_job(job_id, job, cfg, folder_result)
             return
 
+        # 断点续传：先尝试继承上次失败/取消/服务重启留下的本地已下载数据与
+        # 115 上传会话（校验在 build_resume_state：临时文件还在、前缀完整、
+        # 源端哈希没变）。没有可继承断点时也必须传一个空骨架——否则本次运行
+        # 失败时留下的临时文件没有任何状态指向它，重试接不上，续传链永远
+        # 走不到第二步。骨架由引擎边下边填，任务层落库。
+        resume_state = await asyncio.to_thread(build_resume_state, job, cfg)
+        if resume_state is None:
+            resume_state = new_resume_skeleton(job)
+        resume_persister = _make_resume_persister(job_id, resume_state)
         result = await asyncio.to_thread(
             xcc.copy_file_across_clouds,
             source_provider=source_provider,
@@ -736,6 +858,8 @@ async def run_cross_copy_job(job_id: int) -> None:
             cancel_check=lambda: _is_cancel_requested(job_id),
             check_existing=True,
             cfg=cfg,
+            resume=resume_state,
+            on_resume_update=resume_persister,
         )
         result_status = str(getattr(result, "status", "") or "uploaded")
 
@@ -758,6 +882,8 @@ async def run_cross_copy_job(job_id: int) -> None:
         final_status = STATUS_COMPLETED
         if result_status == "skipped":
             final_status = STATUS_SKIPPED
+        # 终态干净：临时文件引擎已在成功路径删掉，断点状态一并清掉
+        clear_resume_state(job_id)
         final_name = str(getattr(result, "name", "") or "").strip() or str(job.get("filename", "") or "").strip()
         final_target_path = _join_pan_path(job.get("target_savepath"), final_name) or str(
             job.get("target_path", "") or ""
@@ -782,12 +908,12 @@ async def run_cross_copy_job(job_id: int) -> None:
         _clear_job_progress(job_id)
         _push_cross_copy_notification(cfg, job, ok=True, message=str(getattr(result, "message", "") or ""))
     except xcc.CrossCloudCopyCancelled:
-        _finalize_cancelled(job_id, "已取消")
+        _finalize_cancelled(job_id, "已取消", resume_state=resume_state)
     except xcc.CrossCloudCopyError as exc:
-        _fail_job(job_id, str(exc))
+        _fail_job(job_id, str(exc), resume_state=resume_state)
     except Exception as exc:  # noqa: BLE001 - 兜底：任何异常都不能杀死任务循环
         logger.exception("cross-copy job %s crashed", job_id)
-        _fail_job(job_id, f"复制失败：{exc}")
+        _fail_job(job_id, f"复制失败：{exc}", resume_state=resume_state)
     finally:
         with _cancel_lock:
             _cancel_requested.discard(job_id)
@@ -911,11 +1037,17 @@ def _delete_source_file(source_provider, source_cookie: str, source_file_id: str
     source_provider.delete_entries(source_cookie, [fid])
 
 
-def _fail_job(job_id: int, message: str) -> None:
+def _fail_job(job_id: int, message: str, resume_state: Optional[Dict[str, Any]] = None) -> None:
+    detail = message[:200]
+    if resume_state_is_inheritable(resume_state):
+        # 失败也保底落一次最新断点：on_resume_update 是节流的，最后一次可能没写。
+        # 文案与取消分支一致——用户看到「已保留断点」才知道重试能续传
+        _persist_final_resume(job_id, resume_state)
+        detail = f"{detail}{_RESUME_KEPT_SUFFIX}"
     update_cross_copy_job(
         job_id,
         status=STATUS_FAILED,
-        status_detail=message[:200],
+        status_detail=detail,
         error_message=message[:2000],
         finished_at=now_text(),
     )
@@ -928,23 +1060,39 @@ def _fail_job(job_id: int, message: str) -> None:
         logger.info("cross-copy failure notify skipped (job=%s)", job_id)
 
 
+def _cross_copy_notify_enabled(cfg: Dict[str, Any], job: Dict[str, Any]) -> bool:
+    """按任务来源取对应的通知开关。
+
+    订阅补源（origin=subscription，自动发起）与手动复制（其余）是两条
+    独立开关，在设置页「通知推送」分区维护；来源未知时按手动处理。
+    """
+    origin = str(job.get("origin", "") or "").strip().lower()
+    key = "cross_copy_notify_subscription" if origin == "subscription" else "cross_copy_notify_manual"
+    return bool(cfg.get(key, True))
+
+
 def _push_cross_copy_notification(cfg: Dict[str, Any], job: Dict[str, Any], *, ok: bool, message: str) -> None:
-    """跨盘复制完成/失败通知（受 cross_copy_notify 开关控制）。"""
-    if not bool(cfg.get("cross_copy_notify", True)):
+    """跨盘复制完成/失败通知。
+
+    开关按任务来源区分（订阅补源 / 手动复制），渠道是否可用只看通知渠道
+    配置，不依赖其他场景的开关。
+    """
+    if not _cross_copy_notify_enabled(cfg, job):
         return
-    runtime_cfg = build_notify_runtime_config(cfg)
-    if not bool(runtime_cfg.get("enabled", False)):
+    if not notify_channel_ready(cfg):
         return
     # 通知里要给人看的网盘名，不能直接拼内部代号（否则会显示 tianyi 这种英文）
     source_label = _provider_label(str(job.get("source_provider", "") or ""), default="源网盘")
     target_label = _provider_label(str(job.get("target_provider", "") or ""), default="目标网盘")
     title = str(job.get("title", "") or job.get("filename", "") or "文件")
+    trigger_label = "订阅补源" if str(job.get("origin", "") or "").strip().lower() == "subscription" else "手动复制"
     if ok:
         content = "\n".join(
             [
                 "### 跨盘复制完成",
                 f"> 文件：{title}",
                 f"> 链路：{source_label} → {target_label}",
+                f"> 触发：{trigger_label}",
                 f"> 结果：{message or '成功'}",
             ]
         )
@@ -954,12 +1102,13 @@ def _push_cross_copy_notification(cfg: Dict[str, Any], job: Dict[str, Any], *, o
                 "### 跨盘复制失败",
                 f"> 文件：{title}",
                 f"> 链路：{source_label} → {target_label}",
+                f"> 触发：{trigger_label}",
                 f"> 原因：{message or '未知错误'}",
                 "> 建议：到任务中心查看详情并重试",
             ]
         )
     try:
-        _send_notify_content(runtime_cfg, content, timeout=15)
+        _send_notify_content(build_notify_runtime_config(cfg), content, timeout=15)
     except Exception as exc:  # noqa: BLE001 - 通知失败只记录
         logger.info("cross-copy notify failed (job=%s): %s", job.get("id"), exc)
 
@@ -1010,6 +1159,8 @@ def cleanup_temp_files_on_startup() -> Dict[str, int]:
             removed = int(xcc.cleanup_orphan_temp_files(temp_dir) or 0)
             if removed:
                 logger.info("cross-copy orphan temp files cleaned: %s in %s", removed, temp_dir)
+            # 孤儿临时文件删掉后，指向它们的断点状态一并作废（空头支票清掉）
+            prune_resume_for_missing_files()
     except Exception as exc:  # noqa: BLE001 - 清理失败不阻断启动
         logger.warning("cross-copy orphan temp cleanup skipped: %s", exc)
     return {"removed": removed}

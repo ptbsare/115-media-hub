@@ -3377,6 +3377,8 @@
             return {
                 notify_push_enabled: document.getElementById('notify_push_enabled').checked,
                 notify_monitor_enabled: document.getElementById('notify_monitor_enabled').checked,
+                cross_copy_notify_subscription: document.getElementById('cross_copy_notify_subscription').checked,
+                cross_copy_notify_manual: document.getElementById('cross_copy_notify_manual').checked,
                 notify_channel: document.getElementById('notify_channel').value.trim(),
                 notify_wecom_webhook: document.getElementById('notify_wecom_webhook').value.trim(),
                 notify_wecom_app_corp_id: document.getElementById('notify_wecom_app_corp_id').value.trim(),

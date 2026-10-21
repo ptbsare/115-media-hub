@@ -519,6 +519,19 @@ def _validate_notify_runtime_config(runtime_cfg: Dict[str, Any]) -> str:
     return channel
 
 
+def notify_channel_ready(cfg: Dict[str, Any]) -> bool:
+    """通知渠道是否已配置可用。
+
+    只看渠道配置（webhook / 企业微信应用凭证），与任何场景开关无关——
+    每个场景（订阅成功、监控成功、跨盘复制）有自己的开关，渠道是共用配置。
+    """
+    try:
+        _validate_notify_runtime_config(build_notify_runtime_config(cfg))
+    except RuntimeError:
+        return False
+    return True
+
+
 def send_notify_test_message(cfg: Dict[str, Any]) -> Dict[str, Any]:
     runtime_cfg = build_notify_runtime_config(cfg)
     now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -534,6 +547,7 @@ def send_notify_test_message(cfg: Dict[str, Any]) -> Dict[str, Any]:
             "> 推送策略：",
             "> - 订阅更新成功（按开关发送）",
             "> - 文件夹监控生成成功（按开关发送）",
+            "> - 跨盘复制成功/失败（订阅补源、手动复制分别按开关发送）",
         ]
     )
     _send_notify_content(runtime_cfg, content, timeout=20)

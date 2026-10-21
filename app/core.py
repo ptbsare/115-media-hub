@@ -1056,10 +1056,11 @@ def default_config() -> Dict[str, Any]:
         "resource_sources": [],
         "resource_quick_links": [],
         "resource_favorite_dirs": {"115": [], "quark": []},
-        "local_storages": [],
-        "cross_copy_temp_storage": "",
-        "cross_copy_temp_subdir": "cross_copy_tmp",
-        "cross_copy_notify": True,
+        # 跨盘复制暂存目录：容器内绝对路径，空 = 默认 /app/config/cross_copy_tmp
+        "cross_copy_temp_dir": "",
+        # 跨盘复制通知开关：按任务来源区分（订阅补源自动发起 / 手动复制）
+        "cross_copy_notify_subscription": True,
+        "cross_copy_notify_manual": True,
         "cross_copy_delete_source_after": True,
         "scraper_noise_phrases": [],
         "scraper_standalone_noise_words": [],
@@ -2696,27 +2697,42 @@ def normalize_mount_points(value: Any) -> List[Dict[str, str]]:
     return normalized
 
 
-def _normalize_local_storages_config(value: Any) -> List[Dict[str, Any]]:
-    """归一化 local_storages 配置（导入放在函数内避免顶层循环依赖）。"""
-    from .services.local_storage import (
-        ensure_default_storage,
-        normalize_local_storages,
+def _normalize_cross_copy_temp_dir_config(merged: Dict[str, Any]) -> None:
+    """归一化跨盘复制暂存目录：配置里只保留 cross_copy_temp_dir 单字段。
+
+    - 新字段合法 → 原样保留；
+    - 新字段为空/非法时，若旧三字段（local_storages / cross_copy_temp_storage /
+      cross_copy_temp_subdir）能合成出路径则迁移过来，否则留空（= 默认目录）；
+    - 旧字段一律清除，完成一次性迁移。
+    """
+    from .services.local_storage import resolve_temp_dir
+
+    raw = str(merged.get("cross_copy_temp_dir", "") or "").strip()
+    has_new = bool(raw) and raw.startswith("/")
+    has_legacy = bool(str(merged.get("cross_copy_temp_storage", "") or "").strip())
+    if has_new or has_legacy:
+        merged["cross_copy_temp_dir"] = resolve_temp_dir(merged)
+    else:
+        merged["cross_copy_temp_dir"] = ""
+    for key in ("local_storages", "cross_copy_temp_storage", "cross_copy_temp_subdir"):
+        merged.pop(key, None)
+
+
+def _normalize_cross_copy_notify_config(merged: Dict[str, Any]) -> None:
+    """归一化跨盘复制通知开关：按任务来源分成两个字段。
+
+    - 旧配置单字段 ``cross_copy_notify`` 一次性迁移：两个新字段都继承它的值，
+      之后旧字段清除；
+    - 新字段缺省时默认开（与旧版默认行为一致），显式传值以传入的为准。
+    """
+    legacy = merged.pop("cross_copy_notify", None)
+    fallback = normalize_bool(legacy, default=True) if legacy is not None else True
+    merged["cross_copy_notify_subscription"] = normalize_bool(
+        merged.get("cross_copy_notify_subscription"), default=fallback
     )
-
-    return ensure_default_storage(normalize_local_storages(value))
-
-
-def _normalize_cross_copy_temp_subdir(value: Any) -> str:
-    """归一化跨盘复制暂存子目录；不合法回落默认值。"""
-    from .services.local_storage import CROSS_COPY_TEMP_SUBDIR
-
-    raw = str(value or "").strip()
-    if not raw:
-        return CROSS_COPY_TEMP_SUBDIR
-    cleaned = raw.replace("\\", "/").strip("/")
-    if not cleaned or ".." in cleaned.split("/"):
-        return CROSS_COPY_TEMP_SUBDIR
-    return cleaned[:128]
+    merged["cross_copy_notify_manual"] = normalize_bool(
+        merged.get("cross_copy_notify_manual"), default=fallback
+    )
 
 
 def get_mount_prefix(cfg: Dict[str, Any], provider: str) -> str:
@@ -3038,10 +3054,8 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged["resource_quick_links"] = normalize_resource_quick_links(merged.get("resource_quick_links", []))
     merged["resource_favorite_dirs"] = normalize_resource_favorite_dirs(merged.get("resource_favorite_dirs", {}))
     merged["mount_points"] = normalize_mount_points(merged.get("mount_points", []))
-    merged["local_storages"] = _normalize_local_storages_config(merged.get("local_storages", []))
-    merged["cross_copy_temp_storage"] = str(merged.get("cross_copy_temp_storage", "") or "").strip()[:64]
-    merged["cross_copy_temp_subdir"] = _normalize_cross_copy_temp_subdir(merged.get("cross_copy_temp_subdir", ""))
-    merged["cross_copy_notify"] = normalize_bool(merged.get("cross_copy_notify", True), default=True)
+    _normalize_cross_copy_temp_dir_config(merged)
+    _normalize_cross_copy_notify_config(merged)
     merged["cross_copy_delete_source_after"] = normalize_bool(
         merged.get("cross_copy_delete_source_after", True), default=True
     )

@@ -391,10 +391,10 @@ class FolderJobsTestBase(unittest.TestCase):
         ccj._cancel_requested.clear()
 
         self.cfg = {
-            "cross_copy_notify": True,
+            "cross_copy_notify_subscription": True,
+            "cross_copy_notify_manual": True,
             "cross_copy_delete_source_after": True,
             "provider_enabled": {"quark": True, "115": True, "aliyun": True},
-            "local_storages": [],
         }
         self.source_provider = FakeFolderProvider({}, name="quark", label="夸克网盘")
         self.target_provider = FakeFolderProvider({"0": []}, name="115", label="115网盘")
@@ -403,6 +403,7 @@ class FolderJobsTestBase(unittest.TestCase):
             patch.object(ccj, "get_config", return_value=self.cfg),
             patch.object(ccj, "_get_provider_or_none", side_effect=self._get_provider),
             patch.object(ccj, "_send_notify_content", MagicMock()),
+            patch.object(ccj, "notify_channel_ready", return_value=True),
             patch.object(ccj, "submit_background", MagicMock()),
             patch.object(
                 ccj,

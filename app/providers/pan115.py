@@ -2959,6 +2959,7 @@ class Pan115Provider(CloudProvider):
         size=-1,
         progress_cb=None,
         cancel_check=None,
+        upload_resume=None,
         **kwargs,
     ):
         return upload_115_file(
@@ -2971,6 +2972,7 @@ class Pan115Provider(CloudProvider):
             size=size,
             progress_cb=progress_cb,
             cancel_check=cancel_check,
+            upload_resume=upload_resume,
             **kwargs,
         )
 
@@ -3369,6 +3371,75 @@ def _oss_list_parts(token: Dict[str, Any], bucket: str, endpoint: str, key: str,
     return sorted(parts, key=lambda p: p["PartNumber"])
 
 
+def _looks_like_upload_session(value: Any) -> bool:
+    """判断一个 dict 是不是「115 上传会话本体」而不是整个 resume 状态。
+
+    复制引擎（cross_cloud_copy 的 arm_upload_session）传的是 resume["upload"]
+    会话子字典；老形态 / 防御路径可能传整个状态（此时会话在 "upload" 键里）。
+    会话本体的特征是带 fields / upload_id / parts 之一，且没有状态层的
+    temp_path / sha1 / downloaded_bytes。用于首run 写回时决定「就地补字段」
+    还是「挂到 upload 键下」——写错会自引用或丢分片。
+    """
+    if not isinstance(value, dict):
+        return False
+    if value.get("temp_path") or value.get("sha1") or value.get("downloaded_bytes") is not None:
+        return False
+    return any(key in value for key in ("fields", "upload_id", "parts"))
+
+
+def _extract_115_upload_resume(upload_resume: Any) -> Optional[Dict[str, Any]]:
+    """从 upload_resume 取出可用的 115 上传会话；没有返回 None（= 首run）。
+
+    容忍调用方的两种传法（跨盘复制契约）：整个 resume state（会话在其
+    ``upload`` 子字典里）或 ``upload`` 子字典本身。会话必须带 fields +
+    upload_id 才算数，否则按首run 重走 initupload（秒传探测反正不亏）。
+    """
+    if not isinstance(upload_resume, dict) or not upload_resume:
+        return None
+    nested = upload_resume.get("upload")
+    if isinstance(nested, dict) and (nested.get("fields") or nested.get("upload_id")):
+        return nested
+    if upload_resume.get("fields") or upload_resume.get("upload_id"):
+        return upload_resume
+    return None
+
+
+def _oss_part_done_callback(upload_resume: Any, session: Optional[Dict[str, Any]]):
+    """取复制引擎挂上的 on_part_done 回调（分片完成上报；落库由引擎负责）。"""
+    for holder in (upload_resume, session):
+        if isinstance(holder, dict):
+            callback = holder.get("on_part_done")
+            if callable(callback):
+                return callback
+    return None
+
+
+def _merge_oss_parts(*part_lists: Any) -> List[Dict[str, Any]]:
+    """合并多来源分片记录，按 PartNumber 去重排序（靠后的来源优先）。
+
+    续传时 OSS 实测分片（_oss_list_parts）是最终事实，必须排在本地记录之后
+    覆盖——本地可能漏记了「OSS 已收但回调没落库」的那一片。
+    """
+    merged: Dict[int, Dict[str, Any]] = {}
+    for parts in part_lists:
+        if not isinstance(parts, list):
+            continue
+        for part in parts:
+            if not isinstance(part, dict):
+                continue
+            try:
+                number = int(part.get("PartNumber"))
+            except (TypeError, ValueError):
+                continue
+            if number <= 0:
+                continue
+            merged[number] = {
+                "PartNumber": number,
+                "ETag": str(part.get("ETag") or "").strip().strip('"'),
+            }
+    return [merged[number] for number in sorted(merged)]
+
+
 def _read_sign_check_range(sink: Any, sign_check: str) -> bytes:
     """二次验证：读取 sign_check 指定的文件字节段（格式 "start-end"）。"""
     try:
@@ -3394,11 +3465,19 @@ def upload_115_file(
     progress_cb=None,
     cancel_check=None,
     part_size_mb: int = 10,
+    upload_resume: Optional[Dict[str, Any]] = None,
 ) -> UploadResult:
     """把 sink 上传到 115 网盘（秒传优先，未命中走 OSS 分片）。
 
     详见模块头部链路注释。sha1/size 由复制引擎在下载时同步算出；
     缺省时本函数自行读取 sink 计算（会多读一遍）。
+
+    :param upload_resume: 断点续传句柄（复制引擎传入的 resume 状态）。带
+        fields + upload_id 时按设计文档 §3.4 续传：跳过 initupload 与分片初始化、
+        重取 OSS token、``_oss_list_parts`` 实测分片对账、跳过已完成分片、
+        用带回的 callback 合并。首run 分片初始化后会把会话写回该字典；
+        每个分片完成调用 ``on_part_done(part_number, etag)``（引擎挂的回调，
+        落库由引擎负责）。秒传命中分支不受影响。
     """
     cookie = str(cookie or "").strip()
     filename = str(filename or "").strip()
@@ -3424,83 +3503,95 @@ def upload_115_file(
         file_sha1 = hasher.hexdigest().upper()
         sink.seek(0)
 
-    userid, userkey = get_115_user_upload_info(cookie)
-    target = f"U_1_{str(target_dir_id or '0')}"
-    base_payload = {
-        "fileid": file_sha1,
-        "filename": filename,
-        "filesize": total,
-        "target": target,
-        "path": "",
-    }
+    # ---- 断点续传会话（首run 为 None；续run 带 fields + upload_id + parts） ----
+    resume_session = _extract_115_upload_resume(upload_resume)
+    on_part_done = _oss_part_done_callback(upload_resume, resume_session)
+    # 没有引擎回点时由 provider 自己把新分片写回会话，保证终态可续传
+    session_parts: Optional[List[Dict[str, Any]]] = None
 
     def _check_cancel():
         if cancel_check is not None and cancel_check():
             raise UploadError("上传已取消", provider="115")
 
-    # ---- 秒传探测（含 405 限流退避与二次验证） ----
+    # ---- 秒传探测（含 405 限流退避与二次验证）；续run 整段跳过 ----
+    # 续run 能带着 upload_id 进来，说明首run 的秒传探测就没命中，没必要再探一次。
     resp: Dict[str, Any] = {}
-    rounds = 0
-    payload = dict(base_payload)
-    while True:
-        try:
-            resp = _upload_115_initupload(cookie, userid, userkey, payload)
-            break
-        except _UploadRateLimited:
-            rounds += 1
-            if rounds > _115_UPLOAD_RETRY_MAX_ROUNDS:
-                raise UploadError(
-                    "115 上传接口持续限流，请稍后再试", retriable=True, provider="115"
-                )
-            time.sleep(_115_UPLOAD_RETRY_BASE_SECONDS * (2 ** (rounds - 1)))
-            continue
-
-    if not resp.get("state", True) and "status" not in resp:
-        mark_cookie_health_failure("115", resp, trigger="runtime:upload_115_file")
-        raise UploadError(_map_115_upload_error(resp), provider="115")
-
-    # cookie 模式响应为扁平结构（字段在顶层），见 _115_upload_resp_fields
-    fields = _115_upload_resp_fields(resp)
-    status = int(fields.get("status") or 0)
-
-    if status == 7:
-        # 二次验证：读指定字节段算 SHA1 后重试一次
-        sign_check = str(fields.get("sign_check") or "")
-        sign_key = str(fields.get("sign_key") or "")
-        if not sign_check:
-            raise UploadError(
-                "115 账号开启了二次验证且未提供验证参数，无法自动上传", provider="115"
-            )
+    fields: Dict[str, Any] = {}
+    if resume_session is None:
+        userid, userkey = get_115_user_upload_info(cookie)
+        target = f"U_1_{str(target_dir_id or '0')}"
+        base_payload = {
+            "fileid": file_sha1,
+            "filename": filename,
+            "filesize": total,
+            "target": target,
+            "path": "",
+        }
+        rounds = 0
         payload = dict(base_payload)
-        payload["sign_key"] = sign_key
-        payload["sign_val"] = hashlib.sha1(_read_sign_check_range(sink, sign_check)).hexdigest().upper()
-        resp = _upload_115_initupload(cookie, userid, userkey, payload)
+        while True:
+            try:
+                resp = _upload_115_initupload(cookie, userid, userkey, payload)
+                break
+            except _UploadRateLimited:
+                rounds += 1
+                if rounds > _115_UPLOAD_RETRY_MAX_ROUNDS:
+                    raise UploadError(
+                        "115 上传接口持续限流，请稍后再试", retriable=True, provider="115"
+                    )
+                time.sleep(_115_UPLOAD_RETRY_BASE_SECONDS * (2 ** (rounds - 1)))
+                continue
+
         if not resp.get("state", True) and "status" not in resp:
+            mark_cookie_health_failure("115", resp, trigger="runtime:upload_115_file")
             raise UploadError(_map_115_upload_error(resp), provider="115")
+
+        # cookie 模式响应为扁平结构（字段在顶层），见 _115_upload_resp_fields
         fields = _115_upload_resp_fields(resp)
         status = int(fields.get("status") or 0)
+
         if status == 7:
-            raise UploadError(
-                "115 账号开启了二次验证，当前无法自动完成上传（需要人工验证）", provider="115"
+            # 二次验证：读指定字节段算 SHA1 后重试一次
+            sign_check = str(fields.get("sign_check") or "")
+            sign_key = str(fields.get("sign_key") or "")
+            if not sign_check:
+                raise UploadError(
+                    "115 账号开启了二次验证且未提供验证参数，无法自动上传", provider="115"
+                )
+            payload = dict(base_payload)
+            payload["sign_key"] = sign_key
+            payload["sign_val"] = hashlib.sha1(_read_sign_check_range(sink, sign_check)).hexdigest().upper()
+            resp = _upload_115_initupload(cookie, userid, userkey, payload)
+            if not resp.get("state", True) and "status" not in resp:
+                raise UploadError(_map_115_upload_error(resp), provider="115")
+            fields = _115_upload_resp_fields(resp)
+            status = int(fields.get("status") or 0)
+            if status == 7:
+                raise UploadError(
+                    "115 账号开启了二次验证，当前无法自动完成上传（需要人工验证）", provider="115"
+                )
+
+        if status == 2:
+            # 秒传命中：零上传流量
+            mark_cookie_health_success("115", trigger="runtime:upload_115_file")
+            pick_code = str(fields.get("pickcode") or fields.get("pick_code") or "")
+            return UploadResult(
+                status="rapid",
+                pick_code=pick_code,
+                name=filename,
+                size=total,
+                sha1=file_sha1,
+                message="秒传命中",
             )
 
-    if status == 2:
-        # 秒传命中：零上传流量
-        mark_cookie_health_success("115", trigger="runtime:upload_115_file")
-        pick_code = str(fields.get("pickcode") or fields.get("pick_code") or "")
-        return UploadResult(
-            status="rapid",
-            pick_code=pick_code,
-            name=filename,
-            size=total,
-            sha1=file_sha1,
-            message="秒传命中",
-        )
+        if status != 1:
+            raise UploadError(_map_115_upload_error(resp), provider="115")
+    else:
+        # 会话里的 fields 就是首run initupload 的拍平响应（bucket/object/callback）
+        session_fields = resume_session.get("fields")
+        fields = dict(session_fields) if isinstance(session_fields, dict) else {}
 
-    if status != 1:
-        raise UploadError(_map_115_upload_error(resp), provider="115")
-
-    # ---- 秒传未命中：OSS 上传 ----
+    # ---- 秒传未命中（或续run）：OSS 上传 ----
     bucket = str(fields.get("bucket") or _115_OSS_DEFAULT_BUCKET)
     key = str(fields.get("object") or "")
     callback = fields.get("callback") or {}
@@ -3517,7 +3608,8 @@ def upload_115_file(
     part_size = max(int(part_size_mb or 10) * 1024 * 1024, _115_OSS_MIN_PART_SIZE)
 
     _check_cancel()
-    if total <= part_size:
+    if resume_session is None and total <= part_size:
+        # 首run 且小文件：单次 PUT（有会话说明首run 就走了分片，不会到这里）
         sink.seek(0)
         payload_bytes = sink.read(total)
         if len(payload_bytes) != total:
@@ -3529,11 +3621,81 @@ def upload_115_file(
             except Exception:
                 pass
     else:
-        upload_id = _oss_multipart_init(token, bucket, endpoint, key)
-        parts: List[Dict[str, Any]] = []
+        session_parts: Optional[List[Dict[str, Any]]] = None
+        if resume_session is None:
+            upload_id = _oss_multipart_init(token, bucket, endpoint, key)
+            done_parts: List[Dict[str, Any]] = []
+            # 首run：把上传会话写回 upload_resume（任务层负责落库），
+            # 失败/取消/重启后凭它续传。复制引擎可能传两种形态：整个 resume
+            # 状态（写进它的 "upload" 键）或现场新建的会话骨架（就地补字段）。
+            # 就地补字段时 parts 列表对象不能换——引擎的 on_part_done 持有
+            # 旧引用，换列表分片就记丢了；也不能写 upload_resume["upload"]=
+            # 它自身（自引用，落库 json.dumps 直接炸）。
+            if isinstance(upload_resume, dict):
+                if _looks_like_upload_session(upload_resume):
+                    upload_resume["provider"] = "115"
+                    upload_resume["fields"] = dict(fields)
+                    upload_resume["upload_id"] = upload_id
+                    parts_list = upload_resume.get("parts")
+                    if not isinstance(parts_list, list):
+                        parts_list = []
+                        upload_resume["parts"] = parts_list
+                    session_parts = parts_list
+                else:
+                    session = {
+                        "provider": "115",
+                        "fields": dict(fields),
+                        "upload_id": upload_id,
+                        "parts": [],
+                    }
+                    upload_resume["upload"] = session
+                    session_parts = session["parts"]
+        else:
+            upload_id = str(resume_session.get("upload_id") or "").strip()
+            if not upload_id:
+                raise UploadError("115 断点续传会话缺少 upload_id，请重试", provider="115")
+            # 续run：OSS 实测分片与本地记录取并集（实测为准——本地可能漏记了
+            # 「OSS 已收但回调没落库」的那一片）
+            listed = _oss_list_parts(token, bucket, endpoint, key, upload_id)
+            outer_parts = upload_resume.get("parts") if isinstance(upload_resume, dict) else None
+            done_parts = _merge_oss_parts(resume_session.get("parts"), outer_parts, listed)
+            # part_size 必须与首run 一致：非末片大小即 part_size，用它纠正默认值
+            listed_sizes = [int(p.get("Size") or 0) for p in listed if isinstance(p, dict)]
+            derived_size = max(listed_sizes) if listed_sizes else 0
+            if derived_size >= _115_OSS_MIN_PART_SIZE:
+                part_size = derived_size
+            logging.info(
+                "115 upload resume: upload_id=%s done_parts=%s part_size=%s",
+                upload_id[:12], len(done_parts), part_size,
+            )
+            if isinstance(resume_session, dict):
+                # 对账后的分片列表写回会话：终态落库与下次续传都基于它。
+                # 原地替换内容、不换列表对象——引擎的 on_part_done 闭包持有
+                # 旧列表引用，换对象后续分片就记丢了。
+                parts_list = resume_session.get("parts")
+                if not isinstance(parts_list, list):
+                    parts_list = []
+                    resume_session["parts"] = parts_list
+                parts_list[:] = done_parts
+                if on_part_done is None:
+                    session_parts = parts_list
+
+        parts_by_number: Dict[int, Dict[str, Any]] = {
+            int(p["PartNumber"]): {"PartNumber": int(p["PartNumber"]), "ETag": str(p.get("ETag") or "")}
+            for p in done_parts
+        }
         sent = 0
         part_number = 1
-        sink.seek(0)
+        if parts_by_number:
+            # 从第一个未完成分片接着传。分片顺序上传，已完成理应是连续前缀；
+            # 万一对账出空洞，退回第一个空洞，前面的不浪费（后面的重传由
+            # parts_by_number 按序号覆盖）。
+            while part_number in parts_by_number:
+                part_number += 1
+            sink.seek((part_number - 1) * part_size)
+            sent = (part_number - 1) * part_size
+        else:
+            sink.seek(0)
         while True:
             _check_cancel()
             chunk = sink.read(part_size)
@@ -3554,7 +3716,14 @@ def upload_115_file(
                 label="115",
                 cancel_check=(lambda: bool(cancel_check is not None and cancel_check())),
             )
-            parts.append({"PartNumber": part_number, "ETag": etag})
+            parts_by_number[part_number] = {"PartNumber": part_number, "ETag": etag}
+            if on_part_done is not None:
+                try:
+                    on_part_done(part_number, etag)
+                except Exception as exc:  # noqa: BLE001 - 上报失败不该打断上传
+                    logging.info("115 upload on_part_done failed (part=%s): %s", part_number, exc)
+            elif session_parts is not None:
+                session_parts.append({"PartNumber": part_number, "ETag": etag})
             sent += len(chunk)
             part_number += 1
             if progress_cb:
@@ -3562,7 +3731,15 @@ def upload_115_file(
                     progress_cb(sent, total)
                 except Exception:
                     pass
-        _oss_multipart_complete(token, bucket, endpoint, key, upload_id, parts, callback)
+        _oss_multipart_complete(
+            token,
+            bucket,
+            endpoint,
+            key,
+            upload_id,
+            [parts_by_number[number] for number in sorted(parts_by_number)],
+            callback,
+        )
 
     mark_cookie_health_success("115", trigger="runtime:upload_115_file")
     return UploadResult(

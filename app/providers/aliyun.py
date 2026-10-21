@@ -997,8 +997,12 @@ class AliyunProvider(CloudProvider):
         size=-1,
         progress_cb=None,
         cancel_check=None,
+        upload_resume=None,
         **kwargs,
     ):
+        # upload_resume：断点续传句柄。阿里本期不实现会话级上传续传——
+        # 预签名分片 URL 的跨进程复用未经真机验证，不冒险；本地数据已由任务层
+        # 保留，下载不再重来，上传从头再来（设计文档 §3.4）。
         return self._upload_file_flow(
             cookie,
             sink,

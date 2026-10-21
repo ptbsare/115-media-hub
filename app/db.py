@@ -538,6 +538,7 @@ def ensure_db() -> None:
                     origin TEXT NOT NULL DEFAULT 'manual',
                     origin_ref TEXT NOT NULL DEFAULT '',
                     source_is_dir INTEGER NOT NULL DEFAULT 0,
+                    resume_json TEXT NOT NULL DEFAULT '{}',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT NOT NULL DEFAULT '',
@@ -579,6 +580,12 @@ def ensure_db() -> None:
                 # 0 = 复制单个文件，1 = 复制整个文件夹（一个任务一个文件夹）
                 cursor.execute(
                     "ALTER TABLE cross_copy_jobs ADD COLUMN source_is_dir INTEGER NOT NULL DEFAULT 0"
+                )
+            if "resume_json" not in cross_copy_job_columns:
+                # 断点续传状态（temp_path/size/sha1/md5/downloaded_bytes/upload），
+                # 任务失败/取消/重启后继承本地已下载数据与 115 上传会话；'{}' = 无断点
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN resume_json TEXT NOT NULL DEFAULT '{}'"
                 )
             cursor.execute("PRAGMA table_info(local_files)")
             local_file_columns = {str(row[1]) for row in cursor.fetchall()}

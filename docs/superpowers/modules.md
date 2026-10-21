@@ -71,9 +71,9 @@
 ### 参数配置（settings）
 - **用途**：全局配置与运维入口：认证、签到、通知、代理、安全、AI、版本。
 - **入口**：页面「参数配置」；`/get_settings`、`/save_settings`、`/settings/...`。
-- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）、本地存储位置管理（添加/启停/删除容器内目录、探测可写与剩余空间、选定跨盘复制的暂存位置与子目录）。
-- **不会做**：不改任务、不动网盘文件、不生成 STRM；删除存储位置只删配置记录，不碰磁盘上的实际文件。
-- **相关代码**：`app/routes/settings.py`、`app/services/sign115.py`、`app/services/notify.py`；页面 `templates/partials/pages/settings.html`
+- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知（四个场景开关：订阅更新成功、文件夹监控生成成功、跨盘复制按任务来源分订阅补源/手动复制；渠道配置共用，场景开关互不影响）、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）、本地暂存目录管理（单个容器内目录 `cross_copy_temp_dir`，空 = 默认 `/app/config/cross_copy_tmp`；保存前探测存在/可写/剩余空间；旧版「位置列表」配置读取时一次性迁移）。
+- **不会做**：不改任务、不动网盘文件、不生成 STRM；换暂存目录只改配置，不碰磁盘上的实际文件。
+- **相关代码**：`app/routes/settings.py`、`app/services/sign115.py`、`app/services/notify.py`、`app/services/local_storage.py`；页面 `templates/partials/pages/settings.html`
 
 ### 播放代理（STRM 网关）
 - **用途**：播放器点开 `.strm` 时，把请求换成可播放的真实地址。
@@ -129,13 +129,14 @@
 | `app/services/subscription_share_runtime.py` | 分享浏览与转存运行时 |
 | `app/services/subscription_state.py` | 订阅状态与追更进度持久化 |
 | `app/services/subscription_offline_cleanup.py` | 离线导入未命中文件的保留与到期清理 |
-| `app/services/notify.py` | 企业微信通知（机器人 Webhook / 自建应用两通道） |
+| `app/services/notify.py` | 企业微信通知（机器人 Webhook / 自建应用两通道）：订阅成功 / 监控成功 / 跨盘复制（按任务来源分开关）三个推送场景，渠道就绪检查 `notify_channel_ready` 与场景开关解耦 |
 | `app/services/sign115.py` | 115 每日签到 |
-| `app/services/cross_cloud_copy.py` | 跨盘复制引擎（P0-B）：源直链下载 + 同步 SHA1/MD5 + 内存/磁盘双通道 + 目标秒传/分片上传 + 取消/换链重试/幂等/孤儿清理；零流量路径（源端已知哈希 + 惰性 sink，秒传命中不下载）与分段下载（Range，绕开整文件流限速） |
+| `app/services/cross_cloud_copy.py` | 跨盘复制引擎（P0-B）：源直链下载（并行分段，`CROSS_COPY_DOWNLOAD_PARALLEL`，落盘后顺序算哈希）+ 同步 SHA1/MD5 + 内存/磁盘双通道 + 目标秒传/分片上传 + 取消/换链重试/幂等/孤儿清理；零流量路径（源端已知哈希 + 惰性 sink，秒传命中不下载）与断点续传管道（resume 状态就地更新 + on_resume_update 上报 + 失败保留临时文件） |
 | `app/services/cross_cloud_copy_folder.py` | 整文件夹跨盘复制：BFS 递归建清单（上限 2000 文件 / 20 层，超限拒绝）、目标端逐级建目录、字节加权进度、单文件失败继续并汇总 partial |
 | `app/services/media_hash_cache.py` | 文件哈希备忘录（media_hash_cache）：按 (provider, file_id) 沉淀已确认的 SHA1，查缓存校验 size、30 天过期，供跨盘复制复用零流量秒传；缓存故障不影响复制主流程 |
-| `app/services/local_storage.py` | 本地存储位置管理：位置列表归一化/去重、目录可用性探测、暂存目录解析、磁盘空间预检 |
-| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知 / 记录清除与自动裁剪 |
+| `app/services/local_storage.py` | 本地暂存目录管理：容器内路径归一化、默认目录（config 卷下 `cross_copy_tmp`）、旧位置列表配置迁移、目录可用性探测、暂存目录解析、磁盘空间预检 |
+| `app/services/cross_copy_resume.py` | 跨盘复制断点续传状态管理：运行前校验（临时文件在/前缀完整/复探源哈希防旧内容上传）、全新骨架构造、可继承性判断、落库净化（深拷贝并剔除 on_part_done 等运行时字段，保证状态可 JSON 序列化）、作废与孤儿清理联动 |
+| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知（按 origin 选订阅补源/手动开关）/ 记录清除与自动裁剪 / 断点续传生命周期（骨架落库、终态保底、成功清除） |
 | `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |
 
 ### 网盘与外部 provider `app/providers/`

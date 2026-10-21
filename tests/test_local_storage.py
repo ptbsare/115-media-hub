@@ -1,4 +1,4 @@
-"""本地存储位置管理测试（#8 存储位置管理）。
+"""本地暂存目录管理测试（跨盘复制暂存目录，2026-10-21 起为单目录模型）。
 
 注意：本会话环境的 tempfile 自检被破坏，测试统一用 tempfile.mkdtemp()
 显式指定 dir（mkdtemp 本身不触发自检），并在 tearDown 手动清理。
@@ -38,74 +38,78 @@ class TestPathNormalization(unittest.TestCase):
         self.assertEqual(ls._normalize_container_path("/"), "/")
 
 
-class TestSubdirNormalization(unittest.TestCase):
-    def test_normal_subdir(self):
-        self.assertEqual(ls._normalize_subdir("cross_copy_tmp"), "cross_copy_tmp")
-
-    def test_nested_subdir(self):
-        self.assertEqual(ls._normalize_subdir("a/b"), "a/b")
-
-    def test_trailing_slash_stripped(self):
-        self.assertEqual(ls._normalize_subdir("a/b/"), "a/b")
-
-    def test_absolute_rejected(self):
-        self.assertEqual(ls._normalize_subdir("/etc"), "")
-
-    def test_traversal_rejected(self):
-        self.assertEqual(ls._normalize_subdir("../etc"), "")
-        self.assertEqual(ls._normalize_subdir("a/../../b"), "")
-
-    def test_dot_segments_cleaned(self):
-        self.assertEqual(ls._normalize_subdir("./a/./b"), "a/b")
-
-    def test_empty_returns_empty(self):
-        self.assertEqual(ls._normalize_subdir(""), "")
-
-
-class TestEntryNormalization(unittest.TestCase):
-    def test_basic_entry(self):
-        entry = ls.normalize_local_storage_entry({"path": "/app/storage", "label": "机械硬盘"})
-        self.assertIsNotNone(entry)
-        self.assertEqual(entry["label"], "机械硬盘")
-        self.assertTrue(entry["enabled"])
-        self.assertTrue(entry["id"].startswith("st-"))
-
-    def test_id_stable_for_same_path(self):
-        e1 = ls.normalize_local_storage_entry({"path": "/app/storage"})
-        e2 = ls.normalize_local_storage_entry({"path": "/app/storage/"})
-        self.assertEqual(e1["id"], e2["id"])
-
-    def test_invalid_path_dropped(self):
-        self.assertIsNone(ls.normalize_local_storage_entry({"path": "relative"}))
-        self.assertIsNone(ls.normalize_local_storage_entry({}))
-        self.assertIsNone(ls.normalize_local_storage_entry(None))
-
-    def test_dedup_by_id(self):
-        storages = ls.normalize_local_storages(
-            [
-                {"path": "/app/storage", "label": "A"},
-                {"path": "/app/storage", "label": "B"},
-                {"path": "/app/storage2", "label": "C"},
-            ]
-        )
-        self.assertEqual(len(storages), 2)
-        self.assertEqual(storages[0]["label"], "A")
-
-    def test_legacy_dict_form(self):
-        storages = ls.normalize_local_storages({"path": "/app/storage"})
-        self.assertEqual(len(storages), 1)
-
-    def test_default_storage_injected(self):
+class TestDefaultTempDir(unittest.TestCase):
+    def test_default_dir_under_config_volume(self):
         with patch.object(ls, "default_storage_path", return_value="/app/config"):
-            storages = ls.ensure_default_storage([])
-            self.assertEqual(len(storages), 1)
-            self.assertEqual(storages[0]["path"], "/app/config")
+            self.assertEqual(ls.default_temp_dir(), "/app/config/cross_copy_tmp")
 
-    def test_default_storage_not_duplicated(self):
-        existing = [{"id": "st-x", "label": "x", "path": "/app/storage", "enabled": True}]
-        with patch.object(ls, "default_storage_path", return_value="/app/storage"):
-            storages = ls.ensure_default_storage(existing)
-            self.assertEqual(len(storages), 1)
+    def test_config_dir_env_override(self):
+        with patch.dict(os.environ, {"MEDIA_HUB_CONFIG_DIR": "/data/config"}):
+            self.assertEqual(ls.default_storage_path(), "/data/config")
+            self.assertEqual(ls.default_temp_dir(), "/data/config/cross_copy_tmp")
+
+
+class TestResolveTempDir(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb_ls_test_")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_empty_cfg_falls_back_to_default(self):
+        with patch.object(ls, "default_storage_path", return_value="/app/config"):
+            self.assertEqual(ls.resolve_temp_dir({}), "/app/config/cross_copy_tmp")
+
+    def test_new_field_wins(self):
+        with patch.object(ls, "default_storage_path", return_value="/app/config"):
+            cfg = {
+                "cross_copy_temp_dir": "/app/storage/cross_copy_tmp",
+                # 旧字段同时存在时以新字段为准
+                "local_storages": [{"id": "st-x", "path": "/app/storage", "enabled": True}],
+                "cross_copy_temp_storage": "st-x",
+                "cross_copy_temp_subdir": "my_tmp",
+            }
+            self.assertEqual(ls.resolve_temp_dir(cfg), "/app/storage/cross_copy_tmp")
+
+    def test_new_field_normalized(self):
+        cfg = {"cross_copy_temp_dir": "/app/storage//tmp///"}
+        self.assertEqual(ls.resolve_temp_dir(cfg), "/app/storage/tmp")
+
+    def test_invalid_new_field_ignored(self):
+        """新字段是相对路径等非法值时忽略，走默认。"""
+        with patch.object(ls, "default_storage_path", return_value="/app/config"):
+            self.assertEqual(ls.resolve_temp_dir({"cross_copy_temp_dir": "relative/dir"}), "/app/config/cross_copy_tmp")
+
+    def test_legacy_storage_id_migrated(self):
+        """旧配置：位置 id + 子目录合成实际路径。"""
+        cfg = {
+            "local_storages": [{"id": "st-x", "path": "/app/storage", "enabled": True}],
+            "cross_copy_temp_storage": "st-x",
+            "cross_copy_temp_subdir": "my_tmp",
+        }
+        self.assertEqual(ls.resolve_temp_dir(cfg), "/app/storage/my_tmp")
+
+    def test_legacy_default_subdir(self):
+        cfg = {
+            "local_storages": [{"id": "st-x", "path": "/app/storage", "enabled": True}],
+            "cross_copy_temp_storage": "st-x",
+        }
+        self.assertEqual(ls.resolve_temp_dir(cfg), "/app/storage/cross_copy_tmp")
+
+    def test_legacy_unknown_id_falls_back_default(self):
+        with patch.object(ls, "default_storage_path", return_value="/app/config"):
+            cfg = {"local_storages": [], "cross_copy_temp_storage": "st-gone"}
+            self.assertEqual(ls.resolve_temp_dir(cfg), "/app/config/cross_copy_tmp")
+
+    def test_legacy_list_not_a_list(self):
+        with patch.object(ls, "default_storage_path", return_value="/app/config"):
+            cfg = {"local_storages": {"bad": True}, "cross_copy_temp_storage": "st-x"}
+            self.assertEqual(ls.resolve_temp_dir(cfg), "/app/config/cross_copy_tmp")
+
+    def test_create_makes_dir(self):
+        target = os.path.join(self.tmp, "cross_copy_tmp")
+        ls.resolve_cross_copy_temp_dir({"cross_copy_temp_dir": target}, create=True)
+        self.assertTrue(os.path.isdir(target))
 
 
 class TestProbe(unittest.TestCase):
@@ -151,82 +155,70 @@ class TestProbe(unittest.TestCase):
             os.chmod(ro, 0o700)
 
 
-class TestResolveAndSpace(unittest.TestCase):
+class TestEnsureFreeSpace(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="wb_ls_test_")
 
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def _cfg_with_storage(self, path):
-        entry = ls.normalize_local_storage_entry({"path": path, "label": "测试盘"})
-        return {"local_storages": [entry], "cross_copy_temp_storage": entry["id"]}
-
-    def test_resolve_creates_subdir(self):
-        cfg = self._cfg_with_storage(self.tmp)
-        target = ls.resolve_storage_dir(cfg, cfg["local_storages"][0]["id"], "cross_copy_tmp")
-        self.assertEqual(target, os.path.join(self.tmp, "cross_copy_tmp"))
-        self.assertTrue(os.path.isdir(target))
-
-    def test_resolve_without_create(self):
-        cfg = self._cfg_with_storage(self.tmp)
-        target = ls.resolve_storage_dir(cfg, cfg["local_storages"][0]["id"], "xcopy", create=False)
-        self.assertFalse(os.path.exists(target))
-
-    def test_resolve_unknown_storage_raises(self):
-        with self.assertRaises(ValueError):
-            ls.resolve_storage_dir({"local_storages": []}, "st-nope", "sub")
-
-    def test_resolve_empty_id_uses_default(self):
-        with patch.object(ls, "default_storage_path", return_value=self.tmp):
-            target = ls.resolve_storage_dir({}, "", "sub")
-            self.assertEqual(target, os.path.join(self.tmp, "sub"))
-
-    def test_resolve_cross_copy_temp_dir(self):
-        cfg = self._cfg_with_storage(self.tmp)
-        cfg["cross_copy_temp_subdir"] = "my_tmp"
-        target = ls.resolve_cross_copy_temp_dir(cfg)
-        self.assertEqual(target, os.path.join(self.tmp, "my_tmp"))
-
-    def test_ensure_free_space_ok(self):
+    def test_ok(self):
         ls.ensure_free_space(self.tmp, 1024)
 
-    def test_ensure_free_space_insufficient(self):
+    def test_insufficient(self):
         with self.assertRaises(ValueError) as ctx:
             ls.ensure_free_space(self.tmp, 10 ** 18)
         msg = str(ctx.exception)
         self.assertIn("空间不足", msg)
         self.assertIn(self.tmp, msg)
 
-    def test_ensure_free_space_zero_noop(self):
+    def test_zero_noop(self):
         ls.ensure_free_space(self.tmp, 0)
 
-    def test_list_volumes_with_state(self):
-        cfg = self._cfg_with_storage(self.tmp)
-        with patch.object(ls, "default_storage_path", return_value=self.tmp):
-            volumes = ls.list_storage_volumes(cfg)
-        # 配置里的路径即默认路径 → 不重复注入，仅一条
-        self.assertEqual(len(volumes), 1)
-        self.assertTrue(volumes[0]["ok"])
-        self.assertEqual(volumes[0]["label"], "测试盘")
 
+class TestConfigNormalization(unittest.TestCase):
+    """core 的配置归一化：只保留 cross_copy_temp_dir，旧字段一次性迁移后清除。"""
 
-class TestConfigIntegration(unittest.TestCase):
-    def test_normalize_via_core(self):
+    def _normalize(self, cfg):
         from app import core
 
-        with patch.object(ls, "default_storage_path", return_value="/app/config"):
-            normalized = core._normalize_local_storages_config(
-                [{"path": "/app/storage", "label": "HDD"}, {"path": "bad"}]
-            )
-        self.assertEqual([e["path"] for e in normalized], ["/app/config", "/app/storage"])
+        merged = dict(cfg)
+        core._normalize_cross_copy_temp_dir_config(merged)
+        return merged
 
-    def test_cross_copy_subdir_normalize(self):
-        from app import core
+    def test_new_field_kept(self):
+        merged = self._normalize({"cross_copy_temp_dir": "/app/storage/cross_copy_tmp"})
+        self.assertEqual(merged["cross_copy_temp_dir"], "/app/storage/cross_copy_tmp")
+        self.assertNotIn("local_storages", merged)
+        self.assertNotIn("cross_copy_temp_storage", merged)
+        self.assertNotIn("cross_copy_temp_subdir", merged)
 
-        self.assertEqual(core._normalize_cross_copy_temp_subdir("x/y"), "x/y")
-        self.assertEqual(core._normalize_cross_copy_temp_subdir("../evil"), "cross_copy_tmp")
-        self.assertEqual(core._normalize_cross_copy_temp_subdir(""), "cross_copy_tmp")
+    def test_legacy_migrated_and_cleared(self):
+        merged = self._normalize({
+            "local_storages": [{"id": "st-x", "path": "/app/storage", "enabled": True}],
+            "cross_copy_temp_storage": "st-x",
+            "cross_copy_temp_subdir": "my_tmp",
+        })
+        self.assertEqual(merged["cross_copy_temp_dir"], "/app/storage/my_tmp")
+        self.assertNotIn("local_storages", merged)
+        self.assertNotIn("cross_copy_temp_storage", merged)
+        self.assertNotIn("cross_copy_temp_subdir", merged)
+
+    def test_empty_stays_empty(self):
+        merged = self._normalize({})
+        self.assertEqual(merged["cross_copy_temp_dir"], "")
+
+    def test_invalid_new_field_rejected(self):
+        merged = self._normalize({"cross_copy_temp_dir": "relative/dir"})
+        self.assertEqual(merged["cross_copy_temp_dir"], "")
+
+    def test_invalid_new_field_with_legacy_falls_to_legacy(self):
+        merged = self._normalize({
+            "cross_copy_temp_dir": "relative/dir",
+            "local_storages": [{"id": "st-x", "path": "/app/storage", "enabled": True}],
+            "cross_copy_temp_storage": "st-x",
+        })
+        self.assertEqual(merged["cross_copy_temp_dir"], "/app/storage/cross_copy_tmp")
 
 
 class TestEngineTempDirHook(unittest.TestCase):
@@ -241,9 +233,8 @@ class TestEngineTempDirHook(unittest.TestCase):
     def test_resolve_temp_dir_from_cfg(self):
         from app.services import cross_cloud_copy as xcc
 
-        entry = ls.normalize_local_storage_entry({"path": self.tmp})
-        cfg = {"local_storages": [entry], "cross_copy_temp_storage": entry["id"]}
-        self.assertEqual(xcc.resolve_temp_dir(cfg), os.path.join(self.tmp, "cross_copy_tmp"))
+        cfg = {"cross_copy_temp_dir": self.tmp}
+        self.assertEqual(xcc.resolve_temp_dir(cfg), self.tmp)
 
     def test_resolve_temp_dir_empty_cfg_falls_back_default(self):
         """空 cfg（非 None）按默认位置解析。"""

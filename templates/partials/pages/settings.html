@@ -1,8 +1,34 @@
         <style>
-            /* 存储位置卡片：只服务「本地存储位置」分区，样式尽量贴着现有暗色卡片走 */
+            /* 存储位置卡片：只服务「本地存储位置」分区。
+               配色走 --st-* 变量：默认深色，html.theme-day 下整套覆盖为浅色，
+               避免硬编码色值在日间主题下不可读。 */
+            #settings-storage {
+                --st-surface: rgba(15, 23, 42, 0.5);
+                --st-surface-strong: rgba(2, 6, 23, 0.55);
+                --st-border: rgba(51, 65, 85, 0.8);
+                --st-text: #f1f5f9;
+                --st-muted: #94a3b8;
+                --st-path: #7dd3fc;
+                --st-ok: #34d399;
+                --st-warn: #fbbf24;
+                --st-danger: #f87171;
+                --st-code-bg: rgba(30, 41, 59, 0.7);
+            }
+            html.theme-day #settings-storage {
+                --st-surface: var(--surface-soft, #f8fafc);
+                --st-surface-strong: #ffffff;
+                --st-border: var(--border, #d9e2ec);
+                --st-text: var(--text, #0f172a);
+                --st-muted: var(--muted, #475569);
+                --st-path: #0369a1;
+                --st-ok: var(--success, #15803d);
+                --st-warn: var(--warn, #b45309);
+                --st-danger: var(--danger, #dc2626);
+                --st-code-bg: rgba(226, 232, 240, 0.8);
+            }
             .settings-storage-card {
-                border: 1px solid rgba(51, 65, 85, 0.8);
-                background: rgba(15, 23, 42, 0.5);
+                border: 1px solid var(--st-border);
+                background: var(--st-surface);
                 border-radius: 1rem;
                 padding: 1rem;
             }
@@ -17,87 +43,41 @@
             .settings-storage-card-title {
                 font-size: 0.875rem;
                 font-weight: 700;
-                color: #f1f5f9;
+                color: var(--st-text);
             }
-            .settings-storage-list {
-                display: flex;
-                flex-direction: column;
-                gap: 0.5rem;
-            }
-            .settings-storage-row {
-                border: 1px solid rgba(51, 65, 85, 0.7);
-                background: rgba(2, 6, 23, 0.55);
+            .settings-storage-current {
+                border: 1px solid var(--st-border);
+                background: var(--st-surface-strong);
                 border-radius: 0.75rem;
-                padding: 0.75rem;
+                padding: 0.85rem 1rem;
                 display: flex;
                 flex-direction: column;
-                gap: 0.4rem;
-            }
-            .settings-storage-row-head {
-                display: flex;
-                flex-wrap: wrap;
-                align-items: center;
-                justify-content: space-between;
-                gap: 0.75rem;
-            }
-            .settings-storage-label {
-                font-size: 0.875rem;
-                font-weight: 700;
-                color: #e2e8f0;
-            }
-            .settings-storage-path {
-                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
-                font-size: 0.75rem;
-                color: #94a3b8;
-                word-break: break-all;
-            }
-            .settings-storage-actions {
-                display: flex;
-                align-items: center;
-                gap: 0.75rem;
-            }
-            .settings-storage-toggle {
-                display: inline-flex;
-                align-items: center;
                 gap: 0.35rem;
-                font-size: 0.75rem;
-                color: #cbd5e1;
-                cursor: pointer;
             }
-            .settings-storage-delete {
-                padding: 0.3rem 0.7rem;
-                border-radius: 0.6rem;
-                border: 1px solid rgba(248, 113, 113, 0.45);
-                background: rgba(127, 29, 29, 0.35);
-                color: #fca5a5;
-                font-size: 0.75rem;
+            .settings-storage-dir-path {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 0.9rem;
                 font-weight: 700;
-            }
-            .settings-storage-delete:hover {
-                background: rgba(153, 27, 27, 0.55);
-                color: #fecaca;
+                color: var(--st-path);
+                word-break: break-all;
             }
             .settings-storage-meta {
                 font-size: 0.75rem;
                 line-height: 1.5rem;
-                color: #34d399;
+                color: var(--st-ok);
             }
             .settings-storage-meta.is-bad {
-                color: #fbbf24;
+                color: var(--st-danger);
             }
-            .settings-storage-error {
-                font-size: 0.75rem;
-                line-height: 1.5rem;
-                color: #f87171;
+            .settings-storage-meta.is-warn {
+                color: var(--st-warn);
             }
-            .settings-storage-empty {
-                border: 1px dashed rgba(51, 65, 85, 0.8);
-                background: rgba(2, 6, 23, 0.4);
-                border-radius: 0.75rem;
-                padding: 0.9rem 1rem;
-                font-size: 0.75rem;
-                line-height: 1.6rem;
-                color: #94a3b8;
+            .settings-storage-actions-row {
+                display: flex;
+                flex-wrap: wrap;
+                align-items: center;
+                gap: 0.5rem;
+                margin-top: 0.75rem;
             }
             .settings-storage-form {
                 display: grid;
@@ -107,8 +87,33 @@
             }
             @media (min-width: 768px) {
                 .settings-storage-form {
-                    grid-template-columns: minmax(0, 2fr) minmax(0, 1fr) auto;
+                    grid-template-columns: minmax(0, 1fr) auto auto;
                 }
+            }
+            .settings-storage-status {
+                border-radius: 0.75rem;
+                padding: 0.6rem 0.9rem;
+                font-size: 0.75rem;
+                line-height: 1.5rem;
+                margin-top: 0.6rem;
+                border: 1px solid var(--st-border);
+                color: var(--st-muted);
+                background: var(--st-surface-strong);
+            }
+            .settings-storage-status.is-ok {
+                color: var(--st-ok);
+                border-color: var(--st-ok);
+            }
+            .settings-storage-status.is-bad {
+                color: var(--st-danger);
+                border-color: var(--st-danger);
+            }
+            #settings-storage code {
+                font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+                font-size: 0.92em;
+                background: var(--st-code-bg);
+                border-radius: 0.3rem;
+                padding: 0.05rem 0.3rem;
             }
         </style>
         <div id="page-settings" class="page-panel module-page hidden space-y-6">
@@ -267,53 +272,41 @@
                     </div>
                     <div id="settings-body-storage" class="space-y-4 settings-section-body" hidden>
                         <div class="text-xs text-slate-500 leading-6">
-                            跨盘复制（比如从 115 复制到其它网盘）时，大文件没法直接对传，会先完整下载到下面选中的本地目录，再上传到目标网盘，传完自动清理临时文件。所以这个目录要选容量够大、剩余空间足够的盘。
+                            跨盘复制（比如从 115 复制到其它网盘）时，大文件没法直接对传，会先完整下载到下面的目录，再上传到目标网盘，传完自动清理临时文件。所以这个目录要放在容量够大、剩余空间足够的盘上。
                         </div>
                         <div class="text-xs text-slate-500 leading-6">
-                            这里填的是<strong class="text-slate-300">容器内的目录</strong>。要先把宿主机的磁盘挂载进容器（例如把宿主机的 <code class="font-mono">/mnt/hdd</code> 挂到容器的 <code class="font-mono">/app/storage</code>），目录不存在或不可写就保存不了。
+                            不配置也能用：默认放在 config 卷下的 <code class="font-mono">cross_copy_tmp</code> 目录。想换成容量更大的盘，就先把宿主机的目录挂载进容器，再把暂存目录改成<strong class="text-slate-300">容器内的路径</strong>。
                         </div>
 
                         <div class="settings-storage-card">
                             <div class="settings-storage-card-head">
-                                <div class="settings-storage-card-title">已添加的位置</div>
-                                <button type="button" onclick="reloadStorageLocations()" class="px-3 py-2 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-xs">刷新</button>
+                                <div class="settings-storage-card-title">当前暂存目录</div>
+                                <button type="button" onclick="reloadStorageTempDir()" class="px-3 py-2 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-xs">刷新</button>
                             </div>
-                            <div id="settings-storage-list" class="settings-storage-list"></div>
+                            <div id="settings-storage-current" class="settings-storage-current">
+                                <div class="settings-storage-dir-path">读取中…</div>
+                                <div class="settings-storage-meta"></div>
+                            </div>
+                            <div class="settings-storage-actions-row">
+                                <button type="button" onclick="toggleStorageTempDirForm()" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">更换目录</button>
+                                <button type="button" id="settings-storage-reset" onclick="resetStorageTempDir()" class="hidden px-4 py-2 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-xs">恢复默认目录</button>
+                            </div>
                         </div>
 
-                        <div class="settings-storage-card">
-                            <div class="settings-storage-card-title">新增位置</div>
+                        <div id="settings-storage-form-card" class="settings-storage-card" hidden>
+                            <div class="settings-storage-card-title">更换暂存目录</div>
                             <div class="settings-storage-form mt-3">
                                 <label class="block min-w-0">
                                     <span class="text-xs text-slate-500">容器内路径</span>
-                                    <input id="settings-storage-new-path" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="例如 /app/storage">
+                                    <input id="settings-storage-dir-input" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="例如 /app/storage/cross_copy_tmp">
                                 </label>
-                                <label class="block min-w-0">
-                                    <span class="text-xs text-slate-500">名称（方便自己认）</span>
-                                    <input id="settings-storage-new-label" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如 4T 机械硬盘">
-                                </label>
-                                <button type="button" onclick="addStorageLocation()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">添加</button>
-                            </div>
-                            <div class="text-[11px] text-slate-500 mt-2 leading-5">点「添加」会先检查目录是否存在、能不能写、还剩多少空间；检查不通过不会保存。</div>
-                            <div id="settings-storage-add-status" class="hidden rounded-xl border px-4 py-3 text-sm leading-6 mt-2"></div>
-                        </div>
-
-                        <div class="settings-storage-card">
-                            <div class="settings-storage-card-title">跨盘复制用哪个位置暂存</div>
-                            <div class="settings-storage-form mt-3">
-                                <label class="block min-w-0">
-                                    <span class="text-xs text-slate-500">暂存位置</span>
-                                    <select id="settings-storage-temp-select" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1"></select>
-                                </label>
-                                <label class="block min-w-0">
-                                    <span class="text-xs text-slate-500">暂存子目录名</span>
-                                    <input id="settings-storage-temp-subdir" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="cross_copy_tmp" value="cross_copy_tmp">
-                                </label>
-                                <button type="button" onclick="saveStorageTempSetting()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">保存暂存设置</button>
+                                <button type="button" onclick="saveStorageTempDir()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">保存</button>
+                                <button type="button" onclick="toggleStorageTempDirForm()" class="px-4 py-3 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-sm">取消</button>
                             </div>
                             <div class="text-[11px] text-slate-500 mt-2 leading-5">
-                                实际落盘路径 = 所选位置 + 子目录。例如选 <code class="font-mono">/app/storage</code>、子目录 <code class="font-mono">cross_copy_tmp</code>，临时文件就放在 <code class="font-mono">/app/storage/cross_copy_tmp</code>。子目录只能填相对路径，不能以 <code class="font-mono">/</code> 开头，也不能用 <code class="font-mono">..</code> 跳到所选位置之外。
+                                填<strong class="text-slate-300">容器内</strong>的目录，默认是 <code class="font-mono">/app/config/cross_copy_tmp</code>。要用大盘，先在 compose 里把宿主机目录挂载进容器（例如把宿主机的 <code class="font-mono">/mnt/hdd</code> 挂到容器的 <code class="font-mono">/app/storage</code>），再填 <code class="font-mono">/app/storage/cross_copy_tmp</code>。保存前会检查目录是否存在、能不能写，检查不通过不会保存。
                             </div>
+                            <div id="settings-storage-form-status" class="settings-storage-status" hidden></div>
                         </div>
                     </div>
                 </section>
@@ -668,6 +661,17 @@
                             <input type="checkbox" id="notify_monitor_enabled" class="ui-checkbox">
                             启用文件夹监控生成成功推送（基于 `.strm` 路径/文件名匹配影视信息）
                         </label>
+                        <label class="flex items-center gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="cross_copy_notify_subscription" class="ui-checkbox">
+                            启用订阅补源的跨盘复制推送（成功/失败）
+                        </label>
+                        <label class="flex items-center gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="cross_copy_notify_manual" class="ui-checkbox">
+                            启用手动跨盘复制推送（成功/失败）
+                        </label>
+                        <div class="text-[11px] text-slate-500 leading-5">
+                            跨盘复制指从其他网盘复制文件到本网盘（如夸克 → 115）。按发起方式分两种：订阅补源是订阅任务自动发起的，手动复制是你在页面上自己点发起的，两种通知分开开关。
+                        </div>
                         <label class="block">
                             <span class="text-xs text-slate-500">通知渠道</span>
                             <select id="notify_channel" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" onchange="syncNotifyChannelUI()">
@@ -709,8 +713,8 @@
                         <details class="settings-help-fold">
                             <summary>查看说明：推送范围与去重规则</summary>
                             <div class="settings-help-fold-body">
-                                推送范围：订阅成功入库 + 文件夹监控成功生成 `.strm`（均可独立开关）。
-                                <br>失败、无更新、过滤跳过等情况保留在 Web 日志查看。
+                                推送范围：订阅成功入库、文件夹监控成功生成 `.strm`、跨盘复制结果（订阅补源/手动复制各一个开关，成功与失败都推）——均可独立开关。
+                                <br>其余失败、无更新、过滤跳过等情况保留在 Web 日志查看。
                                 <br>去重规则：任务名 + 集数 + 保存路径，避免同一更新重复提醒。
                             </div>
                         </details>

@@ -5,6 +5,7 @@
 """
 import hashlib
 import io
+import itertools
 import os
 import shutil
 import tempfile
@@ -703,3 +704,376 @@ class TestIdempotencyUsesFreshListing(unittest.TestCase):
         )
         self.assertEqual(result.status, "skipped")
         self.assertEqual(target.calls, [True])
+
+
+class TestResumePipeline(CrossCloudCopyTestBase):
+    """F2 引擎侧 resume 管道（0.15.1）：跳过下载 / 前缀续下 / upload_resume / 临时文件保留。"""
+
+    SEGMENT = 64 * 1024
+
+    def setUp(self):
+        super().setUp()
+        self.data = bytes(range(256)) * 1024 * 8  # 2MB，32 段
+        self.range_calls = []
+        # 基座的 get mock 按 get_responses 次序消费；这里换成线程安全的 Range 服务
+        patcher = patch(
+            "app.services.cross_cloud_copy.requests.get", side_effect=self._fake_get
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        for extra in (
+            patch.object(xcc, "DOWNLOAD_SEGMENT_BYTES", self.SEGMENT),
+            patch.object(xcc, "MEMORY_CHANNEL_THRESHOLD_BYTES", 1024),
+        ):
+            extra.start()
+            self.addCleanup(extra.stop)
+        self.temp_dir = tempfile.mkdtemp(prefix="xcopy-resume-")
+        self.addCleanup(shutil.rmtree, self.temp_dir, ignore_errors=True)
+        self.source = _FakeProvider(
+            "quark",
+            download_info={
+                "url": "https://x/r",
+                "size": len(self.data),
+                "file_name": "movie.mkv",
+            },
+        )
+        self.target = _FakeProvider(
+            "115", supports_upload=True, upload_result=_uploaded_result()
+        )
+
+    def _fake_get(self, url, stream=False, headers=None, timeout=None, **kwargs):
+        range_header = str((headers or {}).get("Range", "") or "")
+        if not range_header:
+            return _FakeResponse(200, _chunked(self.data))
+        start, _, end = range_header.replace("bytes=", "").partition("-")
+        start_i, end_i = int(start), int(end)
+        self.range_calls.append((start_i, end_i))
+        return _FakeResponse(206, _chunked(self.data[start_i:end_i + 1]))
+
+    def _copy_resume(self, resume, **overrides):
+        kwargs = {
+            "source_provider": self.source,
+            "target_provider": self.target,
+            "filename": "movie.mkv",
+            "size": len(self.data),
+            "temp_dir": self.temp_dir,
+            "resume": resume,
+        }
+        kwargs.update(overrides)
+        return self._copy(**kwargs)
+
+    def _write_temp_file(self, name, payload):
+        path = os.path.join(self.temp_dir, name)
+        with open(path, "wb") as fh:
+            fh.write(payload)
+        return path
+
+    def _resume_state(self, temp_path, *, sha1="", md5="", downloaded=0, upload=None):
+        return {
+            "temp_path": temp_path,
+            "size": len(self.data),
+            "sha1": sha1,
+            "md5": md5,
+            "downloaded_bytes": downloaded,
+            "upload": upload if upload is not None else {},
+        }
+
+    def _leftover_parts(self):
+        return [n for n in os.listdir(self.temp_dir) if n.startswith("xcopy-")]
+
+    # ---- 分支一：哈希已算 + 文件完整 → 完全跳过下载 ----
+
+    def test_resume_complete_skips_download(self):
+        temp_path = self._write_temp_file("xcopy-done.part", self.data)
+        resume = self._resume_state(
+            temp_path,
+            sha1=hashlib.sha1(self.data).hexdigest().upper(),
+            md5=hashlib.md5(self.data).hexdigest(),
+            downloaded=len(self.data),
+        )
+        with patch.object(
+            xcc, "_download_to_sink", side_effect=AssertionError("不应发生下载")
+        ) as spy:
+            result = self._copy_resume(resume)
+        spy.assert_not_called()
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.sha1, hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+        self.assertEqual(self.range_calls, [])  # 一个 Range 请求都没发
+        self.assertFalse(os.path.exists(temp_path))  # 成功即删
+
+    def test_resume_complete_with_stale_sha1_redownloads(self):
+        """sha1 非空但文件不完整（状态损坏）：按无哈希续传处理，重下后算哈希。"""
+        temp_path = self._write_temp_file("xcopy-stale.part", self.data[: self.SEGMENT])
+        resume = self._resume_state(
+            temp_path,
+            sha1=hashlib.sha1(b"stale-content").hexdigest().upper(),
+            downloaded=self.SEGMENT,
+        )
+        result = self._copy_resume(resume)
+        self.assertEqual(result.sha1, hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+        # 断点之后的段重下了（前缀不重下）
+        self.assertFalse([call for call in self.range_calls if call[0] < self.SEGMENT])
+        self.assertFalse(os.path.exists(temp_path))  # 成功即删
+
+    # ---- 分支二：无 sha1 → 从连续前缀续下剩余段 ----
+
+    def test_resume_without_sha1_continues_from_offset(self):
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-part.part", self.data[:prefix])
+        updates = []
+        resume = self._resume_state(temp_path, downloaded=prefix)
+        real_download = xcc._download_to_sink
+        seen = {}
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return real_download(**kwargs)
+
+        with patch.object(xcc, "_download_to_sink", side_effect=spy):
+            result = self._copy_resume(resume, on_resume_update=updates.append)
+        self.assertEqual(seen["start_offset"], prefix)
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.sha1, hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+        # 前缀区间没有重下（mock 计数断言），剩余段一个不少
+        self.assertFalse([call for call in self.range_calls if call[0] < prefix])
+        self.assertEqual(len(self.range_calls), (len(self.data) - prefix) // self.SEGMENT)
+        # 时机②：下载完成即把哈希写进 resume 并触发回调
+        self.assertEqual(resume["sha1"], result.sha1)
+        self.assertEqual(resume["md5"], hashlib.md5(self.data).hexdigest())
+        self.assertEqual(resume["downloaded_bytes"], len(self.data))
+        self.assertTrue(updates)
+        self.assertFalse(os.path.exists(temp_path))  # 成功即删
+
+    def test_resume_download_reports_prefix_progress(self):
+        """续传时 on_segment_done 上报的是「连续前缀」，downloaded_bytes 只增不减。"""
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-prog.part", self.data[:prefix])
+        snapshots = []
+
+        def capture(state):
+            snapshots.append(dict(state))
+
+        resume = self._resume_state(temp_path, downloaded=prefix)
+        # 节流 ≥1s：用每次 +2s 的假时钟让每段完成都触发一次回调
+        ticks = itertools.count(step=2.0)
+        with patch(
+            "app.services.cross_cloud_copy.time.monotonic", side_effect=lambda: next(ticks)
+        ):
+            self._copy_resume(resume, on_resume_update=capture)
+        # 24 个剩余段 + 哈希完成的一次
+        self.assertEqual(len(snapshots), (len(self.data) - prefix) // self.SEGMENT + 1)
+        self.assertEqual(snapshots[0]["downloaded_bytes"], prefix + self.SEGMENT)
+        self.assertEqual(snapshots[-1]["downloaded_bytes"], len(self.data))
+        self.assertEqual(snapshots[-1]["sha1"], hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(
+            [item["downloaded_bytes"] for item in snapshots],
+            sorted(item["downloaded_bytes"] for item in snapshots),
+        )
+
+    # ---- 分支三：resume 无效 → 按 None 处理 ----
+
+    def test_resume_invalid_fields_treated_as_none(self):
+        resume = {"temp_path": "", "size": "abc", "downloaded_bytes": None, "sha1": 5}
+        result = self._copy_resume(resume)
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.sha1, hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+        self.assertEqual(len(self.range_calls), len(self.data) // self.SEGMENT)
+
+    def test_resume_non_dict_treated_as_none(self):
+        result = self._copy_resume("not-a-dict")
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+
+    def test_resume_missing_temp_file_treated_as_none(self):
+        resume = self._resume_state(
+            os.path.join(self.temp_dir, "xcopy-gone.part"), downloaded=0
+        )
+        result = self._copy_resume(resume)
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+
+    def test_resume_size_mismatch_treated_as_none(self):
+        temp_path = self._write_temp_file("xcopy-mm.part", self.data)
+        resume = self._resume_state(temp_path, downloaded=0)
+        resume["size"] = len(self.data) + 1
+        result = self._copy_resume(resume)
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+
+    # ---- 上传会话透传与分片记账 ----
+
+    def test_upload_resume_passthrough_and_part_tracking(self):
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-up.part", self.data[:prefix])
+        part_lengths = []  # 回调当时的 parts 长度（list 会被后续 mutate，不能延迟求值）
+
+        def capture(state):
+            upload = state.get("upload") or {}
+            part_lengths.append(len(upload.get("parts") or []))
+
+        resume = self._resume_state(
+            temp_path,
+            downloaded=prefix,
+            upload={"provider": "115", "upload_id": "oss-1", "parts": []},
+        )
+
+        def uploading(
+            cookie,
+            sink,
+            filename,
+            target_dir_id="0",
+            *,
+            sha1="",
+            md5="",
+            size=-1,
+            progress_cb=None,
+            cancel_check=None,
+            upload_resume=None,
+            **kwargs,
+        ):
+            self.target.upload_calls.append(
+                {"filename": filename, "upload_resume": upload_resume}
+            )
+            callback = (upload_resume or {}).get("on_part_done")
+            callback(1, "etag-1")
+            callback(2, "etag-2")
+            callback(1, "etag-1")  # OSS 重试同一 part：按 PartNumber 去重
+            return _uploaded_result()
+
+        self.target.upload_file = uploading
+        self._copy_resume(resume, on_resume_update=capture)
+        # upload_resume 原样透传，on_part_done 由引擎挂上
+        self.assertEqual(self.target.upload_calls[0]["upload_resume"], resume["upload"])
+        self.assertTrue(callable(resume["upload"]["on_part_done"]))
+        # parts 按 PartNumber 去重记账，每次分片完成都触发一次续传更新
+        self.assertEqual(
+            resume["upload"]["parts"],
+            [{"PartNumber": 1, "ETag": "etag-1"}, {"PartNumber": 2, "ETag": "etag-2"}],
+        )
+        self.assertEqual(part_lengths[-3:], [1, 2, 2])  # 新增、新增、去重
+
+    def test_upload_resume_not_passed_without_resume(self):
+        """resume 为 None 时不能传 upload_resume 关键字参数（provider 旧签名无此参）。"""
+        captured = {}
+
+        def uploading(cookie, sink, filename, target_dir_id="0", **kwargs):
+            captured.update(kwargs)
+            return _uploaded_result()
+
+        self.target.upload_file = uploading
+        self._copy(
+            source_provider=self.source,
+            target_provider=self.target,
+            filename="movie.mkv",
+            size=len(self.data),
+            temp_dir=self.temp_dir,
+        )
+        self.assertNotIn("upload_resume", captured)
+
+    def test_precheck_uses_remaining_bytes_for_resume(self):
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-pre.part", self.data[:prefix])
+        resume = self._resume_state(temp_path, downloaded=prefix)
+        with patch.object(xcc, "_precheck_disk_space") as precheck:
+            self._copy_resume(resume)
+        precheck.assert_called_once_with(self.temp_dir, len(self.data) - prefix)
+
+    # ---- 临时文件保留规则（设计 §3.3） ----
+
+    def test_resume_run_failure_keeps_temp_file(self):
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-keep.part", self.data[:prefix])
+        resume = self._resume_state(temp_path, downloaded=prefix)
+        self.target.upload_result = UploadError(
+            "115 上传接口持续限流，请稍后再试", retriable=True, provider="115"
+        )
+        with self.assertRaises(xcc.CrossCloudCopyError):
+            self._copy_resume(resume)
+        # 失败保留（本地数据 + 上传会话都有继承价值）
+        self.assertTrue(os.path.exists(temp_path))
+        with open(temp_path, "rb") as fh:
+            self.assertEqual(fh.read(), self.data)
+
+    def test_cancel_keeps_temp_file(self):
+        prefix = 8 * self.SEGMENT
+        temp_path = self._write_temp_file("xcopy-cancel.part", self.data[:prefix])
+        resume = self._resume_state(temp_path, downloaded=prefix)
+
+        def cancel_check():
+            return len(self.range_calls) >= 3
+
+        with self.assertRaises(xcc.CrossCloudCopyCancelled):
+            self._copy_resume(resume, cancel_check=cancel_check)
+        self.assertTrue(os.path.exists(temp_path))
+
+    def test_fresh_run_zero_byte_failure_deletes_temp_file(self):
+        """全新运行：还没下到任何字节就失败 → 照旧删（并行预分配会让文件虚大，
+        保留判断必须按真实下载水位，不能只看文件大小）。"""
+
+        def failing_get(url, stream=False, headers=None, timeout=None, **kwargs):
+            raise requests.ConnectionError("boom")
+
+        with patch(
+            "app.services.cross_cloud_copy.requests.get", side_effect=failing_get
+        ):
+            with self.assertRaises(xcc.CrossCloudCopyError):
+                self._copy(
+                    source_provider=self.source,
+                    target_provider=self.target,
+                    filename="movie.mkv",
+                    size=len(self.data),
+                    temp_dir=self.temp_dir,
+                )
+        self.assertEqual(self._leftover_parts(), [])
+
+    def test_fresh_run_partial_failure_keeps_temp_file(self):
+        """全新运行（任务层形态：空骨架 + 落库回调）：下到一部分字节后失败 → 保留。"""
+        state = {"n": 0}
+
+        def flaky_get(url, stream=False, headers=None, timeout=None, **kwargs):
+            state["n"] += 1
+            if state["n"] <= 3:
+                return self._fake_get(url, stream=stream, headers=headers, timeout=timeout)
+            raise requests.ConnectionError("boom")
+
+        # 空骨架 = 还没有任何落盘数据，但有人记账（任务层能落库）
+        skeleton = {
+            "temp_path": "",
+            "size": len(self.data),
+            "sha1": "",
+            "md5": "",
+            "downloaded_bytes": 0,
+            "upload": {},
+        }
+        with patch("app.services.cross_cloud_copy.requests.get", side_effect=flaky_get):
+            with self.assertRaises(xcc.CrossCloudCopyError):
+                self._copy_resume(skeleton, on_resume_update=lambda s: None)
+        self.assertEqual(len(self._leftover_parts()), 1)
+        # 引擎把本次新建的临时文件认领进状态：重试才有路径可继承
+        self.assertTrue(skeleton["temp_path"].startswith(self.temp_dir))
+        self.assertGreater(skeleton["downloaded_bytes"], 0)
+
+    def test_fresh_run_without_recorder_deletes_temp_file(self):
+        """全新运行但没人记账（无 resume、无回调）：下了字节也不留（没人能继承）。"""
+        state = {"n": 0}
+
+        def flaky_get(url, stream=False, headers=None, timeout=None, **kwargs):
+            state["n"] += 1
+            if state["n"] <= 3:
+                return self._fake_get(url, stream=stream, headers=headers, timeout=timeout)
+            raise requests.ConnectionError("boom")
+
+        with patch("app.services.cross_cloud_copy.requests.get", side_effect=flaky_get):
+            with self.assertRaises(xcc.CrossCloudCopyError):
+                self._copy(
+                    source_provider=self.source,
+                    target_provider=self.target,
+                    filename="movie.mkv",
+                    size=len(self.data),
+                    temp_dir=self.temp_dir,
+                )
+        self.assertEqual(self._leftover_parts(), [])

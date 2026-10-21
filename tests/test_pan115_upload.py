@@ -35,6 +35,18 @@ class MemSink(io.BytesIO):
             self.sha1 = sha1
 
 
+class TrackingSink(MemSink):
+    """记录 seek 位置的内存数据源（断言续传跳过了已完成分片）。"""
+
+    def __init__(self, data: bytes, sha1: str = ""):
+        super().__init__(data, sha1=sha1)
+        self.seeks: list = []
+
+    def seek(self, offset, whence=0):
+        self.seeks.append(offset)
+        return super().seek(offset, whence)
+
+
 def _make_encrypted_response(payload: dict) -> bytes:
     """按服务端格式伪造加密响应：分块 LZ4（纯字面量）+ AES-CBC。"""
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -414,3 +426,224 @@ class TestPan115ProviderUploadDelegation(unittest.TestCase):
         self.assertEqual(captured["sha1"], "ABCDEF")
         self.assertEqual(captured["md5"], "0123456789abcdef0123456789abcdef")
         self.assertEqual(captured["size"], 4)
+
+
+class TestPan115UploadResume(unittest.TestCase):
+    """115 OSS 分片续传（设计文档 §3.4）：首run 记会话、续run 对账跳分片。"""
+
+    PART_SIZE = 10 * 1024 * 1024
+    # 10MB + 1024B → part_size_mb=10 时恰好 2 片
+    BIG_DATA = b"z" * (10 * 1024 * 1024 + 1024)
+
+    def setUp(self):
+        self._patches = [
+            patch.object(pan115, "get_115_user_upload_info", side_effect=_ok_upload_info),
+            patch.object(pan115, "mark_cookie_health_success"),
+            patch.object(pan115, "mark_cookie_health_failure"),
+        ]
+        for p in self._patches:
+            p.start()
+        pan115._115_upload_user_info_cache.clear()
+
+    def tearDown(self):
+        for p in self._patches:
+            p.stop()
+
+    def _init_resp(self, **extra):
+        data = {"status": 1, "bucket": "fhnfile", "object": "obj-key", "callback": {"callback": "{}", "callback_var": "{}"}}
+        data.update(extra)
+        return {"state": True, "data": data}
+
+    def _sha1(self):
+        return hashlib.sha1(self.BIG_DATA).hexdigest().upper()
+
+    def _session(self, upload_id="up-r1", parts=None):
+        return {
+            "provider": "115",
+            "fields": {
+                "bucket": "fhnfile",
+                "object": "obj-key",
+                "callback": {"callback": "{}", "callback_var": "{}"},
+                "pickcode": "pc-r",
+            },
+            "upload_id": upload_id,
+            "parts": parts if parts is not None else [],
+        }
+
+    def test_first_run_records_session_and_reports_parts(self):
+        """首run：分片初始化后把会话写回 upload_resume；每片完成回调上报。"""
+        done_calls = []
+        upload_resume = {"upload": {}, "on_part_done": lambda n, e: done_calls.append((n, e))}
+        with patch.object(pan115, "_upload_115_initupload", return_value=self._init_resp()), \
+             patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_multipart_init", return_value="up-new") as m_init, \
+             patch.object(pan115, "_oss_upload_part", side_effect=["e1", "e2"]), \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None):
+            result = pan115.upload_115_file(
+                "cookie", TrackingSink(self.BIG_DATA, sha1=self._sha1()), "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        self.assertEqual(result.status, "uploaded")
+        m_init.assert_called_once()
+        session = upload_resume["upload"]
+        self.assertEqual(session["provider"], "115")
+        self.assertEqual(session["upload_id"], "up-new")
+        self.assertEqual(session["fields"]["object"], "obj-key")
+        # 有引擎回调时分片进度由引擎记录，provider 只上报
+        self.assertEqual(session["parts"], [])
+        self.assertEqual(done_calls, [(1, "e1"), (2, "e2")])
+
+    def test_first_run_without_callback_accumulates_parts(self):
+        """没有引擎回调时，provider 自己把分片进度写回会话（终态可续传）。"""
+        upload_resume = {"upload": {}}
+        with patch.object(pan115, "_upload_115_initupload", return_value=self._init_resp()), \
+             patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_multipart_init", return_value="up-new"), \
+             patch.object(pan115, "_oss_upload_part", side_effect=["e1", "e2"]), \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None):
+            pan115.upload_115_file(
+                "cookie", TrackingSink(self.BIG_DATA, sha1=self._sha1()), "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        self.assertEqual(
+            upload_resume["upload"]["parts"],
+            [{"PartNumber": 1, "ETag": "e1"}, {"PartNumber": 2, "ETag": "e2"}],
+        )
+
+    def test_resume_skips_completed_parts(self):
+        """续run：跳过 initupload/init，OSS 实测分片对账，只传剩余分片。"""
+        listed = [{"PartNumber": 1, "ETag": "e1", "Size": self.PART_SIZE}]
+        recorded = [{"PartNumber": 1, "ETag": "e-old"}]
+        upload_resume = {"upload": self._session(parts=recorded)}
+        part_calls = []
+        sink = TrackingSink(self.BIG_DATA, sha1=self._sha1())
+        with patch.object(pan115, "_upload_115_initupload") as m_init, \
+             patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN) as m_token, \
+             patch.object(pan115, "_oss_multipart_init") as m_mp_init, \
+             patch.object(pan115, "_oss_list_parts", return_value=listed) as m_list, \
+             patch.object(
+                 pan115, "_oss_upload_part",
+                 side_effect=lambda *a: part_calls.append((a[5], len(a[6]))) or "e2",
+             ) as m_part, \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None) as m_done:
+            result = pan115.upload_115_file(
+                "cookie", sink, "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        self.assertEqual(result.status, "uploaded")
+        # 秒传探测与分片初始化都不该发生；token 必须重取（短时效）
+        m_init.assert_not_called()
+        m_mp_init.assert_not_called()
+        m_list.assert_called_once()
+        self.assertTrue(m_token.called)
+        # 只传了第 2 片，且从正确偏移读（跳过第 1 片的 10MB）
+        self.assertEqual(m_part.call_count, 1)
+        self.assertEqual(part_calls, [(2, 1024)])
+        self.assertIn(self.PART_SIZE, sink.seeks)
+        # complete 的 parts 完整有序，第 1 片 ETag 以 OSS 实测为准
+        parts = m_done.call_args[0][5]
+        self.assertEqual(parts, [
+            {"PartNumber": 1, "ETag": "e1"},
+            {"PartNumber": 2, "ETag": "e2"},
+        ])
+        # 对账后的分片列表写回会话
+        self.assertEqual(upload_resume["upload"]["parts"], parts)
+
+    def test_resume_falls_back_to_recorded_parts_when_list_fails(self):
+        """_oss_list_parts 拉不到（返回空）时退回本地记录，已记的分片仍跳过。"""
+        listed = []
+        recorded = [{"PartNumber": 1, "ETag": "e-old"}]
+        upload_resume = {"upload": self._session(parts=recorded)}
+        part_calls = []
+        sink = TrackingSink(self.BIG_DATA, sha1=self._sha1())
+        with patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_list_parts", return_value=listed), \
+             patch.object(
+                 pan115, "_oss_upload_part",
+                 side_effect=lambda *a: part_calls.append(a[5]) or "e2",
+             ) as m_part, \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None) as m_done:
+            pan115.upload_115_file(
+                "cookie", sink, "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        self.assertEqual(part_calls, [2])
+        parts = m_done.call_args[0][5]
+        self.assertEqual(parts, [
+            {"PartNumber": 1, "ETag": "e-old"},
+            {"PartNumber": 2, "ETag": "e2"},
+        ])
+
+    def test_resume_all_parts_done_completes_immediately(self):
+        """全部片已在 OSS：不再上传任何分片，直接合并。"""
+        listed = [
+            {"PartNumber": 1, "ETag": "e1", "Size": self.PART_SIZE},
+            {"PartNumber": 2, "ETag": "e2", "Size": 1024},
+        ]
+        upload_resume = {"upload": self._session(parts=[])}
+        with patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_list_parts", return_value=listed), \
+             patch.object(pan115, "_oss_upload_part") as m_part, \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None) as m_done:
+            result = pan115.upload_115_file(
+                "cookie", TrackingSink(self.BIG_DATA, sha1=self._sha1()), "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        self.assertEqual(result.status, "uploaded")
+        m_part.assert_not_called()
+        parts = m_done.call_args[0][5]
+        self.assertEqual([p["ETag"] for p in parts], ["e1", "e2"])
+
+    def test_resume_reports_new_parts_via_callback(self):
+        """续run 新完成的分片同样走 on_part_done 上报。"""
+        listed = [{"PartNumber": 1, "ETag": "e1", "Size": self.PART_SIZE}]
+        done_calls = []
+        upload_resume = {
+            "upload": self._session(parts=[{"PartNumber": 1, "ETag": "e1"}]),
+            "on_part_done": lambda n, e: done_calls.append((n, e)),
+        }
+        with patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN), \
+             patch.object(pan115, "_oss_list_parts", return_value=listed), \
+             patch.object(pan115, "_oss_upload_part", return_value="e2"), \
+             patch.object(pan115, "_oss_multipart_complete", return_value=None):
+            pan115.upload_115_file(
+                "cookie", TrackingSink(self.BIG_DATA, sha1=self._sha1()), "big.mkv", "0",
+                size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                upload_resume=upload_resume,
+            )
+        # 只上报新传的第 2 片；第 1 片是上次传的，不重复上报
+        self.assertEqual(done_calls, [(2, "e2")])
+
+    def test_resume_missing_upload_id_raises(self):
+        """会话字段不全（缺 upload_id）按明确错误抛出，不静默重传。"""
+        upload_resume = {"upload": {"fields": {"bucket": "b", "object": "k"}}}
+        with patch.object(pan115, "_upload_115_get_token", return_value=FAKE_TOKEN):
+            with self.assertRaises(UploadError) as ctx:
+                pan115.upload_115_file(
+                    "cookie", TrackingSink(self.BIG_DATA, sha1=self._sha1()), "big.mkv", "0",
+                    size=len(self.BIG_DATA), sha1=self._sha1(), part_size_mb=10,
+                    upload_resume=upload_resume,
+                )
+        self.assertIn("upload_id", str(ctx.exception))
+
+    def test_provider_forwards_upload_resume(self):
+        """Pan115Provider.upload_file 把 upload_resume 透传给 upload_115_file。"""
+        provider = pan115.Pan115Provider()
+        captured = {}
+        handle = {"upload": {"upload_id": "up-x"}}
+
+        def fake_upload(cookie, sink, filename, target_dir_id="0", **kwargs):
+            captured.update(kwargs)
+            return UploadResult(status="uploaded", name=filename, size=4)
+
+        with patch.object(pan115, "upload_115_file", side_effect=fake_upload):
+            provider.upload_file(
+                "cookie", io.BytesIO(b"blat"), "probe.bin", "dir-1",
+                sha1="ABCDEF", size=4, upload_resume=handle,
+            )
+        self.assertIs(captured["upload_resume"], handle)

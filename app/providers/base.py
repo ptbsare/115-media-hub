@@ -289,6 +289,7 @@ class CloudProvider(ABC):
         size: int = -1,
         progress_cb=None,
         cancel_check=None,
+        upload_resume: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ) -> "UploadResult":
         """把 sink 中的数据上传到网盘目录。
@@ -301,6 +302,11 @@ class CloudProvider(ABC):
         :param size: 文件总大小；为 -1 时由 sink.size 提供
         :param progress_cb: 进度回调 fn(sent_bytes, total_bytes)
         :param cancel_check: 取消检查 fn() -> bool，返回 True 时中止上传
+        :param upload_resume: 断点续传句柄（跨盘复制任务层传入的 resume 状态）。
+            仅有 115 消费：其中带上次上传会话（fields/upload_id/parts）时跳过
+            initupload 与分片初始化，实测分片对账后续传；其他 provider 忽略
+            （参数留着，行为同现状——夸克 pre 会话 / 阿里预签名 URL 的跨进程
+            复用未经真机验证，本期不做；本地数据已保留，下载不重来）。
         """
         raise NotImplementedError(f"{self.label} 不支持上传")
 
