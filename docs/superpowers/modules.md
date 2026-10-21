@@ -134,7 +134,7 @@
 | `app/services/cross_cloud_copy.py` | 跨盘复制引擎（P0-B）：源直链下载（并行分段，`CROSS_COPY_DOWNLOAD_PARALLEL`，落盘后顺序算哈希）+ 同步 SHA1/MD5 + 内存/磁盘双通道 + 目标秒传/分片上传 + 取消/换链重试/幂等/孤儿清理；零流量路径（源端已知哈希 + 惰性 sink，秒传命中不下载）与断点续传管道（resume 状态就地更新 + on_resume_update 上报 + 失败保留临时文件） |
 | `app/services/cross_cloud_copy_folder.py` | 整文件夹跨盘复制：BFS 递归建清单（上限 2000 文件 / 20 层，超限拒绝）、目标端逐级建目录、字节加权进度、单文件失败继续并汇总 partial |
 | `app/services/media_hash_cache.py` | 文件哈希备忘录（media_hash_cache）：按 (provider, file_id) 沉淀已确认的 SHA1，查缓存校验 size、30 天过期，供跨盘复制复用零流量秒传；缓存故障不影响复制主流程 |
-| `app/services/local_storage.py` | 本地暂存目录管理：容器内路径归一化、默认目录（config 卷下 `cross_copy_tmp`）、旧位置列表配置迁移、目录可用性探测、暂存目录解析、磁盘空间预检 |
+| `app/services/local_storage.py` | 本地暂存目录管理：容器内路径归一化、默认目录（config 卷下 `cross_copy_tmp`）、旧位置列表配置迁移、目录可用性探测、暂存目录解析、磁盘空间预检；挂载点枚举（解析 `/proc/mounts`，区分「真实挂载盘 / 容器可写层」）、候选目录列表、受控建目录（只允许在已挂载盘里建，防止把宿主机路径建成容器层目录） |
 | `app/services/cross_copy_resume.py` | 跨盘复制断点续传状态管理：运行前校验（临时文件在/前缀完整/复探源哈希防旧内容上传）、全新骨架构造、可继承性判断、落库净化（深拷贝并剔除 on_part_done 等运行时字段，保证状态可 JSON 序列化）、作废与孤儿清理联动 |
 | `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知（按 origin 选订阅补源/手动开关）/ 记录清除与自动裁剪 / 断点续传生命周期（骨架落库、终态保底、成功清除） |
 | `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |

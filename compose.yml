@@ -9,7 +9,11 @@ services:
       - /Users/xianer/Documents/docker/115strmxianer/strm:/app/strm
       - /Users/xianer/Documents/docker/115strmxianer/logs:/app/logs
       - /Users/xianer/Documents/docker/115strmxianer/config:/app/config
-      # 额外存储（跨盘复制暂存区用；按需改为你的机械硬盘/NAS 路径，不映射则暂存落在 config 卷）
+      # 额外存储（跨盘复制暂存区用）。/app/storage 这个路径没有被其它功能占用，可以直接拿它当挂载点：
+      #   1) 取消下面一行的注释，把左边换成你的大盘 / 机械硬盘 / NAS 路径
+      #   2) 重建容器：docker compose up -d --force-recreate
+      #   3) 设置页「参数配置 → 本地存储位置 → 更换目录」，列表里会自动出现它，点一下选中保存
+      # macOS 用 /Volumes/media，Linux/NAS 用 /mnt/hdd 这类路径。不映射也能用：暂存默认落在 config 卷。
       # - /Volumes/media:/app/storage
 
     ports:

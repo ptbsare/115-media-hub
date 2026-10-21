@@ -275,7 +275,7 @@
                             跨盘复制（比如从 115 复制到其它网盘）时，大文件没法直接对传，会先完整下载到下面的目录，再上传到目标网盘，传完自动清理临时文件。所以这个目录要放在容量够大、剩余空间足够的盘上。
                         </div>
                         <div class="text-xs text-slate-500 leading-6">
-                            不配置也能用：默认放在 config 卷下的 <code class="font-mono">cross_copy_tmp</code> 目录。想换成容量更大的盘，就先把宿主机的目录挂载进容器，再把暂存目录改成<strong class="text-slate-300">容器内的路径</strong>。
+                            不配置也能用：默认放在 config 卷下的 <code class="font-mono">cross_copy_tmp</code> 目录。想换成容量更大的盘，就先把宿主机的目录挂载进容器（例如 <code class="font-mono">/mnt/hdd → /app/storage</code>），重建容器后回到这里点「更换目录」，扫出来的列表里会直接出现它，点一下就行，不用自己记路径。
                         </div>
 
                         <div class="settings-storage-card">
@@ -287,6 +287,7 @@
                                 <div class="settings-storage-dir-path">读取中…</div>
                                 <div class="settings-storage-meta"></div>
                             </div>
+                            <div id="settings-storage-warning" class="settings-storage-warning" hidden></div>
                             <div class="settings-storage-actions-row">
                                 <button type="button" onclick="toggleStorageTempDirForm()" class="px-4 py-2 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">更换目录</button>
                                 <button type="button" id="settings-storage-reset" onclick="resetStorageTempDir()" class="hidden px-4 py-2 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-xs">恢复默认目录</button>
@@ -295,17 +296,30 @@
 
                         <div id="settings-storage-form-card" class="settings-storage-card" hidden>
                             <div class="settings-storage-card-title">更换暂存目录</div>
-                            <div class="settings-storage-form mt-3">
-                                <label class="block min-w-0">
-                                    <span class="text-xs text-slate-500">容器内路径</span>
-                                    <input id="settings-storage-dir-input" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="例如 /app/storage/cross_copy_tmp">
-                                </label>
+                            <div class="settings-storage-hint">
+                                下面是容器里能用的目录，点一个选中再保存。列表带剩余空间，挂载了新盘只要重建容器、回来点「重新扫描」就能看到。
+                            </div>
+                            <div id="settings-storage-candidates" class="settings-storage-candidates">
+                                <div class="settings-storage-empty">正在扫描容器里的目录…</div>
+                            </div>
+                            <div class="settings-storage-actions-row">
                                 <button type="button" onclick="saveStorageTempDir()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">保存</button>
+                                <button type="button" onclick="rescanStorageCandidates()" class="px-4 py-3 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-sm">重新扫描</button>
                                 <button type="button" onclick="toggleStorageTempDirForm()" class="px-4 py-3 rounded-lg bg-slate-700/60 hover:bg-slate-600/60 text-sm">取消</button>
                             </div>
-                            <div class="text-[11px] text-slate-500 mt-2 leading-5">
-                                填<strong class="text-slate-300">容器内</strong>的目录，默认是 <code class="font-mono">/app/config/cross_copy_tmp</code>。要用大盘，先在 compose 里把宿主机目录挂载进容器（例如把宿主机的 <code class="font-mono">/mnt/hdd</code> 挂到容器的 <code class="font-mono">/app/storage</code>），再填 <code class="font-mono">/app/storage/cross_copy_tmp</code>。保存前会检查目录是否存在、能不能写，检查不通过不会保存。
-                            </div>
+                            <details class="settings-storage-manual">
+                                <summary>扫描不到要用的目录？手动填容器内路径</summary>
+                                <div class="settings-storage-form mt-3">
+                                    <label class="block min-w-0">
+                                        <span class="text-xs text-slate-500">容器内路径</span>
+                                        <input id="settings-storage-dir-input" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1 font-mono" placeholder="例如 /app/storage/cross_copy_tmp">
+                                    </label>
+                                    <button type="button" onclick="saveStorageTempDirFromInput()" class="px-4 py-3 rounded-xl bg-sky-600 hover:bg-sky-500 text-white text-sm font-bold">用这个路径</button>
+                                </div>
+                                <div class="text-[11px] text-slate-500 mt-2 leading-5">
+                                    填<strong class="text-slate-300">容器内</strong>的目录，不是宿主机的路径。把宿主机 <code class="font-mono">/mnt/hdd</code> 挂到容器 <code class="font-mono">/app/storage</code> 之后，这里要填 <code class="font-mono">/app/storage</code> 或它下面的子目录，填 <code class="font-mono">/mnt/hdd</code> 是找不到的。保存前会检查目录存在、能不能写；目录不存在时只在已挂载的盘里自动建，不会往容器临时层里建。
+                                </div>
+                            </details>
                             <div id="settings-storage-form-status" class="settings-storage-status" hidden></div>
                         </div>
                     </div>

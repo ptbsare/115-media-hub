@@ -2464,6 +2464,163 @@
             height: 1px;
             background: linear-gradient(90deg, rgba(56, 189, 248, 0.32), transparent 52%);
         }
+        /* ---- 跨盘复制暂存目录（选目录 + 手动兜底） ---- */
+        .settings-storage-card {
+            border-radius: 1rem;
+            border: 1px solid rgba(51, 65, 85, 0.95);
+            background: rgba(15, 23, 42, 0.72);
+            padding: 0.9rem;
+            display: flex;
+            flex-direction: column;
+            gap: 0.7rem;
+        }
+        .settings-storage-card-head {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 0.75rem;
+        }
+        .settings-storage-card-title {
+            font-size: 0.78rem;
+            font-weight: 800;
+            color: #e2e8f0;
+        }
+        .settings-storage-hint {
+            font-size: 0.72rem;
+            line-height: 1.6;
+            color: #94a3b8;
+        }
+        .settings-storage-current {
+            display: flex;
+            flex-direction: column;
+            gap: 0.3rem;
+        }
+        .settings-storage-dir-path {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.86rem;
+            font-weight: 700;
+            color: #7dd3fc;
+            word-break: break-all;
+        }
+        .settings-storage-meta { font-size: 0.72rem; color: #94a3b8; }
+        .settings-storage-meta.is-bad { color: #f87171; }
+        .settings-storage-warning {
+            border-radius: 0.7rem;
+            border: 1px solid rgba(245, 158, 11, 0.42);
+            background: rgba(120, 53, 15, 0.28);
+            padding: 0.55rem 0.7rem;
+            font-size: 0.72rem;
+            line-height: 1.65;
+            color: #fcd34d;
+        }
+        .settings-storage-actions-row {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.5rem;
+            align-items: center;
+        }
+        .settings-storage-form {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 0.6rem;
+            align-items: flex-end;
+        }
+        .settings-storage-form > label { flex: 1 1 16rem; }
+        .settings-storage-candidates {
+            display: flex;
+            flex-direction: column;
+            gap: 0.45rem;
+        }
+        .settings-storage-candidate {
+            display: block;
+            width: 100%;
+            text-align: left;
+            border-radius: 0.75rem;
+            border: 1px solid rgba(51, 65, 85, 0.95);
+            background: rgba(2, 6, 23, 0.45);
+            padding: 0.6rem 0.7rem;
+            transition: border-color 0.16s ease, background-color 0.16s ease;
+            cursor: pointer;
+        }
+        .settings-storage-candidate:hover:not(:disabled) {
+            border-color: rgba(56, 189, 248, 0.55);
+            background: rgba(8, 47, 73, 0.42);
+        }
+        .settings-storage-candidate.is-selected {
+            border-color: rgba(56, 189, 248, 0.85);
+            background: rgba(8, 47, 73, 0.6);
+            box-shadow: inset 0 0 0 1px rgba(56, 189, 248, 0.35);
+        }
+        .settings-storage-candidate.is-bad,
+        .settings-storage-candidate:disabled {
+            opacity: 0.6;
+            cursor: not-allowed;
+        }
+        .settings-storage-candidate-head {
+            display: flex;
+            flex-wrap: wrap;
+            align-items: center;
+            gap: 0.4rem;
+        }
+        .settings-storage-candidate-path {
+            font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+            font-size: 0.8rem;
+            font-weight: 700;
+            color: #e2e8f0;
+            word-break: break-all;
+        }
+        .settings-storage-candidate-meta { margin-top: 0.25rem; font-size: 0.7rem; color: #94a3b8; }
+        .settings-storage-candidate-note { margin-top: 0.2rem; font-size: 0.68rem; color: #64748b; }
+        .settings-storage-badge {
+            border-radius: 999px;
+            border: 1px solid rgba(100, 116, 139, 0.6);
+            background: rgba(30, 41, 59, 0.8);
+            padding: 0.05rem 0.42rem;
+            font-size: 0.62rem;
+            font-weight: 700;
+            color: #cbd5e1;
+        }
+        .settings-storage-badge.is-default {
+            border-color: rgba(56, 189, 248, 0.55);
+            background: rgba(8, 47, 73, 0.75);
+            color: #7dd3fc;
+        }
+        .settings-storage-empty {
+            border-radius: 0.75rem;
+            border: 1px dashed rgba(71, 85, 105, 0.8);
+            padding: 0.7rem;
+            font-size: 0.72rem;
+            color: #94a3b8;
+        }
+        .settings-storage-manual {
+            border-top: 1px solid rgba(51, 65, 85, 0.7);
+            padding-top: 0.6rem;
+        }
+        .settings-storage-manual > summary {
+            cursor: pointer;
+            font-size: 0.72rem;
+            color: #94a3b8;
+        }
+        .settings-storage-manual > summary:hover { color: #cbd5e1; }
+        .settings-storage-status {
+            border-radius: 0.7rem;
+            border: 1px solid rgba(51, 65, 85, 0.9);
+            background: rgba(15, 23, 42, 0.8);
+            padding: 0.55rem 0.7rem;
+            font-size: 0.72rem;
+            line-height: 1.6;
+            color: #cbd5e1;
+        }
+        .settings-storage-status.is-bad {
+            border-color: rgba(248, 113, 113, 0.42);
+            background: rgba(69, 10, 10, 0.35);
+            color: #fca5a5;
+        }
+        .settings-storage-status.is-ok {
+            border-color: rgba(52, 211, 153, 0.4);
+            background: rgba(6, 78, 59, 0.3);
+            color: #6ee7b7;
+        }
         .settings-info-note {
             padding: 0.75rem;
             border: 1px solid rgba(51, 65, 85, 0.95);
@@ -17011,6 +17168,68 @@
         }
         html.theme-day .settings-help-fold > summary { color: #475569; }
         html.theme-day .settings-help-fold[open] > summary { border-bottom-color: #dbe4ee; }
+        html.theme-day .settings-storage-card {
+            border-color: #dbe4ee;
+            background: rgba(248, 250, 252, 0.95);
+        }
+        html.theme-day .settings-storage-card-title { color: #0f172a; }
+        html.theme-day .settings-storage-hint { color: #64748b; }
+        html.theme-day .settings-storage-dir-path { color: #0369a1; }
+        html.theme-day .settings-storage-meta { color: #64748b; }
+        html.theme-day .settings-storage-meta.is-bad { color: #dc2626; }
+        html.theme-day .settings-storage-warning {
+            border-color: rgba(217, 119, 6, 0.35);
+            background: #fffbeb;
+            color: #92400e;
+        }
+        html.theme-day .settings-storage-candidate {
+            border-color: #dbe4ee;
+            background: #ffffff;
+        }
+        html.theme-day .settings-storage-candidate:hover:not(:disabled) {
+            border-color: #7dd3fc;
+            background: #f0f9ff;
+        }
+        html.theme-day .settings-storage-candidate.is-selected {
+            border-color: #0ea5e9;
+            background: #e0f2fe;
+            box-shadow: inset 0 0 0 1px rgba(14, 165, 233, 0.28);
+        }
+        html.theme-day .settings-storage-candidate-path { color: #0f172a; }
+        html.theme-day .settings-storage-candidate-meta { color: #64748b; }
+        html.theme-day .settings-storage-candidate-note { color: #94a3b8; }
+        html.theme-day .settings-storage-badge {
+            border-color: #cbd5e1;
+            background: #f1f5f9;
+            color: #475569;
+        }
+        html.theme-day .settings-storage-badge.is-default {
+            border-color: #7dd3fc;
+            background: #e0f2fe;
+            color: #0369a1;
+        }
+        html.theme-day .settings-storage-empty {
+            border-color: #cbd5e1;
+            color: #64748b;
+        }
+        html.theme-day .settings-storage-manual { border-top-color: #e2e8f0; }
+        html.theme-day .settings-storage-manual > summary { color: #475569; }
+        html.theme-day .settings-storage-manual > summary:hover { color: #0f172a; }
+        html.theme-day .settings-storage-status {
+            border-color: #dbe4ee;
+            background: #f8fafc;
+            color: #334155;
+        }
+        html.theme-day .settings-storage-status.is-bad {
+            border-color: #fecaca;
+            background: #fef2f2;
+            color: #b91c1c;
+        }
+        html.theme-day .settings-storage-status.is-ok {
+            border-color: #bbf7d0;
+            background: #f0fdf4;
+            color: #15803d;
+        }
         @media (max-width: 767px) {
             .settings-section-navbar {
                 flex-direction: column;

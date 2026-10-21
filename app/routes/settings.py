@@ -25,8 +25,11 @@ from ..services.sign115 import refresh_sign115_status, run_sign115_job
 from ..services.local_storage import (
     _normalize_container_path,
     default_temp_dir,
+    detect_storage_tier,
+    list_storage_candidates,
     probe_storage_path,
     resolve_temp_dir,
+    storage_tier_warning,
 )
 
 router = APIRouter()
@@ -98,15 +101,26 @@ async def save_settings_endpoint(request: Request) -> Dict[str, Any]:
 
 @router.get("/storage/temp-dir")
 async def get_storage_temp_dir(request: Request) -> Dict[str, Any]:
-    """读取跨盘复制暂存目录与实时空间状态。"""
+    """读取跨盘复制暂存目录、空间状态，以及容器里可选的挂载点列表。
+
+    挂载点列表是「选目录」的数据源：用户只要在 compose 里多挂一块盘，刷新
+    这里就能看到它，不用记容器内路径。
+    """
     cfg = get_config()
     target = resolve_temp_dir(cfg)
+    listing = list_storage_candidates(cfg)
+    tier = listing["tier"]
     return {
         "ok": True,
         "dir": target,
         "is_default": not str(cfg.get("cross_copy_temp_dir", "") or "").strip(),
         "default_dir": default_temp_dir(),
         "probe": probe_storage_path(target),
+        "tier": tier,
+        "warning": storage_tier_warning(tier),
+        "candidates": listing["candidates"],
+        "scan_supported": listing["supported"],
+        "container_layer": listing["container_layer"],
     }
 
 
@@ -116,34 +130,49 @@ async def save_storage_temp_dir(request: Request) -> JSONResponse:
 
     设置页改暂存目录很频繁，走 /save_settings 会连带整份配置归一化和保存后
     的健康检查，代价过大，所以单独开一个最小接口。保存前校验目录存在且可写；
-    旧版「位置列表」字段由配置归一化一次性清理。
+    ``create=true`` 时允许在已挂载的磁盘里自动建子目录（挂载点是空盘时省掉
+    手动 mkdir），但绝不在容器临时层里建。旧版「位置列表」字段由配置归一化
+    一次性清理。
     """
     incoming = await request.json()
     payload = incoming if isinstance(incoming, dict) else {}
     raw = str(payload.get("path", "") or "").strip()
+    create_missing = bool(payload.get("create"))
     cfg = get_config()
 
     if not raw:
         save_config({**cfg, "cross_copy_temp_dir": ""})
         target = default_temp_dir()
+        tier = detect_storage_tier(target)
         return JSONResponse(
             content={
                 "ok": True,
                 "dir": target,
                 "is_default": True,
                 "default_dir": target,
-                "probe": probe_storage_path(target),
+                "probe": probe_storage_path(target, create_missing=True),
+                "tier": tier,
+                "warning": storage_tier_warning(tier),
             }
         )
 
     path = _normalize_container_path(raw)
     if not path:
         return JSONResponse(status_code=400, content={"ok": False, "msg": "路径不合法：需为容器内的绝对路径"})
-    probe = probe_storage_path(path)
+    probe = probe_storage_path(path, create_missing=create_missing)
     if not probe["ok"]:
         return JSONResponse(status_code=400, content={"ok": False, "msg": probe["error"] or "目录不可用"})
     save_config({**cfg, "cross_copy_temp_dir": path})
-    return JSONResponse(content={"ok": True, "dir": path, "is_default": False, "probe": probe})
+    return JSONResponse(
+        content={
+            "ok": True,
+            "dir": path,
+            "is_default": False,
+            "probe": probe,
+            "tier": probe.get("tier", "unknown"),
+            "warning": storage_tier_warning(str(probe.get("tier") or "")),
+        }
+    )
 
 
 @router.get("/settings/cookies/status")

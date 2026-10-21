@@ -10,7 +10,19 @@ let latestSettingsSensitiveMeta = {};
 const cookieHealthBusyProviders = new Set();
 
 // 本地暂存目录（跨盘复制）的最近一次读取结果，供当前目录卡片和分区摘要共用
-let latestStorageState = { dir: '', isDefault: true, defaultDir: '', probe: null };
+let latestStorageState = {
+    dir: '',
+    isDefault: true,
+    defaultDir: '',
+    probe: null,
+    tier: 'unknown',
+    warning: '',
+    candidates: [],
+    scanSupported: true,
+    containerLayer: null,
+    // 候选列表里当前选中的目录（未保存），保存时提交它
+    pendingPath: '',
+};
 let storageActionBusy = false;
 
 const SETTINGS_OPEN_SECTION_STORAGE_KEY = 'settings-open-section';
@@ -1626,10 +1638,73 @@ function storageProbeMetaText(probe) {
     return `可用 · 剩余 ${formatStorageBytes(probe.free_bytes)} / 共 ${formatStorageBytes(probe.total_bytes)}`;
 }
 
+// 接口返回统一装配到 latestStorageState；keepPending=true 保留用户尚未保存的选择
+function applyStorageStatePayload(data, { keepPending = true } = {}) {
+    const previousPending = keepPending ? String(latestStorageState.pendingPath || '').trim() : '';
+    latestStorageState = {
+        dir: String(data?.dir || '').trim(),
+        isDefault: !!data?.is_default,
+        defaultDir: String(data?.default_dir || latestStorageState.defaultDir || '').trim(),
+        probe: data?.probe || null,
+        tier: String(data?.tier || 'unknown'),
+        warning: String(data?.warning || ''),
+        candidates: Array.isArray(data?.candidates) ? data.candidates : [],
+        scanSupported: data?.scan_supported !== false,
+        containerLayer: data?.container_layer || null,
+        pendingPath: previousPending,
+    };
+}
+
+// 渲染容器里扫出来的候选目录：点一个选中，保存时提交
+function renderStorageCandidates() {
+    const box = document.getElementById('settings-storage-candidates');
+    if (!box) return;
+    const list = Array.isArray(latestStorageState.candidates) ? latestStorageState.candidates : [];
+    if (!latestStorageState.scanSupported) {
+        box.innerHTML = '<div class="settings-storage-empty">这个环境读不到容器挂载信息，只能用下面的方式手动填路径。</div>';
+        return;
+    }
+    if (!list.length) {
+        box.innerHTML = '<div class="settings-storage-empty">没扫到可用目录。刚挂载了新盘的话，重建容器后再点「重新扫描」。</div>';
+        return;
+    }
+    const selected = String(latestStorageState.pendingPath || latestStorageState.dir || '').trim();
+    box.innerHTML = list.map((item) => {
+        const path = String(item?.path || '');
+        const ok = item?.ok !== false;
+        const isSelected = path === selected;
+        const badges = [];
+        if (item?.is_default) badges.push('<span class="settings-storage-badge is-default">默认</span>');
+        if (item?.note === '当前正在使用的目录') badges.push('<span class="settings-storage-badge">正在使用</span>');
+        if (item?.fs_type) badges.push(`<span class="settings-storage-badge">${escapeHtml(item.fs_type)}</span>`);
+        const metaText = ok
+            ? `剩余 ${formatStorageBytes(item?.free_bytes)} / 共 ${formatStorageBytes(item?.total_bytes)}`
+            : (item?.error || '不可用');
+        const noteText = item?.note && item.note !== '当前正在使用的目录' ? item.note : '';
+        return `<button type="button" class="settings-storage-candidate${isSelected ? ' is-selected' : ''}${ok ? '' : ' is-bad'}"`
+            + ` data-storage-path="${escapeHtml(path)}" onclick="selectStorageCandidate(this.dataset.storagePath)"${ok ? '' : ' disabled'}>`
+            + '<div class="settings-storage-candidate-head">'
+            + `<span class="settings-storage-candidate-path">${escapeHtml(path)}</span>${badges.join('')}`
+            + '</div>'
+            + `<div class="settings-storage-candidate-meta">${escapeHtml(metaText)}</div>`
+            + (noteText ? `<div class="settings-storage-candidate-note">${escapeHtml(noteText)}</div>` : '')
+            + '</button>';
+    }).join('');
+}
+
+export function selectStorageCandidate(path) {
+    const value = String(path || '').trim();
+    if (!value) return;
+    latestStorageState.pendingPath = value;
+    renderStorageCandidates();
+    renderStorageFormStatus(`已选中 ${value}，点「保存」生效`, 'info');
+}
+
 function renderStorageTempDir() {
     const pathEl = document.querySelector('#settings-storage-current .settings-storage-dir-path');
     const metaEl = document.querySelector('#settings-storage-current .settings-storage-meta');
     const resetBtn = document.getElementById('settings-storage-reset');
+    const warningEl = document.getElementById('settings-storage-warning');
     const dir = String(latestStorageState.dir || '').trim();
     if (pathEl) pathEl.textContent = dir || '读取中…';
     if (metaEl) {
@@ -1638,6 +1713,11 @@ function renderStorageTempDir() {
         metaEl.className = latestStorageState.probe?.ok
             ? 'settings-storage-meta'
             : 'settings-storage-meta is-bad';
+    }
+    if (warningEl) {
+        const warning = String(latestStorageState.warning || '').trim();
+        warningEl.hidden = !warning;
+        warningEl.textContent = warning;
     }
     if (resetBtn) resetBtn.classList.toggle('hidden', !!latestStorageState.isDefault);
     refreshSettingsSectionSummaries();
@@ -1648,23 +1728,29 @@ export async function loadStorageTempDir({ silent = false } = {}) {
     if (!currentEl) return false;
     try {
         const data = await window.MediaHubApi.getJson('/storage/temp-dir');
-        latestStorageState = {
-            dir: String(data?.dir || '').trim(),
-            isDefault: !!data?.is_default,
-            defaultDir: String(data?.default_dir || '').trim(),
-            probe: data?.probe || null,
-        };
+        applyStorageStatePayload(data, { keepPending: true });
         renderStorageTempDir();
+        renderStorageCandidates();
         return true;
     } catch (error) {
-        latestStorageState = { dir: '', isDefault: true, defaultDir: '', probe: null };
+        latestStorageState = {
+            dir: '', isDefault: true, defaultDir: '', probe: null,
+            tier: 'unknown', warning: '', candidates: [], scanSupported: true,
+            containerLayer: null, pendingPath: '',
+        };
         const pathEl = currentEl.querySelector('.settings-storage-dir-path');
         const metaEl = currentEl.querySelector('.settings-storage-meta');
+        const warningEl = document.getElementById('settings-storage-warning');
         if (pathEl) pathEl.textContent = '读取失败';
         if (metaEl) {
             metaEl.textContent = String(error?.message || '请稍后重试');
             metaEl.className = 'settings-storage-meta is-bad';
         }
+        if (warningEl) {
+            warningEl.hidden = true;
+            warningEl.textContent = '';
+        }
+        renderStorageCandidates();
         if (!silent) storageToast('读取暂存目录失败：' + (error?.message || '请稍后重试'), 'error');
         return false;
     }
@@ -1676,46 +1762,83 @@ export function toggleStorageTempDirForm() {
     if (!card) return;
     const willShow = card.hidden;
     card.hidden = !willShow;
-    if (willShow && input && !String(input.value || '').trim()) {
-        // 展开时预填当前目录，改起来少打字
-        input.value = String(latestStorageState.dir || '').trim();
+    if (willShow) {
+        // 展开时清掉上次未保存的选择，默认落在当前目录上
+        latestStorageState.pendingPath = String(latestStorageState.dir || '').trim();
+        renderStorageCandidates();
+        if (input && !String(input.value || '').trim()) {
+            input.value = String(latestStorageState.dir || '').trim();
+        }
+        if (!latestStorageState.candidates.length) loadStorageTempDir({ silent: true });
     }
     if (!willShow) renderStorageFormStatus('');
 }
 
-export async function saveStorageTempDir() {
-    if (storageActionBusy) return;
-    const input = document.getElementById('settings-storage-dir-input');
-    const path = String(input?.value || '').trim();
-    if (!path) {
-        renderStorageFormStatus('请先填写容器内的目录路径，例如 /app/storage/cross_copy_tmp', 'error');
-        return;
+// 提交一个具体路径；createMissing=true 允许在已挂载的盘里自动建子目录
+async function submitStorageDir(path, { createMissing = true } = {}) {
+    const target = String(path || '').trim();
+    if (!target) {
+        renderStorageFormStatus('请先选一个目录，或者手动填容器内的路径', 'error');
+        return false;
     }
-    if (!path.startsWith('/')) {
-        renderStorageFormStatus('路径要以 / 开头，填容器内的绝对路径', 'error');
-        return;
+    if (!target.startsWith('/')) {
+        renderStorageFormStatus('路径要以 / 开头，填容器内的绝对路径（不是宿主机路径）', 'error');
+        return false;
     }
     storageActionBusy = true;
     renderStorageFormStatus('正在检查目录是否存在、能不能写、还剩多少空间...', 'info');
     try {
-        const data = await window.MediaHubApi.postJson('/storage/temp-dir', { path });
-        latestStorageState = {
-            dir: String(data?.dir || '').trim(),
-            isDefault: !!data?.is_default,
-            defaultDir: String(latestStorageState.defaultDir || '').trim(),
-            probe: data?.probe || null,
-        };
+        const data = await window.MediaHubApi.postJson('/storage/temp-dir', { path: target, create: createMissing });
+        applyStorageStatePayload(data, { keepPending: false });
         renderStorageTempDir();
+        renderStorageCandidates();
+        const warning = String(data?.warning || '').trim();
+        if (warning) {
+            // 存下来了但有风险（落在容器临时层），卡片留着让用户看见提示
+            renderStorageFormStatus('已保存。' + warning, 'error');
+            return true;
+        }
         const card = document.getElementById('settings-storage-form-card');
         if (card) card.hidden = true;
         renderStorageFormStatus('');
         storageToast('暂存目录已保存', 'success');
+        return true;
     } catch (error) {
         const message = String(error?.payload?.msg || error?.message || '请稍后重试');
         renderStorageFormStatus('保存失败：' + message, 'error');
+        return false;
     } finally {
         storageActionBusy = false;
     }
+}
+
+// 保存当前选中的候选目录
+export async function saveStorageTempDir() {
+    if (storageActionBusy) return;
+    const target = String(latestStorageState.pendingPath || latestStorageState.dir || '').trim();
+    if (!target) {
+        renderStorageFormStatus('请先从上面选一个目录', 'error');
+        return;
+    }
+    await submitStorageDir(target);
+}
+
+// 保存手动填写的路径（扫描不到时的兜底）
+export async function saveStorageTempDirFromInput() {
+    if (storageActionBusy) return;
+    const input = document.getElementById('settings-storage-dir-input');
+    await submitStorageDir(String(input?.value || '').trim());
+}
+
+// 重新扫描挂载点（挂载新盘并重建容器后用）
+export async function rescanStorageCandidates() {
+    if (storageActionBusy) return;
+    renderStorageFormStatus('正在重新扫描容器里的目录…', 'info');
+    const ok = await loadStorageTempDir({ silent: true });
+    renderStorageFormStatus(
+        ok ? '已重新扫描，看到新挂载的盘再点一下选中' : '扫描失败，请稍后重试',
+        ok ? 'info' : 'error'
+    );
 }
 
 export async function resetStorageTempDir() {
@@ -1735,13 +1858,9 @@ export async function resetStorageTempDir() {
     storageActionBusy = true;
     try {
         const data = await window.MediaHubApi.postJson('/storage/temp-dir', { path: '' });
-        latestStorageState = {
-            dir: String(data?.dir || '').trim(),
-            isDefault: true,
-            defaultDir: String(data?.default_dir || '').trim(),
-            probe: data?.probe || null,
-        };
+        applyStorageStatePayload(data, { keepPending: false });
         renderStorageTempDir();
+        renderStorageCandidates();
         const card = document.getElementById('settings-storage-form-card');
         if (card) card.hidden = true;
         renderStorageFormStatus('');
@@ -2081,6 +2200,9 @@ if (typeof window !== 'undefined') {
     window.reloadStorageTempDir = reloadStorageTempDir;
     window.toggleStorageTempDirForm = toggleStorageTempDirForm;
     window.saveStorageTempDir = saveStorageTempDir;
+    window.saveStorageTempDirFromInput = saveStorageTempDirFromInput;
+    window.selectStorageCandidate = selectStorageCandidate;
+    window.rescanStorageCandidates = rescanStorageCandidates;
     window.resetStorageTempDir = resetStorageTempDir;
     window.updateCookieHealthBar = updateCookieHealthBar;
     window.checkCookieHealthProviders = checkCookieHealthProviders;

@@ -263,5 +263,215 @@ class TestEngineTempDirHook(unittest.TestCase):
         self.assertIn("空间不足", str(ctx.exception))
 
 
+class TestMountPoints(unittest.TestCase):
+    """挂载点枚举：只列能存大文件的目录，系统挂载和单文件挂载要剔掉。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb_ls_mount_")
+        self.config_dir = os.path.join(self.tmp, "config")
+        self.storage_dir = os.path.join(self.tmp, "storage")
+        os.makedirs(self.config_dir)
+        os.makedirs(self.storage_dir)
+        # 单文件挂载（模拟 /etc/hosts），必须被 isdir 过滤掉
+        self.host_file = os.path.join(self.tmp, "hosts")
+        with open(self.host_file, "w", encoding="utf-8") as fh:
+            fh.write("127.0.0.1 localhost\n")
+        self.mounts_file = os.path.join(self.tmp, "mounts")
+        lines = [
+            "overlay / overlay rw,relatime 0 0",
+            "proc /proc proc rw,nosuid,nodev,noexec,relatime 0 0",
+            "sysfs /sys sysfs ro,nosuid,nodev,noexec 0 0",
+            "tmpfs /tmp tmpfs rw,nosuid,nodev 0 0",
+            f"/dev/sda1 {self.config_dir} ext4 rw,relatime 0 0",
+            f"/dev/sdb1 {self.storage_dir} ext4 rw,relatime 0 0",
+            f"/dev/vda1 {self.host_file} ext4 rw,relatime 0 0",
+        ]
+        with open(self.mounts_file, "w", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _paths(self):
+        return [item["path"] for item in ls.read_mount_points(self.mounts_file)]
+
+    def test_system_filesystems_filtered(self):
+        paths = self._paths()
+        self.assertNotIn("/proc", paths)
+        self.assertNotIn("/sys", paths)
+        self.assertNotIn("/tmp", paths)
+
+    def test_single_file_mount_filtered(self):
+        self.assertNotIn(self.host_file, self._paths())
+
+    def test_real_dir_mounts_kept(self):
+        paths = self._paths()
+        self.assertIn(self.config_dir, paths)
+        self.assertIn(self.storage_dir, paths)
+
+    def test_overlay_root_flagged_as_container_layer(self):
+        root = next(item for item in ls.read_mount_points(self.mounts_file) if item["path"] == "/")
+        self.assertTrue(root["is_container_layer"])
+
+    def test_missing_mounts_file_returns_none(self):
+        self.assertIsNone(ls.read_mount_points(os.path.join(self.tmp, "no-mounts")))
+
+    def test_escaped_space_unescaped(self):
+        spaced = os.path.join(self.tmp, "my disk")
+        os.makedirs(spaced)
+        escaped = spaced.replace(" ", "\\040")
+        extra = os.path.join(self.tmp, "mounts2")
+        with open(extra, "w", encoding="utf-8") as fh:
+            fh.write(f"/dev/sdc1 {escaped} ext4 rw,relatime 0 0\n")
+        self.assertIn(spaced, [item["path"] for item in ls.read_mount_points(extra)])
+
+
+class TestStorageTier(unittest.TestCase):
+    """层级判断：挂载盘 / 容器可写层 / 判断不了。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb_ls_tier_")
+        self.storage_dir = os.path.join(self.tmp, "storage")
+        os.makedirs(self.storage_dir)
+        self.mounts = [
+            {"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True},
+            {"path": self.storage_dir, "fs_type": "ext4", "device": "/dev/sdb1", "is_container_layer": False},
+        ]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_inside_mount_is_mount(self):
+        target = os.path.join(self.storage_dir, "cross_copy_tmp")
+        self.assertEqual(ls.detect_storage_tier(target, self.mounts), "mount")
+
+    def test_under_overlay_root_is_container_layer(self):
+        self.assertEqual(ls.detect_storage_tier("/etc/whatever", self.mounts), "container_layer")
+
+    def test_empty_mount_list_is_container_layer(self):
+        self.assertEqual(ls.detect_storage_tier("/whatever", []), "container_layer")
+
+    def test_unsupported_env_is_unknown(self):
+        with patch.object(ls, "read_mount_points", return_value=None):
+            self.assertEqual(ls.detect_storage_tier("/whatever"), "unknown")
+
+    def test_bare_metal_root_counts_as_mount(self):
+        """裸机上 / 是真实磁盘，不能当成容器临时层。"""
+        mounts = [{"path": "/", "fs_type": "ext4", "device": "/dev/vda1", "is_container_layer": False}]
+        self.assertEqual(ls.detect_storage_tier("/home/u/tmp", mounts), "mount")
+
+    def test_warning_only_for_container_layer(self):
+        self.assertTrue(ls.storage_tier_warning("container_layer"))
+        self.assertEqual(ls.storage_tier_warning("mount"), "")
+        self.assertEqual(ls.storage_tier_warning("unknown"), "")
+
+
+class TestProbeCreateMissing(unittest.TestCase):
+    """自动建子目录：只在已挂载的盘里建，绝不在容器临时层里建。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb_ls_create_")
+        self.storage_dir = os.path.join(self.tmp, "storage")
+        os.makedirs(self.storage_dir)
+        self.mounts = [
+            {"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True},
+            {"path": self.storage_dir, "fs_type": "ext4", "device": "/dev/sdb1", "is_container_layer": False},
+        ]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_creates_subdir_inside_mounted_disk(self):
+        target = os.path.join(self.storage_dir, "cross_copy_tmp")
+        with patch.object(ls, "read_mount_points", return_value=self.mounts):
+            probe = ls.probe_storage_path(target, create_missing=True)
+        self.assertTrue(probe["ok"])
+        self.assertTrue(probe["created"])
+        self.assertTrue(os.path.isdir(target))
+        self.assertEqual(probe["tier"], "mount")
+
+    def test_refuses_to_create_in_container_layer(self):
+        target = os.path.join(self.tmp, "stray", "cross_copy_tmp")
+        with patch.object(ls, "read_mount_points", return_value=self.mounts):
+            probe = ls.probe_storage_path(target, create_missing=True)
+        self.assertFalse(probe["ok"])
+        self.assertIn("不是挂载进来的磁盘", probe["error"])
+        self.assertFalse(os.path.exists(target))
+
+    def test_host_path_not_silently_recreated(self):
+        """/mnt/hdd 这种宿主机路径不能在容器里凭空造出来。"""
+        with patch.object(ls, "read_mount_points", return_value=self.mounts):
+            probe = ls.probe_storage_path("/mnt/hdd-does-not-exist", create_missing=True)
+        self.assertFalse(probe["ok"])
+        self.assertFalse(os.path.exists("/mnt/hdd-does-not-exist"))
+
+    def test_missing_dir_keeps_old_error_without_create_flag(self):
+        target = os.path.join(self.storage_dir, "nope")
+        probe = ls.probe_storage_path(target)
+        self.assertFalse(probe["ok"])
+        self.assertIn("不存在", probe["error"])
+        self.assertFalse(probe["created"])
+        self.assertFalse(os.path.exists(target))
+
+    def test_unsupported_env_allows_create(self):
+        """读不到挂载表（非 Linux 环境）时不拦，否则本地开发没法用。"""
+        target = os.path.join(self.tmp, "devbox", "tmp")
+        with patch.object(ls, "read_mount_points", return_value=None):
+            probe = ls.probe_storage_path(target, create_missing=True)
+        self.assertTrue(probe["ok"])
+        self.assertTrue(probe["created"])
+
+
+class TestListStorageCandidates(unittest.TestCase):
+    """候选列表：挂载点直接可点，根目录不进列表，老配置也能看见。"""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="wb_ls_cand_")
+        self.config_dir = os.path.join(self.tmp, "config")
+        self.storage_dir = os.path.join(self.tmp, "storage")
+        os.makedirs(self.config_dir)
+        os.makedirs(self.storage_dir)
+        self.mounts = [
+            {"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True},
+            {"path": self.config_dir, "fs_type": "ext4", "device": "/dev/sda1", "is_container_layer": False},
+            {"path": self.storage_dir, "fs_type": "ext4", "device": "/dev/sdb1", "is_container_layer": False},
+        ]
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _listing(self, cfg=None):
+        with patch.object(ls, "read_mount_points", return_value=self.mounts), \
+                patch.object(ls, "default_storage_path", return_value=self.config_dir):
+            return ls.list_storage_candidates(cfg or {})
+
+    def test_root_is_not_a_candidate(self):
+        self.assertNotIn("/", [item["path"] for item in self._listing()["candidates"]])
+
+    def test_mounts_listed_with_subdir(self):
+        paths = [item["path"] for item in self._listing()["candidates"]]
+        self.assertIn(os.path.join(self.config_dir, "cross_copy_tmp"), paths)
+        self.assertIn(os.path.join(self.storage_dir, "cross_copy_tmp"), paths)
+
+    def test_default_candidate_first(self):
+        listing = self._listing()
+        self.assertTrue(listing["candidates"][0]["is_default"])
+        self.assertEqual(listing["default_dir"], os.path.join(self.config_dir, "cross_copy_tmp"))
+        self.assertEqual(listing["tier"], "mount")
+
+    def test_scan_supported_flag(self):
+        self.assertTrue(self._listing()["supported"])
+        with patch.object(ls, "read_mount_points", return_value=None):
+            self.assertFalse(ls.list_storage_candidates({})["supported"])
+
+    def test_stray_current_dir_kept_and_flagged(self):
+        """老配置指向非挂载点目录时也要列出来，并标成容器临时层。"""
+        stray = os.path.join(self.tmp, "stray")
+        os.makedirs(stray)
+        listing = self._listing({"cross_copy_temp_dir": stray})
+        self.assertIn(stray, [item["path"] for item in listing["candidates"]])
+        self.assertEqual(listing["tier"], "container_layer")
+
+
 if __name__ == "__main__":
     unittest.main()

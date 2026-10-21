@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from unittest import mock
 from contextlib import contextmanager
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 
@@ -143,6 +144,71 @@ class StorageTempDirApiTest(unittest.TestCase):
         self.assertEqual(data["dir"], os.path.join(self.tmp, "cross_copy_tmp"))
         self.assertEqual(save_mock.call_args[0][0]["cross_copy_temp_dir"], "")
 
+    def test_get_includes_candidates_and_scan_flag(self):
+        """读取接口要带上候选目录列表，前端才有的可选。"""
+        with self._patched({}):
+            resp = self.client.get("/storage/temp-dir")
+        data = resp.json()
+        self.assertIsInstance(data["candidates"], list)
+        self.assertIn("scan_supported", data)
+        self.assertIn("tier", data)
+        self.assertIn("warning", data)
+
+    def _fake_mounts(self, mount_root):
+        return [
+            {"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True},
+            {"path": mount_root, "fs_type": "ext4", "device": "/dev/sdb1", "is_container_layer": False},
+        ]
+
+    def test_save_with_create_builds_subdir_inside_mount(self):
+        """挂载点是空盘时，create=true 直接把子目录建出来。"""
+        mount_root = os.path.join(self.tmp, "disk")
+        os.makedirs(mount_root)
+        target = os.path.join(mount_root, "cross_copy_tmp")
+        with mock.patch.object(ls, "read_mount_points", return_value=self._fake_mounts(mount_root)), \
+                self._patched({}) as save_mock:
+            resp = self.client.post("/storage/temp-dir", json={"path": target, "create": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(os.path.isdir(target))
+        self.assertTrue(resp.json()["probe"]["created"])
+        self.assertEqual(save_mock.call_args[0][0]["cross_copy_temp_dir"], target)
+
+    def test_save_without_create_flag_rejects_missing_dir(self):
+        mount_root = os.path.join(self.tmp, "disk2")
+        os.makedirs(mount_root)
+        target = os.path.join(mount_root, "cross_copy_tmp")
+        with mock.patch.object(ls, "read_mount_points", return_value=self._fake_mounts(mount_root)), \
+                self._patched({}) as save_mock:
+            resp = self.client.post("/storage/temp-dir", json={"path": target})
+        self.assertEqual(resp.status_code, 400)
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(save_mock.call_count, 0)
+
+    def test_save_refuses_to_create_in_container_layer(self):
+        """手填一个容器临时层里的不存在的路径，不能被悄悄建出来。"""
+        target = os.path.join(self.tmp, "stray", "cross_copy_tmp")
+        # 只挂载了 /（容器可写层），tmp 下面的目录都不算挂载盘
+        mounts = [{"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True}]
+        with mock.patch.object(ls, "read_mount_points", return_value=mounts), \
+                self._patched({}) as save_mock:
+            resp = self.client.post("/storage/temp-dir", json={"path": target, "create": True})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("不是挂载进来的磁盘", resp.json()["msg"])
+        self.assertFalse(os.path.exists(target))
+        self.assertEqual(save_mock.call_count, 0)
+
+    def test_save_container_layer_returns_warning(self):
+        """存到容器临时层能成功，但必须回一句风险提示。"""
+        stray = os.path.join(self.tmp, "stray2")
+        os.makedirs(stray)
+        mounts = [{"path": "/", "fs_type": "overlay", "device": "overlay", "is_container_layer": True}]
+        with mock.patch.object(ls, "read_mount_points", return_value=mounts), self._patched({}):
+            resp = self.client.post("/storage/temp-dir", json={"path": stray})
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["tier"], "container_layer")
+        self.assertIn("临时层", data["warning"])
+
     def test_old_location_endpoints_gone(self):
         """旧的位置管理端点已下线，应返回 404/405。"""
         with self._patched({}):
@@ -151,6 +217,45 @@ class StorageTempDirApiTest(unittest.TestCase):
                 self.client.post("/storage/locations/add", json={"path": self.tmp}).status_code,
                 (404, 405),
             )
+
+
+class StorageCandidateUiTest(unittest.TestCase):
+    """暂存目录从「手填路径」改成「选挂载点」的前端结构回归。"""
+
+    def setUp(self):
+        root = Path(__file__).resolve().parents[1]
+        self.template = (root / "templates/partials/pages/settings.html").read_text(encoding="utf-8")
+        self.module = (root / "static/js/modules/tabs/settings.js").read_text(encoding="utf-8")
+        self.css = (root / "static/css/index.css").read_text(encoding="utf-8")
+
+    def test_template_has_candidate_list_and_warning(self):
+        self.assertIn('id="settings-storage-candidates"', self.template)
+        self.assertIn('id="settings-storage-warning"', self.template)
+        self.assertIn('onclick="rescanStorageCandidates()"', self.template)
+
+    def test_manual_input_kept_as_folded_fallback(self):
+        """手填还在，但收进「扫描不到」的折叠区，不再是主路径。"""
+        self.assertIn("settings-storage-manual", self.template)
+        self.assertIn("扫描不到要用的目录", self.template)
+        self.assertIn('onclick="saveStorageTempDirFromInput()"', self.template)
+
+    def test_module_renders_and_selects_candidates(self):
+        self.assertIn("function renderStorageCandidates", self.module)
+        self.assertIn("window.selectStorageCandidate = selectStorageCandidate", self.module)
+        self.assertIn("window.rescanStorageCandidates = rescanStorageCandidates", self.module)
+        self.assertIn("window.saveStorageTempDirFromInput = saveStorageTempDirFromInput", self.module)
+
+    def test_module_sends_create_flag(self):
+        """保存要带 create，挂载点是空盘时后端才能建子目录。"""
+        self.assertIn("create: createMissing", self.module)
+
+    def test_module_degrades_gracefully_without_mount_scan(self):
+        self.assertIn("scanSupported", self.module)
+
+    def test_css_covers_candidates_and_day_theme(self):
+        self.assertIn(".settings-storage-candidate {", self.css)
+        self.assertIn("html.theme-day .settings-storage-candidate {", self.css)
+        self.assertIn("html.theme-day .settings-storage-warning", self.css)
 
 
 if __name__ == "__main__":
