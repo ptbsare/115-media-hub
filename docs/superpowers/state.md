@@ -8,17 +8,18 @@
 
 ## 基线
 
-- **更新日期**: 2026-10-21（并行分段下载 + 任务断点续传，0.15.1 发版）
-- **分支**: `main`，0.15.0 已推送；本轮（并行下载 + 断点续传 + 0.15.1）**待提交**
-- **版本**: `0.15.1`（2026-10-21 发布：并行分段下载 + 任务断点续传）
-- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；运行中镜像仍不含 `2e29fd1` 之后的修复，**用户重建镜像后才是 0.15.1 代码**
-- **最近提交**: `5b34417` 发版 0.15.1：并行分段下载 + 任务断点续传（2026-10-21），**待推送 / 待打 tag**
+- **更新日期**: 2026-10-21（暂存目录改成点选挂载盘，0.15.2 发版）
+- **分支**: `main`，0.15.0 已推送；0.15.1 与 0.15.2 均为本地提交，**待推送 / 待打 tag**
+- **版本**: `0.15.2`（2026-10-21 发布：暂存目录点选挂载盘 + 三层防呆 + compose 映射说明修正）
+- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常），**用户重建镜像后才是 0.15.2 代码**
+- **最近提交**: `feb504e` 设置页暂存目录点选挂载盘 + 本轮 0.15.2 发版提交（2026-10-21）
 - **工作区**: 干净
 
 ## 最近一次验证
 
-- 容器全量 **1826 项零失败**（2026-10-21，88.2s，`scripts/check.sh --all --container` 全绿，handoff 体积 32220/32768）。
-- 本机指定模块 450 条零失败：跨盘复制引擎 / 并行下载 / 断点续传 / 任务层 / provider 上传 / 模块登记。
+- 容器全量 **1859 项零失败**（2026-10-21，75.4s，`scripts/check.sh --all --container` 全绿），覆盖暂存目录挂载点改造与跨盘复制两条链路。
+- 本机 8 模块 284 条零失败（`test_local_storage` / `test_settings_storage_ui` / `test_settings_layout_frontend` / `test_settings_notify_ui` / `test_modules_doc` / 复制引擎三件）。
+- 容器内实测：挂 `/app/storage` 后自动进候选列表；空盘自动建 `cross_copy_tmp`；`/mnt/hdd`（宿主机路径）与 `/tmp/foo`（容器层）均被拒并给出挂载指引。
 - **新增回归钉**：`TestResumeBootstrapChain`（首跑失败留断点 → 重跑零 Range 请求、跳过下载直接上传）、`TestResumeStateForDb`（含 on_part_done 闭包的状态能正常落库）、并行 1/3/8 三元结果相等、失败/取消保留临时文件。
 - **CLI 新增 `cross-copy` 命令组**（cli.py，宿主机场，不进镜像）：`capabilities` 看组合、`create` 建任务（配合 `browse ls` 查文件 ID）、`list/cancel/retry/delete/clear [--scope]` 管理记录；payload 级测试钉住。
 - **订阅补源自动链路模拟验证通过**（素材真实建夸克分享 + 合成 115 订阅任务）：

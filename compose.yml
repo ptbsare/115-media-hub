@@ -14,7 +14,7 @@ services:
       #   2) 重建容器：docker compose up -d --force-recreate
       #   3) 设置页「参数配置 → 本地存储位置 → 更换目录」，列表里会自动出现它，点一下选中保存
       # macOS 用 /Volumes/media，Linux/NAS 用 /mnt/hdd 这类路径。不映射也能用：暂存默认落在 config 卷。
-      # - /Volumes/media:/app/storage
+      - /Users/xianer/Documents/docker/115strmxianer/storage:/app/storage
 
     ports:
       - "18080:18080"
