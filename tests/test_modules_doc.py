@@ -96,6 +96,15 @@ class ModulesDocTest(unittest.TestCase):
                 self.assertIn(field, body, f"模块「{title}」缺少 {field} 字段")
 
     def test_agents_md_points_to_modules_doc(self):
+        """本地 AGENTS.md 必须指向模块索引。
+
+        AGENTS.md / CLAUDE.md 是本地开发用的 agent 引导文件，按约定不入库
+        （见 .gitignore），所以干净 clone 环境里没有这两个文件——那种情况下跳过，
+        否则 CI 与别人 clone 后跑测试会直接 FileNotFoundError。
+        本机有文件时这条断言照旧生效，作用是防止本地引导文件漏掉模块索引入口。
+        """
+        if not AGENTS_DOC.is_file():
+            self.skipTest("本地没有 AGENTS.md（干净 clone 环境），跳过本机引导文件检查")
         agents_text = AGENTS_DOC.read_text(encoding="utf-8")
         self.assertIn("docs/superpowers/modules.md", agents_text)
 

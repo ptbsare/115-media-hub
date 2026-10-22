@@ -45,10 +45,12 @@ tests/*
 !tests/
 !tests/test_*.py
 
-# local agent state (not for repo)
-# AGENTS.md / CLAUDE.md 反过来是要入库的：它们是给人和 AI 看的项目规则与代码地图，
-# 而且 tests/test_modules_doc.py 会校验 AGENTS.md 指向 modules.md，不入库的话别人
-# clone 下来跑测试必挂。
+# local agent config (not for repo)
+# AGENTS.md / CLAUDE.md 是本地开发用的 agent 引导与代码地图，不入库。
+# 因此测试里读它们必须先判存在（见 tests/test_modules_doc.py），
+# 否则干净 clone 跑测试会 FileNotFoundError。
+AGENTS.md
+CLAUDE.md
 .worktrees/
 .claude/
 .workbuddy/

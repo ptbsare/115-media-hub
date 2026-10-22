@@ -18,13 +18,14 @@ All notable changes to this project will be documented in this file. The format 
 - **`.dockerignore` 补齐本地目录**：`.workbuddy/`、`.worktrees/`、`.claude/`、`.playwright-cli/`、`.env.example` 之前没排除。`Dockerfile` 是选择性 COPY，镜像内容本来不受影响，但构建上下文每次都要白传这 ~700KB；现在与文件里原有的「本地 agent 上下文不进构建上下文」注释对齐。
 - **README→Word 转换脚本从 `tests/` 移到 `scripts/`**：它是一次性手动工具，不是测试用例，也不该被 `tests/*` 忽略规则藏起来。同时改掉「产物写死在脚本目录」的行为 —— 现在默认输出到系统临时目录 `$TMPDIR/115-media-hub-README.docx`，也可显式指定路径，不会再往仓库里落未跟踪文件。
 - **`.gitignore` 清掉一段空注释**（`# 忽略敏感配置…` 下面已经没有任何规则）。
-- **`AGENTS.md` / `CLAUDE.md` 改为入库**：它们是给人和 AI 看的项目规则与代码地图（不是本地配置、也没有凭据），而 `test_modules_doc` 会校验 `AGENTS.md` 指向 `modules.md`。之前被忽略规则挡在仓库外，导致在干净机器上 clone 下来跑测试必然 `FileNotFoundError` —— 也就是说此前「全绿」只在本机成立。真正的本地状态（`.workbuddy/`、`.claude/`、`.worktrees/`）继续不入库。
+- **修掉「测试依赖本地未入库文件」的隐患**：`test_modules_doc` 里有一条断言直接读 `AGENTS.md`，而 `AGENTS.md` / `CLAUDE.md` 是本机开发用的 agent 引导与代码地图、按约定不入库（`.gitignore` 里明确挡着）。于是干净机器上 clone 下来跑测试必然 `FileNotFoundError` —— 本机的「1991 条全绿」并不成立于别人。现在这条断言先判文件是否存在：本机有文件时照旧校验它指向 `modules.md`，干净 clone 环境下跳过。**两个文件仍然不入库**，`.workbuddy/`、`.claude/`、`.worktrees/` 同理。
 
 ### 验证
 
 - 容器内全量 **1991 条零失败**（`scripts/test_in_container.sh`）。
 - `node --check` 全量 33 个 JS 文件通过；`version.json` 变更检测用真实历史分别跑出 `true` / `false`；工作流 YAML 结构经解析校验（`needs`、条件、job 级并发组、输出传递）。
-- **新流水线的两次真实运行验证了门禁本身**：第一次（`5d35d24`）测试红 —— 因为 `AGENTS.md` 未入库 —— 构建 job 状态为 `skipped`，镜像没有被覆盖，这正是要的效果；补上文件后第二次测试绿、构建按预期 `skipped`（该次未改 `version.json`）；随后用 `workflow_dispatch` 手动触发，测试绿 + 构建成功，`0.15.6` 与 `latest` 已推送到 Docker Hub。
+- **用「只含已跟踪文件」的导出版本复现干净机器**：`git archive` 出一份不带 `AGENTS.md` 的副本，在里面跑 `tests.test_modules_doc` → 5 条通过、1 条跳过（修好前是 `FileNotFoundError`）。
+- **新流水线的真实运行验证了门禁本身**：首次（`5d35d24`）测试红、构建 `skipped`，镜像没有被覆盖 —— 这正是要的效果，也暴露了上面那个隐患；修复后测试绿、构建按预期 `skipped`（该次未改 `version.json`）；随后用 `workflow_dispatch` 手动触发，测试绿 + 构建成功，`0.15.6` 与 `latest` 已推送到 Docker Hub。
 
 ## [0.15.5] - 2026-10-22
 
