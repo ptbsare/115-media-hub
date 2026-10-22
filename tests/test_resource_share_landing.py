@@ -327,5 +327,61 @@ class ShareLandingTimeoutConstantTest(unittest.TestCase):
         self.assertLessEqual(core.RESOURCE_SHARE_LANDING_TIMEOUT_SECONDS, 600)
 
 
+class ShareLandingAmbiguousTaskTest(unittest.IsolatedAsyncioTestCase):
+    """夸克没回 task_id 时不能当「同步完成」。
+
+    那是本功能最隐蔽的假成功路径：以前返回 ok=True，调用方直接判「已确认落地」，
+    连目录都不查，于是空目录也标完成。现在必须落到「按目录确认」。
+    """
+
+    def setUp(self):
+        self.patcher = mock.patch.object(
+            resource_service, "RESOURCE_SHARE_LANDING_POLL_CHUNK_SECONDS", 0.05
+        )
+        self.patcher.start()
+        self.addCleanup(self.patcher.stop)
+
+    def test_wait_share_save_without_task_id_is_ambiguous(self):
+        from app.providers.quark import QuarkProvider
+
+        outcome = QuarkProvider().wait_share_save("cookie", {"response": {"data": {}}})
+        self.assertFalse(outcome["ok"])
+        self.assertTrue(outcome["ambiguous"])
+        self.assertEqual(outcome["status"], 0)
+
+    async def test_ambiguous_outcome_confirmed_by_directory(self):
+        provider = ScriptedWaitProvider(
+            outcomes=[{"ok": False, "status": 0, "ambiguous": True, "reason": "没有 task_id"}],
+            entries=EXPECTED,
+        )
+        result = await resource_service._wait_share_receive_landing(
+            provider=provider,
+            cookie="quark-cookie",
+            bundle={"ok": True},
+            target_cid="target-cid",
+            expected=EXPECTED,
+            total_timeout=1.0,
+        )
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result.get("directory_confirmed"))
+        self.assertFalse(result.get("failed"))
+
+    async def test_ambiguous_with_empty_target_stays_unconfirmed(self):
+        provider = ScriptedWaitProvider(
+            outcomes=[{"ok": False, "status": 0, "ambiguous": True, "reason": "没有 task_id"}] * 8,
+            entries=[],
+        )
+        result = await resource_service._wait_share_receive_landing(
+            provider=provider,
+            cookie="quark-cookie",
+            bundle={"ok": True},
+            target_cid="target-cid",
+            expected=EXPECTED,
+            total_timeout=0.2,
+        )
+        self.assertFalse(result["confirmed"])
+        self.assertFalse(result.get("failed"))
+
+
 if __name__ == "__main__":
     unittest.main()

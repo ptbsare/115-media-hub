@@ -2540,8 +2540,15 @@ class QuarkProvider(CloudProvider):
         data = response.get("data", {}) if isinstance(response.get("data"), dict) else {}
         task_id = str(data.get("task_id", "") or "").strip()
         if not task_id:
-            # 少数情况下接口同步完成、没有 task_id：让调用方直接列目录判断
-            return {"ok": True, "status": 2, "reason": "接口未返回 task_id，按同步完成处理"}
+            # 没有 task_id 就拿不到任务状态。**不能**返回 ok=True——调用方看到 ok
+            # 会直接判「已确认落地」，而文件可能压根还没出现（这正是本函数要修的
+            # 毛病）。标记 ambiguous，让调用方改为按目标目录确认。
+            return {
+                "ok": False,
+                "status": 0,
+                "ambiguous": True,
+                "reason": "接口未返回 task_id，改为按目录确认落地",
+            }
         return wait_quark_share_save_task(cookie, task_id, timeout=timeout, interval=interval)
 
     def probe_connectivity(self, cookie):

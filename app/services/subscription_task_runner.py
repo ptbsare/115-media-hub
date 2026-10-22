@@ -355,8 +355,13 @@ def _subscription_cross_copy_needed(
 
 async def _scan_subscription_existing_episodes_quietly(
     task: Dict[str, Any], cfg: Dict[str, Any]
-) -> Set[int]:
-    """为补源取「目标目录实际落盘的集」，扫不到就返回空集合。
+) -> Optional[Set[int]]:
+    """为补源取「目标目录实际落盘的集」。
+
+    返回 ``None`` 表示**没扫成**（网盘没配、cookie 失效、目录读取失败），调用方
+    必须退回 ``last_episode`` 口径；返回空集合才是「目录确实一集都没有」。
+    这两者必须分开——早先把失败也返回 ``set()``，下游据此判出「整季都缺」，
+    一次扫描失败就会把整季重下一遍。
 
     补源有两条调用路径。有候选的那条走目录校准之后，扫描结果现成；无候选早退
     那条发生在校准之前，只有进度里的旧值（常为 0）。拿旧值当判缺依据，会把
@@ -369,13 +374,13 @@ async def _scan_subscription_existing_episodes_quietly(
     provider_name = str(task.get("provider", "115") or "115").strip() or "115"
     provider_meta = _get_provider_or_none(provider_name)
     if provider_meta is None:
-        return set()
+        return None
     try:
         cookie = provider_meta.get_cookie(cfg)
     except Exception:
-        return set()
+        return None
     if not str(cookie or "").strip():
-        return set()
+        return None
     base_savepath = normalize_relative_path(str(task.get("savepath", "") or "").strip())
     scan_savepath = resolve_subscription_tv_scan_savepath(task, base_savepath) or base_savepath
     try:
@@ -383,13 +388,13 @@ async def _scan_subscription_existing_episodes_quietly(
             await asyncio.to_thread(provider_meta.resolve_folder_id_by_path, cookie, scan_savepath) or ""
         ).strip()
         if not folder_id:
-            return set()
+            return set()  # 目录不存在 = 本盘这部剧还没有，不是「没扫成」
         scan_result = await asyncio.to_thread(
             _scan_provider_existing_tv_episodes, provider_meta, cookie, folder_id, task
         )
     except Exception as exc:
         logging.getLogger(__name__).info("跨盘补源：现场扫描目标目录失败（%s），按进度值判缺", exc)
-        return set()
+        return None
     episodes = scan_result.get("episodes", []) if isinstance(scan_result, dict) else []
     return {
         max(0, int(item or 0))

@@ -1240,5 +1240,115 @@ class TestStagingCleanup(SubscriptionCrossCopyTestBase):
         self.assertEqual(removed, 0)
 
 
+class TestStagingFallbackVolumeLimit(unittest.TestCase):
+    """扫不出分享文件时要退回整包，但整包不能无限大。
+
+    退回整包是为了「至少不会一集都补不上」，代价是把不付费的夸克账号一次塞满；
+    一旦塞满，后面所有补源都会失败，而多转进来的部分没有任何路径会删。
+    """
+
+    @staticmethod
+    def _provider(per_file_size):
+        return FakeQuarkProvider(
+            share_entries=[
+                {"id": "share-fid-1", "name": "S01E01.mkv", "size": per_file_size, "is_dir": False},
+                {"id": "share-fid-2", "name": "S01E02.mkv", "size": per_file_size, "is_dir": False},
+            ]
+        )
+
+    def test_oversized_fallback_is_refused(self):
+        provider = self._provider(3 * 1024 ** 3)  # 两集共 6GB
+        with patch.object(sc, "_scan_share_media_files", return_value=([], ["扫描失败"])), patch.object(
+            sc, "staging_fallback_max_bytes", return_value=2 * 1024 ** 3
+        ):
+            staged = sc._stage_share_to_quark(
+                provider,
+                "cookie-quark",
+                "https://pan.quark.cn/s/abc",
+                "",
+                "云下载/跨盘中转/测试剧集",
+                task={"media_type": "tv", "name": "测试剧集"},
+                last_episode=5,
+            )
+        self.assertEqual(staged["files"], [])
+        self.assertEqual(staged["folders"], [])
+        self.assertFalse(staged["already_staged"])
+        self.assertTrue(any("超过整包上限" in item for item in staged["skipped"]))
+        # 关键：一次转存都没提交
+        self.assertEqual(provider.received, [])
+
+    def test_small_fallback_still_staged(self):
+        provider = self._provider(1024)
+        with patch.object(sc, "_scan_share_media_files", return_value=([], ["扫描失败"])), patch.object(
+            sc, "staging_fallback_max_bytes", return_value=2 * 1024 ** 3
+        ):
+            staged = sc._stage_share_to_quark(
+                provider,
+                "cookie-quark",
+                "https://pan.quark.cn/s/abc",
+                "",
+                "云下载/跨盘中转/测试剧集",
+                task={"media_type": "tv", "name": "测试剧集"},
+                last_episode=5,
+            )
+        self.assertTrue(any("按整包转存" in item for item in staged["skipped"]))
+        self.assertTrue(provider.received)
+
+    def test_limit_zero_means_unlimited(self):
+        with patch.dict(os.environ, {"CROSS_COPY_STAGING_FALLBACK_MAX_GB": "0"}):
+            self.assertEqual(sc.staging_fallback_max_bytes(), 0)
+        with patch.dict(os.environ, {"CROSS_COPY_STAGING_FALLBACK_MAX_GB": "junk"}):
+            self.assertEqual(sc.staging_fallback_max_bytes(), 10 * 1024 ** 3)
+
+
+class TestExistingEpisodeScanFailure(unittest.TestCase):
+    """扫描失败必须返回 None（未知），不能返回空集合。
+
+    空集合在下游是「本盘一集都没有」的强断言，一次扫描失败就会让整季被判缺、
+    整季重下。这两者必须在类型上分开。
+    """
+
+    @staticmethod
+    def _scan():
+        from app.services import subscription_task_runner as runner
+
+        return asyncio.run(
+            runner._scan_subscription_existing_episodes_quietly({"provider": "115", "savepath": "剧"}, {})
+        )
+
+    def test_missing_provider_returns_none(self):
+        from app.services import subscription_task_runner as runner
+
+        with patch.object(runner, "_get_provider_or_none", return_value=None):
+            self.assertIsNone(self._scan())
+
+    def test_empty_cookie_returns_none(self):
+        from app.services import subscription_task_runner as runner
+
+        provider = MagicMock()
+        provider.get_cookie.return_value = ""
+        with patch.object(runner, "_get_provider_or_none", return_value=provider):
+            self.assertIsNone(self._scan())
+
+    def test_scan_exception_returns_none(self):
+        from app.services import subscription_task_runner as runner
+
+        provider = MagicMock()
+        provider.get_cookie.return_value = "cookie"
+        provider.resolve_folder_id_by_path.side_effect = RuntimeError("boom")
+        with patch.object(runner, "_get_provider_or_none", return_value=provider):
+            self.assertIsNone(self._scan())
+
+    def test_missing_folder_is_really_empty(self):
+        """目录不存在 = 这部剧本盘还没有，是真空集合，不能当成「没扫成」。"""
+        from app.services import subscription_task_runner as runner
+
+        provider = MagicMock()
+        provider.get_cookie.return_value = "cookie"
+        provider.resolve_folder_id_by_path.return_value = ""
+        with patch.object(runner, "_get_provider_or_none", return_value=provider):
+            self.assertEqual(self._scan(), set())
+
+
 if __name__ == "__main__":
     unittest.main()

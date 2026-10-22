@@ -38,6 +38,27 @@ logger = logging.getLogger(__name__)
 # 夸克侧中转目录（与订阅离线中转同级的独立目录，删除只删此目录内文件）
 CROSS_COPY_STAGING_ROOT = "云下载/跨盘中转"
 
+
+def staging_fallback_max_bytes() -> int:
+    """整包转存的体积上限，超过就本轮放弃。
+
+    分享目录扫不出文件时要退回整包转存（层级太深或撞限流时至少不会一集都补不上），
+    但整包会把不付费的夸克账号一次塞满：一旦真塞满，后面所有补源都会失败，而多转
+    进来的文件没有任何路径会删，只能等保留期。所以给一个上限：
+
+    - ``CROSS_COPY_STAGING_FALLBACK_MAX_GB``（默认 10，0 或负数 = 不限制）；
+    - 分享条目全都没带 size（例如整包是个文件夹、体积拿不到）时不拦截，保持
+      原来的可用性，只在日志里说明「按整包转存」。
+    """
+    try:
+        gb = float(os.environ.get("CROSS_COPY_STAGING_FALLBACK_MAX_GB", 10) or 10)
+    except (TypeError, ValueError):
+        gb = 10.0
+    if gb <= 0:
+        return 0
+    return int(gb * 1024 ** 3)
+
+
 # 「真正接通」的源网盘判定直接复用 core 里的白名单（也是任务字段归一化的白名单），
 # 不另建一份常量：跨盘复制引擎本身支持 115/夸克/阿里互传，但补源只把
 # 「夸克 → 目标盘」接进了主链路，其余源即使勾上也不会执行。
@@ -430,6 +451,27 @@ def _stage_share_to_quark(
                 + "、".join(f"E{int(item.get('episode', 0) or 0)}" for item in missing)
             )
         else:
+            # 退回整包之前先看体积：整包把配额塞满之后，后面所有补源都会失败，
+            # 而多转进来的部分没有任何路径会删（只能等保留期）。宁可这一轮不补，
+            # 下一轮重扫——扫描失败多半是限流或网络抖动，会自己好。
+            total_bytes = sum(
+                _entry_size(item) for item in share_entries if not _entry_is_dir(item)
+            )
+            limit_bytes = staging_fallback_max_bytes()
+            if limit_bytes and total_bytes > limit_bytes:
+                return {
+                    "folder_id": "",
+                    "folders": [],
+                    "files": [],
+                    "skipped": skipped
+                    + [
+                        f"分享目录读不出文件，退回整包需转存 {total_bytes / (1024 ** 3):.1f}GB，"
+                        f"超过整包上限 {limit_bytes / (1024 ** 3):.0f}GB，本轮不转存"
+                        "（避免占满夸克空间），下一轮再试"
+                    ],
+                    "already_staged": False,
+                    "episode_filtered": False,
+                }
             skipped.append("分享目录里没扫到文件，本轮按整包转存")
 
     folder_id = str(quark_provider.ensure_folder_id_by_path(cookie, staging_rel_path) or "0")

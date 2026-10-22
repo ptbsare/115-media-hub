@@ -1,3 +1,5 @@
+import json
+
 from .core import *  # noqa: F401,F403
 
 RESOURCE_JOB_ACTIVE_STATUSES = ("pending", "running", "submitted")
@@ -434,6 +436,36 @@ def recover_stale_resource_jobs(max_age_seconds: int = RESOURCE_JOB_STALE_RECOVE
         touch_resource_jobs_state_signal("resource-jobs-recover-stale")
     return {"recovered": recovered, "checked": checked}
 
+def _submitted_awaits_landing(extra_json_value: Any) -> bool:
+    """这个 submitted 到底是「转存已成功、只是没挂监控」还是「还没确认落地」。
+
+    后者是分享转存链路新引入的含义：``resource.run_resource_job`` 在宽限期内没等到
+    文件真的出现在目标目录时，会把任务落成 ``submitted``，并把诊断写进
+    ``extra_json.share_landing``。这种任务不能被下面的恢复逻辑改成 ``completed``
+    ——否则「没确认就不宣称完成」只生效 20 秒。
+
+    ``share_landing.supported=False``（115 这类同步网盘）表示这条链路根本没走等待，
+    ``submitted`` 仍是旧含义，照旧恢复。
+    """
+    data: Any = extra_json_value
+    if isinstance(extra_json_value, str):
+        text = extra_json_value.strip()
+        if not text:
+            return False
+        try:
+            data = json.loads(text)
+        except (TypeError, ValueError):
+            return False
+    if not isinstance(data, dict):
+        return False
+    landing = data.get("share_landing")
+    if not isinstance(landing, dict):
+        return False
+    if not bool(landing.get("supported", False)):
+        return False
+    return not bool(landing.get("confirmed", False))
+
+
 def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[str, int]:
     ensure_db()
     with db_connection() as conn:
@@ -441,7 +473,7 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
         query_limit = max(20, min(int(limit or 200), 1000))
         cursor.execute(
             """
-            SELECT id, resource_id, status_detail
+            SELECT id, resource_id, status_detail, extra_json
             FROM resource_jobs
             WHERE status = 'submitted' AND trim(monitor_task_name) = ''
             ORDER BY id DESC
@@ -465,6 +497,9 @@ def recover_submitted_resource_jobs_without_monitor(limit: int = 200) -> Dict[st
             if job_id <= 0:
                 continue
             checked += 1
+            # 还没确认落地的转存：保持 submitted，别谎报完成
+            if _submitted_awaits_landing(data.get("extra_json")):
+                continue
             detail = str(data.get("status_detail", "") or "").strip()
             next_detail = detail or hint_text
             # 旧记录里可能已经有老文案（小写 strm），避免重复追加同一层意思。

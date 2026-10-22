@@ -265,5 +265,82 @@ class ResourceJobManagementTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class SubmittedLandingGuardTest(unittest.TestCase):
+    """「还没确认落地」的 submitted 不能被恢复逻辑改成 completed。
+
+    恢复逻辑原本的意思是「转存已成功、只是没挂监控，补一句提示」，它会把所有
+    submitted 无条件改成 completed。分享转存链路引入「未确认落地」这个新含义后，
+    如果不区分，任务在 20 秒内就会被谎报完成，整个等落地功能等于没做。
+    """
+
+    def setUp(self):
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.original_db_path = db.DB_PATH
+        self.original_db_ensured = db._DB_ENSURED
+        db.DB_PATH = str(Path(self.temp_dir.name) / "resource-jobs.db")
+        db._DB_ENSURED = False
+        db.ensure_db()
+        self.invalidate_patcher = mock.patch.object(resource_jobs, "invalidate_resource_state_snapshot")
+        self.signal_patcher = mock.patch.object(resource_jobs, "touch_resource_jobs_state_signal")
+        self.invalidate_patcher.start()
+        self.signal_patcher.start()
+
+    def tearDown(self):
+        self.signal_patcher.stop()
+        self.invalidate_patcher.stop()
+        db.DB_PATH = self.original_db_path
+        db._DB_ENSURED = self.original_db_ensured
+        self.temp_dir.cleanup()
+
+    def _insert_submitted(self, extra_json):
+        now = db.now_text()
+        with db.db_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO resource_jobs(
+                    resource_id, title, status, status_detail, created_at, updated_at,
+                    finished_at, monitor_task_name, extra_json
+                ) VALUES (?, ?, 'submitted', ?, ?, ?, '', '', ?)
+                """,
+                (1, "测试任务", "已提交，等待确认落地", now, now, extra_json),
+            )
+            job_id = int(cursor.lastrowid)
+            conn.commit()
+        return job_id
+
+    def _status(self, job_id):
+        with db.db_connection() as conn:
+            row = conn.execute("SELECT status FROM resource_jobs WHERE id = ?", (job_id,)).fetchone()
+        return str(row[0]) if row else ""
+
+    def test_helper_distinguishes_new_and_legacy_submitted(self):
+        awaits = resource_jobs._submitted_awaits_landing
+        self.assertTrue(awaits(json.dumps({"share_landing": {"supported": True, "confirmed": False}})))
+        self.assertFalse(awaits(json.dumps({"share_landing": {"supported": True, "confirmed": True}})))
+        # 115 这类同步网盘压根没走等待，submitted 还是老含义
+        self.assertFalse(awaits(json.dumps({"share_landing": {"supported": False}})))
+        self.assertFalse(awaits("{}"))
+        self.assertFalse(awaits(""))
+        self.assertFalse(awaits("not-json"))
+        self.assertFalse(awaits(None))
+
+    def test_unconfirmed_landing_is_not_recovered(self):
+        job_id = self._insert_submitted(
+            json.dumps(
+                {"share_landing": {"supported": True, "confirmed": False, "elapsed": 120.0}}
+            )
+        )
+        result = resource_jobs.recover_submitted_resource_jobs_without_monitor()
+        self.assertEqual(result["recovered"], 0)
+        self.assertEqual(self._status(job_id), "submitted")
+
+    def test_legacy_submitted_is_still_recovered(self):
+        job_id = self._insert_submitted("{}")
+        result = resource_jobs.recover_submitted_resource_jobs_without_monitor()
+        self.assertEqual(result["recovered"], 1)
+        self.assertEqual(self._status(job_id), "completed")
+
+
 if __name__ == "__main__":
     unittest.main()

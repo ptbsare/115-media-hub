@@ -622,6 +622,23 @@ async def _wait_share_receive_landing(
         last_status = int(payload.get("status", 0) or 0)
         last_reason = str(payload.get("reason", "") or "").strip()
         elapsed = round(time.monotonic() - started, 1)
+        if bool(payload.get("ambiguous")):
+            # 网盘没给任务 id，查不到状态：改成「隔一段查一次目标目录」。
+            # 既不能当成功（目录可能还是空的），也不能空转（每次都立即返回）。
+            if await _share_landing_seen_in_target(provider, cookie, target_cid, expected):
+                return {
+                    "supported": True,
+                    "confirmed": True,
+                    "skipped": False,
+                    "status": last_status,
+                    "elapsed": elapsed,
+                    "reason": last_reason,
+                    "directory_confirmed": True,
+                }
+            if time.monotonic() >= deadline:
+                break
+            await asyncio.sleep(min(chunk, max(0.05, deadline - time.monotonic())))
+            continue
         if bool(payload.get("ok")):
             return {
                 "supported": True,
