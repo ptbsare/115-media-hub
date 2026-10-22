@@ -25,8 +25,13 @@ design/
 tests/
 # local agent handoff context (not for image build context)
 AGENTS.md
+CLAUDE.md
+.workbuddy/
+.worktrees/
+.claude/
 docs/
 .playwright-browsers/
+.playwright-cli/
 
 # tracked export template, excluded from image build context
 tg-resource.json
@@ -34,4 +39,5 @@ tg-resource.json
 # 本机部署配置与默认数据目录（有路径信息，不该进镜像）
 .env
 .env.local
+.env.example
 data/

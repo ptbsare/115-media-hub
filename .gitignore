@@ -16,9 +16,6 @@ node_modules/
 strm/
 config/
 
-# 忽略敏感配置 (如果 config 目录下全是私密信息)
-
-
 .codex/
 .cursor/
 .superpowers/
