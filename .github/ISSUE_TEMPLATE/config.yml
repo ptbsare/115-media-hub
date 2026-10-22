@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 部署与使用问题（先看 README）
+    url: https://github.com/xianer235/115-media-hub#快速开始
+    about: 安装、Docker 启动、网盘 Cookie 配置、TMDB 绑定、订阅怎么建，README 里都有对应章节。
+  - name: 本项目免费开源，没有付费版
+    url: https://github.com/xianer235/115-media-hub#许可证
+    about: 采用 MIT 许可证，所有功能免费使用，不需要购买任何授权，也没有「专业版」「激活码」。
+  - name: 安全漏洞（不要开公开 issue）
+    url: https://github.com/xianer235/115-media-hub/security/policy
+    about: 越权访问、凭据泄露、路径穿越这类问题请走私密渠道上报。

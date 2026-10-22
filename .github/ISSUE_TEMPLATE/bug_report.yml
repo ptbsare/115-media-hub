@@ -1,0 +1,93 @@
+name: Bug 报告
+description: 功能不正常、报错、任务卡住或结果不对
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        **贴日志前请先打码**：完整的 115 Cookie、`webhook_secret`、账号密码等于账号控制权，公开贴出来会被扫走。保留前 4 位够定位就行。
+
+        如果你怀疑是安全问题（越权访问、凭据泄露、路径穿越等），**不要用这个表单**，请按 [SECURITY.md](../blob/main/SECURITY.md) 的私密渠道上报。
+
+  - type: input
+    id: version
+    attributes:
+      label: 版本号
+      description: 设置页底部显示，或 `version.json` 里的 `version` 字段
+      placeholder: 0.15.3
+    validations:
+      required: true
+
+  - type: dropdown
+    id: deploy
+    attributes:
+      label: 部署方式
+      options:
+        - Docker Compose
+        - Docker run / 其他编排
+        - 直接 python main.py
+        - 其他
+    validations:
+      required: true
+
+  - type: dropdown
+    id: module
+    attributes:
+      label: 出问题的模块
+      options:
+        - 资源中心 / 资源导入
+        - 资源推荐
+        - 影视订阅任务
+        - 文件夹监控任务 / STRM 生成
+        - 文件管理（浏览 / 跨盘复制 / 识别整理）
+        - 目录树同步
+        - 任务中心
+        - 设置 / 通知 / 网盘账号
+        - 命令行工具 CLI
+        - 其他
+    validations:
+      required: true
+
+  - type: textarea
+    id: what
+    attributes:
+      label: 现象
+      description: 你做了什么操作、期望的结果是什么、实际发生了什么。如果是「结果不对」，把期望值和实际值都写出来。
+      placeholder: |
+        操作：在订阅任务「xxx」上点补源，缺 3 集
+        期望：只把缺的 3 集复制到 Season 01
+        实际：任务显示成功，但目录里没有新文件
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志
+      description: 页面上的任务日志，或 `docker logs` / `docker compose logs` 的相关片段。**记得打码凭据。**
+      render: shell
+      placeholder: |
+        粘贴相关日志片段，不要贴整份日志
+    validations:
+      required: false
+
+  - type: input
+    id: env
+    attributes:
+      label: 环境
+      description: 系统与版本，例如 macOS 15 / Docker Desktop 4.x，或 Ubuntu 24.04 + docker compose v2
+      placeholder: macOS 15.1 + Docker Desktop 4.38
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已在最新版本上复现（或确认不是旧版本的已知问题）
+          required: true
+        - label: 我搜过已有 issue，没有重复
+          required: true
+        - label: 我确认提交内容里没有完整的 Cookie、密钥或账号密码
+          required: true

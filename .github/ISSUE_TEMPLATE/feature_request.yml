@@ -1,0 +1,44 @@
+name: 功能建议
+description: 想要一个现在没有的能力，或现有功能不好用
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        这个项目是个人维护的，功能选择会优先考虑「通用场景 + 维护成本」。写得越具体，越容易被采纳。
+
+  - type: textarea
+    id: scenario
+    attributes:
+      label: 你想解决什么问题
+      description: 先讲场景，不要直接讲实现方案。你现在的操作流程是什么、卡在哪一步、多久遇到一次。
+      placeholder: |
+        我每周要手动把 5 部剧的新集从夸克转到 115，每次都要点开分享目录一集集勾选……
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望的行为
+      description: 描述「点一下会发生什么」，不需要写技术实现。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternative
+    attributes:
+      label: 你现在怎么绕过这个问题
+      description: 临时方案、手动操作、或者用别的工具顶上。这能帮助判断需求有多强。
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我搜过已有 issue，没有重复
+          required: true
+        - label: 这个需求与「个人媒体库自动化管理」相关（本项目不处理破解、绕过授权、批量分发侵权内容的需求）
+          required: true

@@ -1,8 +1,15 @@
 # 115 Media Hub
 
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Release](https://img.shields.io/github/v/release/xianer235/115-media-hub)](https://github.com/xianer235/115-media-hub/releases/latest)
+[![Docker Pulls](https://img.shields.io/docker/pulls/xianer235/115-media-hub)](https://hub.docker.com/r/xianer235/115-media-hub)
+[![Stars](https://img.shields.io/github/stars/xianer235/115-media-hub)](https://github.com/xianer235/115-media-hub/stargazers)
+
 `115 Media Hub` 是一个基于 FastAPI 的媒体自动化管理面板，把多网盘转存、115 网盘 `.strm` 生成、TG 资源同步、影视订阅追更、文件管理（网盘浏览 / 跨盘复制 / 刮削重命名）放进同一个后台，并提供宿主机命令行客户端（`cli.py`），让 AI 代理或脚本无需打开网页即可完成同样的管理操作。
 
 它适合希望直接用网盘 Cookie 驱动"生成播放链接""转存后自动刷新""按片名自动找资源""批量重命名刮削"一体化流程的场景。
+
+> **本项目采用 MIT 许可证免费开源，所有功能都可以直接使用，没有付费版，也不需要购买任何授权。** 如果你在别处看到「专业版」「授权码」「激活」之类的说法，那不是本项目提供的。
 
 ## 功能总览
 
@@ -539,6 +546,13 @@ CLI 专属环境变量（见「命令行工具」）：`MH_USERNAME` / `MH_PASSW
 - 当前版本信息见 `version.json`
 - 历史变更见 `CHANGELOG.md`
 - 仓库地址：<https://github.com/xianer235/115-media-hub>
+
+## 参与贡献
+
+- 提代码前先看 [CONTRIBUTING.md](CONTRIBUTING.md)：本地启动、测试命令、代码约定与提交要求都在里面。
+- 发现安全问题（尤其是凭据泄露、越权访问）请**不要**开公开 issue，按 [SECURITY.md](SECURITY.md) 的渠道私密上报。
+- Bug 请用 issue 模板提交，填清版本号、部署方式和日志；功能建议请说明使用场景。
+- 日志与截图里的 `115 Cookie`、`webhook_secret`、账号密码请自行打码后再贴。
 
 ## 许可证
 

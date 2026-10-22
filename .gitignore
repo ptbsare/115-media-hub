@@ -10,6 +10,7 @@ __pycache__/
 .venv/
 node_modules/
 .playwright-browsers/
+.playwright-cli/
 
 # 忽略数据
 strm/
