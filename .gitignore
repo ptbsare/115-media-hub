@@ -36,6 +36,13 @@ preview-runtime/
 # local editor settings
 .vscode/
 
+# 本机部署配置（挂载路径、端口等，每人不同，不入库）。模板见 .env.example
+.env
+.env.local
+
+# compose 变量里的默认数据目录（别人 clone 后不配 .env 时落在这里）
+data/
+
 # formal tests live in tests/; keep local test artifacts ignored.
 tests/*
 !tests/

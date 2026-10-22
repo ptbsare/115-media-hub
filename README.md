@@ -74,6 +74,8 @@ services:
 docker compose up -d
 ```
 
+上面是最小配置，直接改这段就够用。仓库根目录还带了一份 `compose.yml`，挂载路径、端口、容器名都从同目录的 `.env` 读取，模板见 `.env.example`（`cp .env.example .env` 后按需改），适合想换盘、换机器时只改一处。
+
 访问地址：
 
 - `http://服务器IP:18080`

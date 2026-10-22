@@ -14,18 +14,19 @@
 ```bash
 git clone https://github.com/xianer235/115-media-hub.git
 cd 115-media-hub
+cp .env.example .env
 ```
 
-**先改 `compose.yml` 里的挂载路径。** 仓库里那份是作者本机的绝对路径（`/Users/xianer/...`），直接启动会在你的机器上建出一串不存在的目录。把三行 `volumes` 的左边换成你自己的目录：
+打开 `.env`，把目录改成你自己的。默认值是项目下的 `./data/`，够用就可以不动；想放到大盘或 NAS 就填绝对路径：
 
-```yaml
-volumes:
-  - /你的路径/strm:/app/strm
-  - /你的路径/logs:/app/logs
-  - /你的路径/config:/app/config
-  # 跨盘复制的暂存区，可选；不映射就落在 config 卷里
-  - /你的路径/storage:/app/storage
+```env
+MH_CONFIG_DIR=/你的路径/config
+MH_STRM_DIR=/你的路径/strm
+MH_LOGS_DIR=/你的路径/logs
+MH_STORAGE_DIR=/你的路径/storage
 ```
+
+`.env` 是各人本机的部署配置，`.gitignore` 已忽略，不会被提交。`compose.yml` 本身不用改。
 
 然后：
 
@@ -33,9 +34,11 @@ volumes:
 docker compose up -d
 ```
 
-打开 `http://127.0.0.1:18080`。登录凭据由环境变量 `MH_USERNAME` / `MH_PASSWORD` 提供（不再有默认的 `admin/admin123`），可以在 `compose.yml` 的 `environment` 里加，或者启动后在设置页改。
+打开 `http://127.0.0.1:18080`，默认账号 `admin` / `admin123`，**首次登录后到设置页改掉**。
 
 `config` 目录装的是数据库、Cookie 与全部设置，**升级镜像不会清掉它**，但删掉它等于重置。
+
+> `MH_USERNAME` / `MH_PASSWORD` 是宿主机命令行 `cli.py` 用的，不作用于容器内网页登录，别混在一起配。
 
 ### 直接跑
 

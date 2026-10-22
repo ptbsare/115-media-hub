@@ -1,23 +1,25 @@
-version: '3.8'
-
 services:
+  # 这个服务名是历史命名（早期用于区分测试环境），不影响使用。
+  # 所有本机相关的路径、端口都从同目录的 .env 读，模板见 .env.example：
+  #   cp .env.example .env
+  # 换机器或换磁盘时只改 .env，不用动这个文件。
   115-media-hub-test:
-    
+
     build: .
-    container_name: 115-media-hub-test
+    container_name: ${MH_CONTAINER_NAME:-115-media-hub}
     volumes:
-      - /Users/xianer/Documents/docker/115strmxianer/strm:/app/strm
-      - /Users/xianer/Documents/docker/115strmxianer/logs:/app/logs
-      - /Users/xianer/Documents/docker/115strmxianer/config:/app/config
+      - ${MH_STRM_DIR:-./data/strm}:/app/strm
+      - ${MH_LOGS_DIR:-./data/logs}:/app/logs
+      - ${MH_CONFIG_DIR:-./data/config}:/app/config
       # 额外存储（跨盘复制暂存区用）。/app/storage 这个路径没有被其它功能占用，可以直接拿它当挂载点：
-      #   1) 取消下面一行的注释，把左边换成你的大盘 / 机械硬盘 / NAS 路径
+      #   1) 在 .env 里把 MH_STORAGE_DIR 换成你的大盘 / 机械硬盘 / NAS 路径
       #   2) 重建容器：docker compose up -d --force-recreate
       #   3) 设置页「参数配置 → 本地存储位置 → 更换目录」，列表里会自动出现它，点一下选中保存
       # macOS 用 /Volumes/media，Linux/NAS 用 /mnt/hdd 这类路径。不映射也能用：暂存默认落在 config 卷。
-      - /Users/xianer/Documents/docker/115strmxianer/storage:/app/storage
+      - ${MH_STORAGE_DIR:-./data/storage}:/app/storage
 
     ports:
-      - "18080:18080"
+      - "${MH_PORT:-18080}:18080"
     environment:
-      - TZ=Asia/Shanghai
+      - TZ=${TZ:-Asia/Shanghai}
     restart: always
