@@ -1958,6 +1958,64 @@ def submit_quark_share_save(
         raise
 
 
+def wait_quark_share_save_task(
+    cookie: str,
+    task_id: str,
+    timeout: float = 120.0,
+    interval: float = 1.0,
+) -> Dict[str, Any]:
+    """等夸克异步转存任务真正落地。
+
+    夸克的 /share/sharepage/save 只是「提交任务」，立刻返回一个 task_id；文件要过
+    一会儿才出现在目标目录里（小文件通常 1~3 秒，整目录分享可能几十秒）。转存后
+    马上列目录会拿到旧列表，表现为「转存成功但中转目录里找不到新条目」。
+
+    状态码（data.status）：1 等待/进行中，2 已完成，3 失败。
+    超过 timeout 仍没完成时返回 ``ok=False``，由调用方决定是继续等目录还是报错。
+    """
+    normalized_cookie = str(cookie or "").strip()
+    normalized_task_id = str(task_id or "").strip()
+    if not normalized_cookie:
+        raise RuntimeError("Quark Cookie 未配置")
+    if not normalized_task_id:
+        return {"ok": False, "status": 0, "reason": "没有 task_id"}
+
+    deadline = time.monotonic() + max(5.0, float(timeout or 120.0))
+    headers = _build_quark_headers(normalized_cookie, referer="https://pan.quark.cn/")
+    last_status = 0
+    consecutive_errors = 0
+    while time.monotonic() < deadline:
+        try:
+            url = _build_quark_api_url("/1/clouddrive/task", {"task_id": normalized_task_id})
+            payload = _request_quark_json_payload(
+                url,
+                {},
+                headers,
+                timeout=20,
+                method="GET",
+                fallback="查询夸克转存任务失败",
+            )
+            consecutive_errors = 0
+            data = payload.get("data", {}) if isinstance(payload.get("data"), dict) else {}
+            last_status = parse_int(data.get("status"), default=0)
+            if last_status == 2:
+                return {"ok": True, "status": 2, "response": payload}
+            if last_status == 3:
+                return {
+                    "ok": False,
+                    "status": 3,
+                    "reason": str(data.get("message", "") or "夸克转存任务失败"),
+                    "response": payload,
+                }
+        except Exception as exc:  # 查询本身失败不该让补源直接崩掉
+            consecutive_errors += 1
+            if consecutive_errors >= 3:
+                return {"ok": False, "status": last_status, "reason": str(exc)}
+        time.sleep(max(0.3, float(interval or 1.0)))
+
+    return {"ok": False, "status": last_status, "reason": "等待夸克转存任务超时"}
+
+
 # === 上传能力（秒传优先：md5+sha1 双哈希 → 未命中走 OSS 分片） ===
 # 链路（对齐社区成熟实现 athunderx/OpenList quark driver）：
 #   /file/upload/pre   → task_id / bucket / obj_key / upload_id / upload_url / auth_info / callback / part_size
@@ -2474,6 +2532,17 @@ class QuarkProvider(CloudProvider):
             str(payload.get("receive_code", "") or "").strip(),
             selected_entries,
         )
+
+    def wait_share_save(self, cookie, save_result, timeout=120.0, interval=1.0):
+        """等异步转存任务完成（save 接口只提交任务，文件稍后才进目录）。"""
+        payload = save_result if isinstance(save_result, dict) else {}
+        response = payload.get("response", {}) if isinstance(payload.get("response"), dict) else {}
+        data = response.get("data", {}) if isinstance(response.get("data"), dict) else {}
+        task_id = str(data.get("task_id", "") or "").strip()
+        if not task_id:
+            # 少数情况下接口同步完成、没有 task_id：让调用方直接列目录判断
+            return {"ok": True, "status": 2, "reason": "接口未返回 task_id，按同步完成处理"}
+        return wait_quark_share_save_task(cookie, task_id, timeout=timeout, interval=interval)
 
     def probe_connectivity(self, cookie):
         try:

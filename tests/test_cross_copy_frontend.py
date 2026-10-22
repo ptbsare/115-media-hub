@@ -101,7 +101,7 @@ class CrossCopyFrontendTest(unittest.TestCase):
             self.assertIn(f'value="{mode}"', subscription_modal)
         self.assertIn("cross_copy_mode: getSubscriptionCrossCopyMode()", subscription_ui)
         self.assertIn("cross_copy_sources: getSelectedSubscriptionCrossCopySources()", subscription_ui)
-        self.assertIn("已开启跨盘补源，请至少勾选一个源网盘", subscription_ui)
+        self.assertIn("目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘", subscription_ui)
         self.assertIn("setSubscriptionCrossCopyMode(task.cross_copy_mode || 'off')", subscription_ui)
 
 

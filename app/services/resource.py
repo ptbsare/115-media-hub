@@ -514,6 +514,156 @@ def _submit_provider_share_receive_job(
     return provider.submit_share_receive(cookie, receive_payload, selected_entries)
 
 
+# 落地等待按片轮询：片越短取消越灵敏；每片不低于 5 秒，因为
+# wait_quark_share_save_task 内部对 timeout 有 5 秒下限，传更小的值没意义。
+RESOURCE_SHARE_LANDING_POLL_CHUNK_SECONDS = 15
+
+
+def _share_landing_expected_keys(expected: Any) -> List[Dict[str, Any]]:
+    """把「勾选了哪些条目」整理成比对用的键：名字 + 大小 + 是否文件夹。"""
+    keys: List[Dict[str, Any]] = []
+    for entry in expected if isinstance(expected, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        name = str(entry.get("name", "") or "").strip()
+        if not name:
+            continue
+        try:
+            size = max(0, int(entry.get("size", 0) or 0))
+        except (TypeError, ValueError):
+            size = 0
+        keys.append({"name": name, "size": size, "is_dir": bool(entry.get("is_dir", False))})
+    return keys
+
+
+async def _share_landing_seen_in_target(
+    provider: Any,
+    cookie: str,
+    target_cid: str,
+    expected: Any,
+) -> bool:
+    """查一次目标目录，确认勾选的条目是否真的出现了。
+
+    任务查询超时不等于没落地（任务状态接口也会抽风），所以超时前拿目录做一次实锤。
+    大小只在两边都知道时比对：文件夹的 size 常常是 0。
+    """
+    wanted = _share_landing_expected_keys(expected)
+    normalized_cid = str(target_cid or "").strip()
+    if not wanted or not normalized_cid:
+        return False
+    try:
+        listed = await asyncio.to_thread(provider.list_entries, cookie, normalized_cid)
+    except Exception:
+        return False
+    offered: Dict[Tuple[str, bool], int] = {}
+    for item in listed if isinstance(listed, list) else []:
+        if not isinstance(item, dict):
+            continue
+        name = str(item.get("name", "") or "").strip()
+        if not name:
+            continue
+        try:
+            size = max(0, int(item.get("size", 0) or 0))
+        except (TypeError, ValueError):
+            size = 0
+        offered[(name, bool(item.get("is_dir", False)))] = size
+    for item in wanted:
+        key = (item["name"], bool(item["is_dir"]))
+        if key not in offered:
+            return False
+        actual_size = offered[key]
+        if int(item["size"] or 0) > 0 and actual_size > 0 and actual_size != int(item["size"]):
+            return False
+    return True
+
+
+async def _wait_share_receive_landing(
+    *,
+    provider: Any,
+    cookie: str,
+    bundle: Any,
+    target_cid: str,
+    expected: Any,
+    total_timeout: float,
+    ensure_not_cancelled: Any = None,
+) -> Dict[str, Any]:
+    """等「分享转存」的文件真正落到目标目录。
+
+    夸克的 save 接口只提交异步任务，文件要过几秒（整目录分享可能几十秒）才出现；
+    以前提交完立刻标「已完成」，用户去翻目录是空的，只能当成失败。这里等到任务
+    确认完成；查询超时前再查一次目标目录，避免任务接口抽风导致误判。
+
+    115 这类同步接口没有 wait_share_save，直接返回「不需要等」，行为不变。
+    """
+    wait_fn = getattr(provider, "wait_share_save", None)
+    if not callable(wait_fn):
+        return {"supported": False, "confirmed": True, "skipped": True, "reason": "sync_provider"}
+    budget = max(0.05, float(total_timeout or 0))
+    chunk_cap = max(0.05, float(RESOURCE_SHARE_LANDING_POLL_CHUNK_SECONDS or 15))
+    started = time.monotonic()
+    deadline = started + budget
+    last_status = 0
+    last_reason = ""
+    while True:
+        if callable(ensure_not_cancelled):
+            ensure_not_cancelled("等待转存落地")
+        remaining = deadline - time.monotonic()
+        chunk = min(chunk_cap, max(0.05, remaining))
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.to_thread(wait_fn, cookie, bundle, chunk),
+                timeout=chunk + 5,
+            )
+        except asyncio.TimeoutError:
+            outcome = {"ok": False, "status": 0, "reason": "查询转存任务超时"}
+        except Exception as exc:  # noqa: BLE001 - 查询失败不该把导入直接判失败
+            outcome = {"ok": False, "status": 0, "reason": str(exc)}
+        payload = outcome if isinstance(outcome, dict) else {}
+        last_status = int(payload.get("status", 0) or 0)
+        last_reason = str(payload.get("reason", "") or "").strip()
+        elapsed = round(time.monotonic() - started, 1)
+        if bool(payload.get("ok")):
+            return {
+                "supported": True,
+                "confirmed": True,
+                "skipped": False,
+                "status": last_status,
+                "elapsed": elapsed,
+                "reason": last_reason,
+            }
+        if last_status == 3:
+            return {
+                "supported": True,
+                "confirmed": False,
+                "failed": True,
+                "skipped": False,
+                "status": last_status,
+                "elapsed": elapsed,
+                "reason": last_reason or "对方网盘转存任务失败",
+            }
+        if time.monotonic() >= deadline:
+            break
+    elapsed = round(time.monotonic() - started, 1)
+    if await _share_landing_seen_in_target(provider, cookie, target_cid, expected):
+        return {
+            "supported": True,
+            "confirmed": True,
+            "skipped": False,
+            "status": last_status,
+            "elapsed": elapsed,
+            "reason": last_reason,
+            "directory_confirmed": True,
+        }
+    return {
+        "supported": True,
+        "confirmed": False,
+        "skipped": False,
+        "status": last_status,
+        "elapsed": elapsed,
+        "reason": last_reason or "等待落地超时",
+    }
+
+
 async def cancel_resource_job(job_id: int, reason: str = "manual") -> Dict[str, Any]:
     job = get_resource_job(job_id, include_private=True)
     if not job:
@@ -929,6 +1079,32 @@ async def run_resource_job(job_id: int) -> None:
                 job["extra_json"] = safe_json_dumps(merged_extra)
         ensure_not_cancelled("提交后")
 
+        # 第二段预算：等文件真的落地。必须放在上面那个 90s 提交超时之外——
+        # wait_for 超时不会杀掉线程，嵌套进来就会被掐断，产生「报失败但其实转存成功」。
+        landing: Dict[str, Any] = {"supported": False, "confirmed": True, "skipped": True}
+        if is_share_receive_link and not is_offline_link:
+            landing_timeout = max(10, int(RESOURCE_SHARE_LANDING_TIMEOUT_SECONDS or 120))
+            if callable(getattr(share_provider, "wait_share_save", None)):
+                update_resource_job(
+                    job_id,
+                    status="running",
+                    status_detail=f"{provider_label} 已受理转存，等待文件落地（最长 {landing_timeout} 秒）",
+                )
+            landing = await _wait_share_receive_landing(
+                provider=share_provider,
+                cookie=provider_cookie,
+                bundle=response_bundle,
+                target_cid=folder_id,
+                expected=resolved_selection.get("selected_entries"),
+                total_timeout=landing_timeout,
+                ensure_not_cancelled=ensure_not_cancelled,
+            )
+            if landing.get("failed"):
+                # 夸克明确报失败：走统一失败收口，别让它显示成完成
+                raise RuntimeError(
+                    f"{provider_label} 转存失败：{landing.get('reason') or '对方返回失败'}"
+                )
+
         if is_offline_link:
             identity = build_offline_job_identity(job)
             offline_extra = safe_json_loads(job.get("extra_json"), {})
@@ -949,7 +1125,18 @@ async def run_resource_job(job_id: int) -> None:
 
         if is_share_receive_link and not bool(getattr(share_provider, "supports_monitor", False)):
             detail = f"{detail}；{provider_label} 不联动文件夹监控，导入后不会自动刷新"
-            next_status = "completed"
+            if bool(landing.get("supported")) and not bool(landing.get("confirmed")):
+                # 没确认落地就别宣称完成：标「待刷新」，用户看到的是实话
+                next_status = "submitted"
+                detail = (
+                    f"{detail}；已提交，等待 {landing.get('elapsed', 0)} 秒未确认落地，"
+                    "文件可能稍后出现在目录"
+                )
+            else:
+                next_status = "completed"
+                if bool(landing.get("supported")):
+                    landed_note = "已在目标目录确认落地" if landing.get("directory_confirmed") else "已确认落地"
+                    detail = f"{detail}；{landed_note}（{landing.get('elapsed', 0)} 秒）"
         else:
             monitor_task_name = str(job.get("monitor_task_name", "") or "").strip()
             auto_refresh_enabled = bool(job.get("auto_refresh"))
@@ -992,6 +1179,22 @@ async def run_resource_job(job_id: int) -> None:
             update_fields["finished_at"] = now_text()
         if is_share_receive_link:
             update_fields["extra_json"] = job.get("extra_json", safe_json_dumps({}))
+            if bool(landing.get("supported")):
+                # 落地等待的诊断挂在任务扩展字段里，排查时不用翻日志
+                update_fields["extra_json"] = safe_json_dumps(
+                    merge_json_object(
+                        safe_json_loads(update_fields["extra_json"], {}),
+                        {"share_landing": {key: landing.get(key) for key in (
+                            "confirmed",
+                            "failed",
+                            "skipped",
+                            "status",
+                            "elapsed",
+                            "reason",
+                            "directory_confirmed",
+                        )}},
+                    )
+                )
             if str(job.get("sharetitle", "")).strip():
                 update_fields["sharetitle"] = str(job.get("sharetitle", "")).strip()
         elif is_offline_link:

@@ -662,6 +662,14 @@ RESOURCE_CHANNEL_INACTIVE_CACHE_LIMIT = max(0, int(os.environ.get("RESOURCE_CHAN
 RESOURCE_CHANNEL_CACHE_TTL_DAYS = max(0, int(os.environ.get("RESOURCE_CHANNEL_CACHE_TTL_DAYS", 30) or 30))
 RESOURCE_QUICK_LINKS_LIMIT = 60
 RESOURCE_IMPORT_TIMEOUT_SECONDS = max(10, min(900, int(os.environ.get("RESOURCE_IMPORT_TIMEOUT_SECONDS", 90) or 90)))
+# 分享转存「等文件真的落地」的预算：夸克 save 只提交任务，文件要过几秒才出现在
+# 目录里。与上面的提交预算分开计时，避免被 90s 掐断后误报失败。
+RESOURCE_SHARE_LANDING_TIMEOUT_SECONDS = max(
+    10,
+    min(600, int(os.environ.get("RESOURCE_SHARE_LANDING_TIMEOUT_SECONDS", 120) or 120)),
+)
+# 夸克中转目录里补源副本的默认保留天数（0 = 不自动清理）
+DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS = 7
 RESOURCE_JOB_STALE_RECOVER_SECONDS = max(
     30,
     min(7 * 24 * 3600, int(os.environ.get("RESOURCE_JOB_STALE_RECOVER_SECONDS", 300) or 300)),
@@ -1062,6 +1070,9 @@ def default_config() -> Dict[str, Any]:
         "cross_copy_notify_subscription": True,
         "cross_copy_notify_manual": True,
         "cross_copy_delete_source_after": True,
+        # 夸克中转目录（云下载/跨盘中转）里补源副本的保留天数：0 = 不自动清理。
+        # 成功复制会自动删源文件，取消/失败为续传保留，超期由定时任务兜底清理。
+        "cross_copy_staging_retention_days": 7,
         "scraper_noise_phrases": [],
         "scraper_standalone_noise_words": [],
     }
@@ -1909,6 +1920,23 @@ def convert_subscription_absolute_to_season_episode(task: Dict[str, Any], absolu
         remaining -= season_total
 
 
+def build_subscription_movie_savepath(task: Dict[str, Any], base_savepath: str) -> str:
+    """电影订阅在目标网盘里的落点：``<savepath>/片名 年份``。
+
+    导入（转存后移动文件）和跨盘补源都必须用这一个函数，别各写一遍——两处
+    各拼一次字符串，格式迟早会分叉，用户就会看到同一部电影躺在两个目录里。
+    """
+    normalized_base = normalize_relative_path(base_savepath)
+    payload = task if isinstance(task, dict) else {}
+    title = str(payload.get("title", "") or "").strip()
+    year = str(payload.get("year", "") or "").strip()
+    folder_name = sanitize_115_folder_name(
+        f"{title} {year}".strip() or "未命名电影",
+        fallback="未命名电影",
+    )
+    return join_relative_path(normalized_base, folder_name)
+
+
 def build_subscription_tv_savepath(task: Dict[str, Any], base_savepath: str, season: int = 0, episode: int = 0) -> str:
     normalized_base = resolve_subscription_tv_base_savepath(task, base_savepath)
     if not normalized_base:
@@ -2735,6 +2763,26 @@ def _normalize_cross_copy_notify_config(merged: Dict[str, Any]) -> None:
     )
 
 
+def _clamp_cross_copy_staging_retention_days(value: Any) -> int:
+    """夸克中转副本保留天数：0 = 关，非法值回落默认 7，上限 365 天。
+
+    设置页提交的是字符串（"7"），也可能被手改成空串或负数，所以这里统一兜住；
+    0 是合法值（表示不自动清理），不能当成「未设置」。
+    """
+    raw = value if value not in (None, "") else DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS
+    try:
+        days = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS
+    return max(0, min(365, days))
+
+
+def _normalize_cross_copy_staging_retention_config(merged: Dict[str, Any]) -> None:
+    merged["cross_copy_staging_retention_days"] = _clamp_cross_copy_staging_retention_days(
+        merged.get("cross_copy_staging_retention_days", DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS)
+    )
+
+
 def get_mount_prefix(cfg: Dict[str, Any], provider: str) -> str:
     provider_key = normalize_mount_provider(provider)
     if not provider_key:
@@ -3056,6 +3104,7 @@ def normalize_config(cfg: Dict[str, Any]) -> Dict[str, Any]:
     merged["mount_points"] = normalize_mount_points(merged.get("mount_points", []))
     _normalize_cross_copy_temp_dir_config(merged)
     _normalize_cross_copy_notify_config(merged)
+    _normalize_cross_copy_staging_retention_config(merged)
     merged["cross_copy_delete_source_after"] = normalize_bool(
         merged.get("cross_copy_delete_source_after", True), default=True
     )

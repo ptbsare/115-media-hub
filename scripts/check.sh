@@ -96,8 +96,8 @@ fi
 
 if [ -n "$run_changed" ]; then
   step "unittest（按改动挑选：${run_changed}）"
-  # run_tests.py 会把临时目录挪进仓库并吞掉「清理失败」噪音——本机安全中心
-  # 会拦临时文件删除，直接 discover 会刷一堆假失败。
+  # run_tests.py 会把临时目录指到本轮会话目录（系统临时区），并只在会话目录内
+  # 容忍清理失败——本机安全中心会拦临时文件删除，直接 discover 会刷一堆假失败。
   if [ "$in_container" = "1" ]; then
     scripts/test_in_container.sh --changed "$run_changed" || failed=1
   else

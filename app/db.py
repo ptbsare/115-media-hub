@@ -539,6 +539,8 @@ def ensure_db() -> None:
                     origin_ref TEXT NOT NULL DEFAULT '',
                     source_is_dir INTEGER NOT NULL DEFAULT 0,
                     resume_json TEXT NOT NULL DEFAULT '{}',
+                    organize_state TEXT NOT NULL DEFAULT '',
+                    organize_detail TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT NOT NULL DEFAULT '',
@@ -587,6 +589,20 @@ def ensure_db() -> None:
                 cursor.execute(
                     "ALTER TABLE cross_copy_jobs ADD COLUMN resume_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "organize_state" not in cross_copy_job_columns:
+                # 补源入库后整理状态：'' 不涉及 / pending 待整理 / running 整理中 /
+                # done 已改名 / skipped 按开关不需要 / failed 整理失败（文件保持原名）
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN organize_state TEXT NOT NULL DEFAULT ''"
+                )
+            if "organize_detail" not in cross_copy_job_columns:
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN organize_detail TEXT NOT NULL DEFAULT ''"
+                )
+            # 索引必须放在补列之后：老库这张表还没有 organize_state 时不能建
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_organize ON cross_copy_jobs(organize_state)"
+            )
             cursor.execute("PRAGMA table_info(local_files)")
             local_file_columns = {str(row[1]) for row in cursor.fetchall()}
             if "scan_token" not in local_file_columns:

@@ -1472,6 +1472,11 @@
             }
         }
 
+        // 补源真正接通的源网盘：必须与后端 app/services/subscription_cross_copy.py 的
+        // SUPPORTED_SOURCE_PROVIDERS 保持一致。跨盘复制引擎支持 115/夸克/阿里互传，
+        // 但订阅补源只接通了夸克作源，这里不能直接照搬「能当源」的能力表，
+        // 否则界面能勾、后端静默跳过。
+        const SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES = ['quark'];
         const SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES = [{ name: 'quark', label: '夸克网盘' }];
         let subscriptionCrossCopySourcesCache = null;
         let subscriptionCrossCopySourcesPromise = null;
@@ -1517,6 +1522,7 @@
                     const providers = Array.isArray(capabilities?.providers) ? capabilities.providers : [];
                     const sources = providers
                         .filter(item => item?.can_be_source)
+                        .filter(item => SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(String(item?.name || '')))
                         .map(item => ({ name: String(item.name || ''), label: String(item.label || item.name || '') }));
                     subscriptionCrossCopySourcesCache = sources.length ? sources : SUBSCRIPTION_CROSS_COPY_FALLBACK_SOURCES;
                 } catch (e) {
@@ -1570,9 +1576,9 @@
                 if (disabled) {
                     hintEl.textContent = '已关闭：只用自家网盘候选，不做跨盘复制。';
                 } else if (!getSelectedSubscriptionCrossCopySources().length) {
-                    hintEl.textContent = '请至少勾选一个源网盘。勾选后，任务才会从该网盘补源。';
+                    hintEl.textContent = '请勾选夸克网盘作为源网盘。目前跨盘补源只支持从夸克网盘复制资源，其他网盘还没接通。';
                 } else {
-                    hintEl.textContent = '复制只读取源网盘，不会删除源文件；暂存位置和空间预检在参数配置的「存储位置」中设置。';
+                    hintEl.textContent = '复制只读取源网盘，不会删除源文件；暂存位置和空间预检在参数配置的「存储位置」中设置。目前源网盘仅支持夸克。';
                 }
             }
             void loadSubscriptionCrossCopySources().then(sources => {
@@ -1797,9 +1803,10 @@
             const crossCopyMode = String(task.cross_copy_mode || 'off').trim().toLowerCase();
             const crossCopySources = (Array.isArray(task.cross_copy_sources) ? task.cross_copy_sources : [])
                 .map(item => String(item || '').trim())
-                .filter(item => item && item !== task.provider);
+                .filter(item => item && item !== task.provider)
+                .filter(item => SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(item));
             if (crossCopyMode !== 'off' && !crossCopySources.length) {
-                return showToast('已开启跨盘补源，请至少勾选一个源网盘', { tone: 'warn', duration: 3000, placement: 'top-center' });
+                return showToast('目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘，或把补源模式改为「关闭」', { tone: 'warn', duration: 3400, placement: 'top-center' });
             }
             task.cross_copy_mode = crossCopyMode === 'off' ? 'off' : crossCopyMode;
             task.cross_copy_sources = task.cross_copy_mode === 'off' ? [] : crossCopySources;
@@ -2398,7 +2405,8 @@
                 const lastHitBadgeHtml = buildSubscriptionLastHitBadge(task);
                 const crossCopyMode = String(task?.cross_copy_mode || 'off').trim().toLowerCase();
                 const crossCopySourceNames = Array.isArray(task?.cross_copy_sources)
-                    ? task.cross_copy_sources.map(name => String(name || '').trim()).filter(Boolean)
+                    ? task.cross_copy_sources.map(name => String(name || '').trim())
+                        .filter(name => name && SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(name))
                     : [];
                 const crossCopyBadgeHtml = crossCopyMode !== 'off' && crossCopySourceNames.length
                     ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-400/25" title="${escapeHtml(crossCopyMode === 'prefer' ? '优先跨盘：每次命中都从源网盘复制' : '兜底：自家网盘没命中才跨盘复制')}">补源：${escapeHtml(crossCopySourceNames.map(name => getSubscriptionProviderLabel(name)).join('、'))}</span>`

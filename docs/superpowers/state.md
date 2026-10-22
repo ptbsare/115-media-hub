@@ -8,46 +8,51 @@
 
 ## 基线
 
-- **更新日期**: 2026-10-21（暂存目录改成点选挂载盘，0.15.2 发版）
+- **更新日期**: 2026-10-22（补源整链修复 + 精准选集 + 中转残留清理 + 补源入库后整理 + 手动转存等落地，未发版）
 - **分支**: `main`，0.15.0 已推送；0.15.1 与 0.15.2 均为本地提交，**待推送 / 待打 tag**
 - **版本**: `0.15.2`（2026-10-21 发布：暂存目录点选挂载盘 + 三层防呆 + compose 映射说明修正）
-- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常），**用户重建镜像后才是 0.15.2 代码**
-- **最近提交**: `feb504e` 设置页暂存目录点选挂载盘 + 本轮 0.15.2 发版提交（2026-10-21）
-- **工作区**: 干净
+- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。容器内 `app/services/subscription_cross_copy.py` 等是 `docker cp` 的热更文件，**重建镜像后才是 0.15.2 + 本轮全部修复**
+- **最近提交**: `34babed` 0.15.2 发版（2026-10-21）
+- **工作区**: 有未提交改动（本轮：补源整链修复 + 源网盘收窄 + 精准选集 + 中转空目录清理 + **中转残留定时清理** + **补源入库后整理** + **手动转存等落地再判完成**）。新增模块 `cross_copy_staging_cleanup.py`、`subscription_cross_copy_organize.py`；改动面 `core.py` / `db.py` / `startup.py` / `resource.py` / `cross_copy_jobs.py` / `subscription.py` / `subscription_task_runner.py` / `subscription_cross_copy.py` / `providers/quark.py` / `ui.js` / `settings.js` / 两个页面模板 / 测试 + 文档
+
 
 ## 最近一次验证
 
-- 容器全量 **1859 项零失败**（2026-10-21，75.4s，`scripts/check.sh --all --container` 全绿），覆盖暂存目录挂载点改造与跨盘复制两条链路。
+- **订阅补源真机跑通（2026-10-22，`origin=subscription` 三条任务，用户中途手动取消）**：115 任务「光阴之外」（本盘已到 E41）一次跑出 3 条补源任务 `id=12/13/14`，`target_savepath=115连载中/光阴之外 (2025)/Season 01`，文件名 `S01E42/43/44.mp4`——**分享里 11 个文件只转存并注册了缺的 3 集**，说明「转存即挑缺集」生效。夸克中转目录 `/云下载/跨盘中转/光阴之外` 里正好只有这 3 个文件。取消后 `id=12/13` 保留 `resume_json`（断点可续传）、`id=14` 未开始；本机暂存留 2 个 `.part` 共 214MB。**「复制完成 + 中转副本被删」这一段仍缺一次完整真机**（用户主动中断）。附带发现 `/app/config/cross_copy_tmp` 有 3 个 10-21 的旧 `.part` 共 5.7GB（历史测试残留，与本次无关）。
+- 容器全量 **1974 项零失败**（2026-10-22 末轮，`scripts/check.sh --all --container`，73.8s）。此前那个「`chmod 0500` 目录仍可写」的假失败本轮没复现——测试容器是用宿主机 uid 跑的（`docker run -u $(id -u)`），不是 root，权限判定正常生效。
+- 补源模块单跑 `test_subscription_cross_copy` **78 条零失败**（含 `TestMissingEpisodeSelection` / `TestStagingCleanup` / `TestStageSharePrecision`）。
+- 容器内实测补源搜索（「光阴之外」，provider=quark）：修复前 275 条候选按集数排序，TOP3 是 3 条 score 44 的 TG 日报贴 + 《凡人修仙传》；修复后过滤出 55 条，TOP15 全是《光阴之外》，TOP1 为 score 98 / E44（本盘 E41，正是缺的集）。
 - 本机 8 模块 284 条零失败（`test_local_storage` / `test_settings_storage_ui` / `test_settings_layout_frontend` / `test_settings_notify_ui` / `test_modules_doc` / 复制引擎三件）。
 - 容器内实测：挂 `/app/storage` 后自动进候选列表；空盘自动建 `cross_copy_tmp`；`/mnt/hdd`（宿主机路径）与 `/tmp/foo`（容器层）均被拒并给出挂载指引。
-- **新增回归钉**：`TestResumeBootstrapChain`（首跑失败留断点 → 重跑零 Range 请求、跳过下载直接上传）、`TestResumeStateForDb`（含 on_part_done 闭包的状态能正常落库）、并行 1/3/8 三元结果相等、失败/取消保留临时文件。
-- **CLI 新增 `cross-copy` 命令组**（cli.py，宿主机场，不进镜像）：`capabilities` 看组合、`create` 建任务（配合 `browse ls` 查文件 ID）、`list/cancel/retry/delete/clear [--scope]` 管理记录；payload 级测试钉住。
-- **订阅补源自动链路模拟验证通过**（素材真实建夸克分享 + 合成 115 订阅任务）：
-  分享解析 → 注册任务（origin=subscription）→ 复制到 115 **落地 SHA1 逐字节一致** → 中转副本被删、夸克原片完好。转存一步在自己分享上被夸克平台 404（「禁止转存自己的分享」）拦下，属平台规则，生产是他人分享不受影响。
-- **监控目录联动验证通过**：临时监控任务指向 115/跨盘复制测试/监控联动 → 跨盘复制影片文件（让子弹飞…mkv，12.1s 秒传命中）→ 触发扫描 5 秒完成 → **STRM 生成**，指向本服务代理地址。产物已全部清理（文件/STRM/临时任务/运行记录）。
-- **又修两个真机 bug**（详见 handoff）：
-  - 夸克 `sharepage/detail` 的 stoken 旧代码双重编码，服务端改单 decode 后含 `+/=` 的 stoken 必 400「非法token」（纯字母数字碰巧正常，时好时坏）；两处改单次编码 + 2 条回归用例。
-  - 订阅补源 `_stage_share_to_quark` 把 `list_share_entries` 的 `{"entries": [...]}` dict 当裸 list 迭代 → 分享永远「没有可转存的文件」，**订阅补源转存整链原本不可用**；单测 fake 返回裸 list 掩盖了契约漂移，已连 fake 一起修。
+- **回归钉**：`TestResumeBootstrapChain`（首跑失败留断点 → 重跑零 Range 请求、跳过下载直接上传）、`TestResumeStateForDb`（含 on_part_done 闭包能落库）、并行 1/3/8 三元结果相等、失败/取消保留临时文件；**CLI `cross-copy` 命令组**（宿主机场，不进镜像：`capabilities` / `create` / `list|cancel|retry|delete|clear [--scope]`）payload 级测试钉住。
+- **订阅补源自动链路模拟验证通过**（真实夸克分享 + 合成 115 订阅任务）：分享解析 → 注册 `origin=subscription` → 复制到 115 **落地 SHA1 逐字节一致** → 中转副本被删、夸克原片完好（转存自己分享被平台 404 拦下属规则，生产是他人分享不受影响）。
+- **监控目录联动验证通过**：临时监控任务指向 115/跨盘复制测试/监控联动 → 跨盘复制影片文件（12.1s 秒传命中）→ 触发扫描 5 秒完成 → **STRM 生成**，指向本服务代理地址。产物已清理。
+- **两个真机 bug 已修**（详见 handoff）：① 夸克 `sharepage/detail` 的 stoken 旧代码双重编码，服务端改单 decode 后含 `+/=` 的 stoken 必 400「非法token」，两处改单次编码 + 2 条回归用例；② `_stage_share_to_quark` 把 `list_share_entries` 的 `{"entries": [...]}` dict 当裸 list 迭代 → 分享永远「没有可转存的文件」，**转存整链原本不可用**（单测 fake 返回裸 list 掩盖了契约漂移，已连 fake 一起修）。
 
 ## 待办
 
 ### A. 需要用户操作
 
-1. **重建镜像**（0.15.1 的并行下载与断点续传不在运行中的 App 里）；重建后建议真机跑一次：大文件跨盘复制看并发是否生效（日志/速度）、中途取消再重试看是否跳过已下载部分。
-2. 测试产物清理（都在各盘「跨盘复制测试」文件夹，确认不要就整目录删）：115 侧 `xcopy-a/b/c-aliyun/pan115`、`秒传验证`、`文件夹用例`、`xcopy-d-quark-src-3m.bin`、`监控联动`（已空）；阿里侧 `xcopy-a/b/c`、`文件夹用例`；夸克侧 `xcopy-d-quark-src-3m.bin`（原片）+ 空的「跨盘复制自测」。任务记录 10 条界面点「清空复制」即可。
-3. 接收夹 / 文件夹监控老待办（10-07~10-08 遗留）：要么集中复核，要么按「线上没报错即可用」关掉，等用户定。
+1. **重建镜像固化**（0.15.1 的并行下载 / 断点续传 + 本轮补源修复目前都是 `docker cp` 热更文件，重建后才是正式代码）。
+2. **跑完一次完整补源**（现在只差最后一段）：把取消的 3 条任务（`id=12/13/14`）点「重试」——前两条已有断点会续传，不必重下 214MB 以上的部分；预期看到落到 `115连载中/光阴之外 (2025)/Season 01` 并各出一个文件、夸克 `/云下载/跨盘中转/光阴之外` 三个中转副本被自动删。**不打算重试的话要清中转目录**，那 3 个文件约 10.3GB 占着夸克配额。
+3. 测试产物清理（都在各盘「跨盘复制测试」文件夹，确认不要就整目录删）：115 侧 `xcopy-a/b/c-aliyun/pan115`、`秒传验证`、`文件夹用例`、`xcopy-d-quark-src-3m.bin`、`监控联动`（已空）；阿里侧 `xcopy-a/b/c`、`文件夹用例`；夸克侧 `xcopy-d-quark-src-3m.bin`（原片）+ 空的「跨盘复制自测」。任务记录 14 条界面点「清空复制」即可。
+4. **陈旧临时文件**（与本次补源无关，历史测试残留，容器内可直删）：`/app/config/cross_copy_tmp` 3 个 `.part` 共 5.7GB、`/app/storage/cross_copy_tmp` 2 个 `.part` 共 214MB（后者是本次取消任务留下的，重试会复用、成功后自动删）。
+5. 接收夹 / 文件夹监控老待办（10-07~10-08 遗留）：要么集中复核，要么按「线上没报错即可用」关掉，等用户定。
 
 ### B. 已真机验证通过（勿重复）
 
 - 阿里 ↔ 115 双向、秒传、文件夹复制、多分片+分片重试、双任务并行。
-- 订阅补源自动链路（注册→复制→删源→原片安全）、监控目录联动（复制落监控目录→扫描→STRM）。
-- 并行下载 / 断点续传：**仅容器全量 + 单测验证，未真机**（重建镜像后按 A-1 复核）。
+- **订阅补源触发 + 转存 + 注册 + 落点（2026-10-22 真机）**：115 任务自动判定缺集 → 夸克搜到候选 → 只转存缺的 3 集 → 注册 3 条 `origin=subscription` 任务 → 落 `Season 01`，全部成立。
+- 订阅补源**下游链路**（注册→复制→删源→原片安全）、监控目录联动（复制落监控目录→扫描→STRM）。
+- **补源入库后原地改名 / 夸克中转残留自动清理 / 手动转存等落地再判完成**（2026-10-22，容器全量 + 单测，**未真机**——用户本机走移动网络，明确说不验证）：三件都是「代码走通、测试钉住」，真机效果等下一次实际补源时看。
+- 并行下载 / 断点续传：**仅容器全量 + 单测验证，未真机**（重建镜像后按 A-1 复核；A-2 的续传重试可顺带验证）。
 
 ### C. 已确认要做，排在后面
 
 - 123 网盘 / 天翼：接上传与取链（现在只能浏览）。用户 2026-10-20：这两个盘现在不用，先放着。
 - STRM 支持非 115（决定「复制到夸克能不能直接进媒体库播放」）。
 - 夸克 / 阿里作目标时的上传会话续传（本期只做下载侧；预签名 / pre 会话跨进程复用需真机验证后再动）。
+- **阿里作补源源**（等用户指令）：需要放开 PanSou 白名单里的阿里链接 + 接 `cross_copy_sources`。阿里源带 `content_hash`，115 可秒传、免下载，是收益最大的一条（夸克必须下载一遍算哈希）。
 
 ### 已定不做（不要再提案）
 
@@ -55,6 +60,14 @@
 
 ## 当前需要知道的上下文
 
+- **订阅跨盘补源已在主链路接通（2026-10-22，仅夸克作源）**：统一入口是 `_subscription_cross_copy_dispatch`，主链路调两次——无候选时在「等待资源」早退前，有候选时在**目标目录扫描校准 `last_episode` 之后**（首轮真机踩到：判定放在校准前，用的是进度旧值 0，候选最高 E40 > 0 就判「本盘不缺」，整条链路一次都没触发）。夸克候选走 `subscription.find_subscription_cross_copy_candidates`（浅拷贝 task、provider 换 quark 复用同一套搜索评分），**新函数靠顶部 `globals().update` 注入，不要在 `subscription_task_runner.py` 里加 import（会循环）**；`prefer` 命中即补、`fallback` 本盘缺才补（电视剧候选集数取 `episode`/`range_end` 较大值比 `last_episode`）。**落点与订阅导入一致**（`_cross_copy_target_savepath`：电影 `<savepath>/片名 年份`、剧集 `<savepath>/Season NN`，目标目录由 `ensure_folder_id_by_path` 自动建）。
+- **补源候选不能沿用主链路的排序**（2026-10-22 真机发现）：`find_subscription_cross_copy_candidates` 过滤掉 `score < min_score` 与 `low_score_fallback`，再按「标题命中任务名优先 → 分数降序」重排；注册侧 `_pick_share_candidates` 跳过被长文本污染成 `...xxxhttps` 的链接。主链路按集数排序时，TG 日报贴的假集数（实测 1170）会把 score 44 的日报贴顶到榜首，而《凡人修仙传》这类别的剧也能挤进《光阴之外》的 top 3——补源注册不做逐文件内容校验，挑错就是把别人的剧复制进本剧目录。
+- **夸克转存是异步任务，不能转完立刻列目录**（2026-10-22 真机：两条候选全部报「转存后没在中转目录找到新条目」）。`/share/sharepage/save` 只返回 `task_id`，实测小文件夹约 2 秒后条目才进目录。现在 `submit_share_receive` 之后调 `provider.wait_share_save` 轮询 `/1/clouddrive/task`（status=2 完成，默认最多 120 秒，`CROSS_COPY_STAGE_TASK_TIMEOUT` 可调），任务状态没确认也不直接判失败，再给 20 秒「列目录重试」可见窗口（`CROSS_COPY_STAGE_VISIBLE_TIMEOUT`）。**另一个后果**：上一轮其实已转存成功、只是列目录太早，文件留在中转目录里；所以 `already_staged` 分支现在会把目录里对应条目返回，交给注册侧查重后**补注册**（`find_processed_cross_copy_job` 挡住已成功/已取消的，failed 允许重试），否则永远补不上。
+- **补源选集：在「转存」这一步就只转缺的集，不是整包转存后再筛**（2026-10-22）。剧集任务有本盘进度时，`_stage_share_to_quark` 先 `_scan_share_media_files` 只读递归扫分享（≤3 层、≤40 目录），`_select_missing_episode_files` 挑缺集、`_dedupe_episode_files` 同集留体积最大，只把这几集的 `fid` 提交转存——**分享里没有缺集时一次转存都不发、连中转目录都不建**。判缺口径是「目标目录实际已落盘的集集合」（`existing_episodes`，中间缺集也能补），拿不到集合才退回比 `last_episode`。散文件与整季文件夹**两条路都过这层筛**（以前只有文件夹筛，散文件无脑全注册）；`_expand_staged_folder_media_files` 展开文件夹后逐文件注册（`source_is_dir=False`）从而拍平，同一轮按集去重（先到先得），**认不出集数的文件一律不复制**（`4！2.mp4` 这类全角脏名解析不出来，宁可少补也不污染季目录）。扫不动（403 / 超层级）才退回整包并在 skipped 写明。
+- **补源中转清理分两层**：① 源文件中转副本由 `cross_copy_jobs` 在单文件任务成功后自动删（条件 `origin=subscription` + 非文件夹 + 成功 + `cross_copy_delete_source_after`，默认开；**手动复制的源永不删**）；② 分享带进来的文件夹空壳由 `cleanup_staging_empty_folders()` 在每轮补源注册后按 DFS 倒序清，**只删确实为空的**，中转任务根目录永不删、`cid=="0"` 直接返回防御。**任务取消/失败后中转副本按设计保留**（要续传），用户不重试就一直占夸克配额。
+- **补源「入库后整理」= 复制收口只打标记 + 定时器改名**（2026-10-22）：补进来的集是分享原名（`S01E42.mp4`），订阅导入的是 `光阴之外 (2025) - S01E42.mp4`，同一部剧两种命名。`cross_copy_jobs` 成功收口在**同一条 UPDATE** 里把 `organize_state` 标 `pending`（仅 `origin=subscription` + 非文件夹 + 成功；重试清空），`subscription_cross_copy_organize` 定时器（120 秒一轮）捞 90 秒防抖窗口外的、按（目标网盘 + 目标目录 + 订阅任务名）成组、CAS 抢占后调刮削命名计划**原地改名**（只改文件名、不移动、不建目录），开关沿用该订阅任务的「入库后整理（电视剧）」，关掉或 `tmdb_id<=0` 标 `skipped`。**别把改名塞回复制收口**：刮削任务阻塞最长几分钟，会占死并发名额。
+- **夸克中转残留自动清理**（2026-10-22）：`cross_copy_staging_cleanup` 定时器（默认 1800 秒）扫中转根下每个任务目录，删掉超过 `cross_copy_staging_retention_days`（**0 = 关，默认 7 天**）没修改的条目与空目录；**活跃任务的条目受保护**（先查 `cross_copy_jobs` 活跃集，查不到就整轮跳过）；删除是进夸克回收站、**配额不会立即释放**。清掉之后旧任务「重试可续传」不成立，调小之前要知道这个代价。
+- **源网盘界面只列夸克（2026-10-22）**：跨盘复制引擎支持 115/夸克/阿里互传，但补源只把「夸克 → 目标盘」接进了主链路。此前订阅弹窗按「能当源」的能力表列出阿里/115，勾了却不执行、日志一个字不写；现在前端收窄成只列已接通的源（`ui.js` 的 `SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES`，须与 `core.SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS` 一致），后端 `split_cross_copy_sources` 把历史配置/手工写入的未接通源识别出来写 warn（「暂未接通补源，本次已跳过」），无可用源时同样写 warn，不再静默。
 - **跨盘复制三段式**：取链 → 分段下载（16MB 一段、**同任务内默认 3 路并发**，`CROSS_COPY_DOWNLOAD_PARALLEL` 1~8；落盘后按顺序整文件算哈希）→ 秒传探测 / 分片上传。任务全局并发默认 2（`CROSS_COPY_MAX_CONCURRENT`，硬上限 8），文件夹任务内部逐文件串行。
 - **断点续传两层**（2026-10-21 起）：下载侧（连续前缀续下 / 哈希已有则整段跳过）+ 115 上传会话侧（`upload_id` + parts 对账，只补缺片）。状态挂 `cross_copy_jobs.resume_json`，失败/取消保留、成功清除、孤儿与删记录联动作废；续传前复探源哈希防旧内容上传。**落库必须过 `resume_state_for_db`**——`resume["upload"]["on_part_done"]` 是闭包，直接 `json.dumps` 会抛异常被吞掉，断点静默不落库。
 - **暂存目录是单目录模型**（2026-10-21 起，原「位置列表」已下线）：配置只有 `cross_copy_temp_dir`（容器内绝对路径，空 = 默认 `/app/config/cross_copy_tmp`）；设置项 2b 只做「看当前目录状态 + 填容器内路径更换 + 恢复默认」；旧三字段（`local_storages`/`cross_copy_temp_storage`/`cross_copy_temp_subdir`）读取时自动迁移、保存新值后清除；接口是 `GET/POST /storage/temp-dir`。

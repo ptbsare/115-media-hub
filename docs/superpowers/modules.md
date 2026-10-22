@@ -18,8 +18,8 @@
 ### 资源中心（resource）
 - **用途**：把外部资源变成网盘里的文件：同步 TG 频道、PanSou 盘搜、手动粘贴资源文本。
 - **入口**：页面「资源中心」；`POST /resource/...`；CLI `resource ...`。
-- **会做**：频道同步与分类、资源文本预览/导入、解析 magnet / ED2K / 直链与 115·夸克·天翼·123·阿里分享、提交导入任务（转存 / 离线 / 跨盘）、浏览网盘目录；任务可取消、清理、删除。
-- **不会做**：不生成 STRM、不重命名整理；入库后是否刷新播放文件取决于是否命中监控任务（webhook / 导入完成触发）。
+- **会做**：频道同步与分类、资源文本预览/导入、解析 magnet / ED2K / 直链与 115·夸克·天翼·123·阿里分享、提交导入任务（转存 / 离线 / 跨盘）、浏览网盘目录；任务可取消、清理、删除。**分享转存类任务「提交受理」不等于完成**：夸克 `/share/sharepage/save` 只返回 task_id，任务会先调 `wait_share_save` 等异步任务结束，再按落盘宽限期（`RESOURCE_SHARE_LANDING_TIMEOUT_SECONDS`，默认 120 秒）轮询目标目录确认文件真的出现，确认到才写 `completed`；超时未确认写 `submitted` 并注明「文件可能稍后出现」，把「已提交」和「已落地」分开，避免用户看到完成却在目录里找不到。
+- **不会做**：不生成 STRM、不重命名整理；入库后是否刷新播放文件取决于是否命中监控任务（webhook / 导入完成触发）；超时未确认落地的任务不会自动重试转存（要重来就手动重跑），也不会替用户去猜「分享里到底有哪个文件」。
 - **相关代码**：`app/routes/resource.py`、`app/services/resource.py`、`app/providers/pansou.py`；页面 `templates/partials/pages/resource.html`
 - **细节**：`docs/superpowers/specs/2026-08-09-resource-sync-refresh-design.md`、`2026-08-27-cross-cloud-copy-design.md`
 
@@ -34,8 +34,13 @@
 - **用途**：按片名/剧名周期找资源并入库，持续追更。
 - **入口**：页面「影视订阅」；`/subscription/...`；CLI `subscribe ...`。
 - **会做**：按名称搜索资源、按质量/集数筛选、转存或磁力离线入库、记录剧集台账、可选通知，并在入库后精准触发监控刷新（STRM）；**电视剧订阅自理新集**：入库后按任务自己的「入库后整理」选项（默认开启、standard 命名、中文标题）对本次新入库文件**原地改名**（只改文件名、不建目录、不移动，要求 `tmdb_id>0`），电影订阅不改名；「扫描链接」弹窗支持一次粘贴多条（每行一条，115 可混排分享/磁力/电驴），每条链接各自排一次任务按顺序执行；磁力/电驴走 115 离线时，115 报「下载完成」后还会在**宽限期（30 秒 / 每 10 秒一次 / 最多 3 次）**重扫中转目录，避免 115 目录列表滞后于一瞬间把「文件刚到」判成「没有文件」。
-- **不会做**：不直接写 STRM 文件（生成交给文件夹监控 / 目录树），不整理你已有的库结构；**电视剧的原地改名只针对本次新入库文件，不承担「归档进片名文件夹」职责（那是接收夹的活），电影订阅 v1 一律不改名**。
-- **相关代码**：`app/routes/subscription.py`、`app/services/subscription.py`；页面 `templates/partials/pages/subscription.html`
+- **不会做**：不直接写 STRM 文件（生成交给文件夹监控 / 目录树），不整理你已有的库结构；**电视剧的原地改名只针对本次新入库文件，不承担「归档进片名文件夹」职责（那是接收夹的活），电影订阅 v1 一律不改名**；**跨盘补源只认夸克作源网盘**（`cross_copy_sources` 仅 `["quark"]`），阿里 / 115 作源未接。
+- **跨盘补源触发口径**（2026-10-22 接通并修正判定时机）：补源统一走 `_subscription_cross_copy_dispatch`，主链路里调用两次——**无候选时**在「等待资源」早退之前（本盘一条候选都没有必然缺，判定不依赖 `last_episode`）；**有候选时**在**目标目录扫描校准 `last_episode` 之后**（校准前是进度旧值，fallback 会恒判「本盘不缺」而永不补源，首轮真机就是这么一次都没触发的）。补源候选单独用夸克搜（`find_subscription_cross_copy_candidates`），不混进本盘候选；`prefer` = 命中即补，`fallback` = 本盘缺才补（电影无候选算缺；电视剧候选集数取 `episode`/`range_end` 较大值，全都 ≤ `last_episode` 算缺），`off` = 不补。
+- **补源转存只转缺的集**（2026-10-22）：剧集任务 + 本盘已有进度时，`_stage_share_to_quark` 先调 `_scan_share_media_files` 只读地递归列分享文件，按集数挑出缺的（`_select_missing_episode_files` + `_dedupe_episode_files` 同集留最大），只把这几集转存进夸克中转；分享里没有缺集时一次转存都不发（连中转目录都不建）。扫不出文件（子目录 403 / 超过 `SHARE_SCAN_MAX_DIRS`）才退回整包转存，并在 `skipped` 里写明。**不要改回「整包转存后在中转里筛」**：下载虽然一样只下缺的，但夸克配额会被整包占住（不付费账号一个季包就满）。
+- **补源候选排序口径**（与主链路不同，别混用）：`find_subscription_cross_copy_candidates` 返回前会丢掉 `score < min_score` 和 `low_score_fallback` 的候选，再按「标题命中任务名优先 → 分数降序」重排。主链路的电视剧候选是「集数优先」排序，而跨盘候选多来自 TG 日报贴，容易解析出 1170 这类假集数，按集数取 top N 会把低分日报贴和**别的剧**顶到队首（实测《凡人修仙传》混进《光阴之外》的候选并排到第 3）。注册侧 `_pick_share_candidates` 另会跳过被长文本污染成 `...xxxhttps` 的链接。
+- **源网盘界面只列夸克**（名单来自 `core.SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS`，与 `subscription_cross_copy.split_cross_copy_sources` 同源），历史上勾过的 115/阿里 不再静默——跑任务时写一条 warn 明确「暂未接通补源，本次已跳过」，没有可用源时也写一条，避免「开关是开的却什么都没发生」。
+- **补源入库后按任务开关原地改名**（2026-10-22）：分享里复制过来的文件是分享原名（`S01E42.mp4`），跟订阅导入的 `剧名 (年份) - S01E42.mp4` 不一致，媒体库会有两种命名。所以单文件补源任务**复制成功后只在同一条 UPDATE 里打一个 `organize_state='pending'` 标记**（不额外写库），由 `subscription_cross_copy_organize` 的定时器成组（同目标目录 + 同任务）、等 90 秒防抖、CAS 抢占后调刮削的命名计划**原地改名**；开关沿用该订阅任务的「入库后整理（电视剧）」，关掉或 `tmdb_id<=0` 就标 `skipped` 不动手。文件夹任务与手动复制任务一律不标记。改名**只改文件名、不移动、不建目录**，所以不会把 Season 里的文件搬去别处。
+- **相关代码**：`app/routes/subscription.py`、`app/services/subscription.py`、`app/services/subscription_cross_copy_organize.py`；页面 `templates/partials/pages/subscription.html`
 - **细节**：README 的「方案三 / 方案四」；磁力 / 电驴手动离线入库的实现说明用 `rg "磁力/电驴离线入库" docs/superpowers/handoff-archive.md` 定位
 
 ### 文件夹监控（folder monitor）
@@ -71,7 +76,7 @@
 ### 参数配置（settings）
 - **用途**：全局配置与运维入口：认证、签到、通知、代理、安全、AI、版本。
 - **入口**：页面「参数配置」；`/get_settings`、`/save_settings`、`/settings/...`。
-- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知（四个场景开关：订阅更新成功、文件夹监控生成成功、跨盘复制按任务来源分订阅补源/手动复制；渠道配置共用，场景开关互不影响）、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）、本地暂存目录管理（单个容器内目录 `cross_copy_temp_dir`，空 = 默认 `/app/config/cross_copy_tmp`；保存前探测存在/可写/剩余空间；旧版「位置列表」配置读取时一次性迁移）。
+- **会做**：网盘认证（115 扫码或手动 Cookie、阿里云盘官方 OAuth、其余 Cookie / 凭证）、Cookie 体检与凭证复制、115 每日签到开关与手动签到、企业微信通知（四个场景开关：订阅更新成功、文件夹监控生成成功、跨盘复制按任务来源分订阅补源/手动复制；渠道配置共用，场景开关互不影响）、TG 代理与 PanSou / AI 连通测试、后台安全（登录密码、全局 `webhook_secret`）、本地暂存目录管理（单个容器内目录 `cross_copy_temp_dir`，空 = 默认 `/app/config/cross_copy_tmp`；保存前探测存在/可写/剩余空间；旧版「位置列表」配置读取时一次性迁移）、**夸克中转残留清理（`cross_copy_staging_retention_days`，0 = 关，默认 7 天；清理动作由 `cross_copy_staging_cleanup` 后台定时器执行，设置页只负责保存天数）**。
 - **不会做**：不改任务、不动网盘文件、不生成 STRM；换暂存目录只改配置，不碰磁盘上的实际文件。
 - **相关代码**：`app/routes/settings.py`、`app/services/sign115.py`、`app/services/notify.py`、`app/services/local_storage.py`；页面 `templates/partials/pages/settings.html`
 
@@ -123,7 +128,7 @@
 | `app/services/resource.py` | 资源导入任务执行（磁力离线、网盘转存 / 接收 / 保存） |
 | `app/services/subscription.py` | 订阅编排入口，聚合下列订阅子模块 |
 | `app/services/subscription_runner.py` | 订阅队列调度与并发控制（支持一次追加多条手动候选、只触发一次调度） |
-| `app/services/subscription_task_runner.py` | 单个订阅任务的一次完整执行 |
+| `app/services/subscription_task_runner.py` | 单个订阅任务的一次完整执行；跨盘补源的「缺不缺 + 触发注册」也在这里（`_subscription_cross_copy_needed`） |
 | `app/services/subscription_episode.py` | 剧集 / 集数识别与台账证据 |
 | `app/services/subscription_share_selection.py` | 分享内容筛选（剧集 / 标题 / 质量） |
 | `app/services/subscription_share_runtime.py` | 分享浏览与转存运行时 |
@@ -136,8 +141,10 @@
 | `app/services/media_hash_cache.py` | 文件哈希备忘录（media_hash_cache）：按 (provider, file_id) 沉淀已确认的 SHA1，查缓存校验 size、30 天过期，供跨盘复制复用零流量秒传；缓存故障不影响复制主流程 |
 | `app/services/local_storage.py` | 本地暂存目录管理：容器内路径归一化、默认目录（config 卷下 `cross_copy_tmp`）、旧位置列表配置迁移、目录可用性探测、暂存目录解析、磁盘空间预检；挂载点枚举（解析 `/proc/mounts`，区分「真实挂载盘 / 容器可写层」）、候选目录列表、受控建目录（只允许在已挂载盘里建，防止把宿主机路径建成容器层目录） |
 | `app/services/cross_copy_resume.py` | 跨盘复制断点续传状态管理：运行前校验（临时文件在/前缀完整/复探源哈希防旧内容上传）、全新骨架构造、可继承性判断、落库净化（深拷贝并剔除 on_part_done 等运行时字段，保证状态可 JSON 序列化）、作废与孤儿清理联动 |
-| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知（按 origin 选订阅补源/手动开关）/ 记录清除与自动裁剪 / 断点续传生命周期（骨架落库、终态保底、成功清除） |
-| `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重） |
+| `app/services/cross_copy_staging_cleanup.py` | 夸克中转目录残留自动清理：定时（默认 1800 秒）扫 `${CROSS_COPY_STAGING_ROOT}` 下每个任务目录，按「条目修改时间早于 `cross_copy_staging_retention_days` 天」判定过期，只删过期条目、只删确认为空的目录，任务根目录与 `cid=="0"` 受保护；**运行中任务的条目一律不删**（先查 `cross_copy_jobs` 的活跃任务做保护集，查不到就整轮跳过）；删除是移进夸克回收站，配额不会立即释放；开关就是 `cross_copy_staging_retention_days`（设 0 = 关闭，默认 7 天） |
+| `app/services/subscription_cross_copy_organize.py` | 订阅补源「入库后整理」定时器：捞 `organize_state='pending'` 且已过防抖窗口（90 秒）的任务 → 按（目标网盘 + 目标目录 + 订阅任务名）成组 → 沿用该订阅任务的「入库后整理」开关，调刮削命名计划**原地改名** → 把结果写回 `organize_*`。复制收口只打标记，真正的改名叫这里做（刮削任务最长几分钟，塞进复制收口会占死并发名额）；`locate_subscription_imported_files` 也从 runner 上移到这里 |
+| `app/services/cross_copy_jobs.py` | 跨盘复制任务表（cross_copy_jobs）：创建 / 状态机 / 取消 / 重试 / 启动恢复 / 进度上报 / 完成失败通知（按 origin 选订阅补源/手动开关）/ 记录清除与自动裁剪 / 断点续传生命周期（骨架落库、终态保底、成功清除）；**订阅补源单文件任务复制成功时顺手把 `organize_state` 标成 `pending`（同一条 UPDATE），真正的改名交给 `subscription_cross_copy_organize` 的定时器**，重试会清空该标记 |
+| `app/services/subscription_cross_copy.py` | 订阅跨盘补源：夸克分享候选 → 转存夸克中转目录 → 注册复制任务（save_first + 去重）；**落点直接复用订阅导入的目录函数**（`core.build_subscription_movie_savepath` / `build_subscription_tv_savepath`，见 `_cross_copy_target_savepath`），不在这里另拼字符串；`split_cross_copy_sources` 负责区分「已接通/未接通」的源网盘，供主链路写跳过日志；**转存前先扫分享，只转存缺的集**（`_scan_share_media_files` + `_dedupe_episode_files`，2026-10-22；无缺集时一次转存都不发、连中转目录都不建，扫不动才退回整包）；**转存后必须等夸克异步任务落地再列目录**（`provider.wait_share_save`，save 只返回 task_id，2026-10-22 真机排查）；**按集筛缺覆盖「整季文件夹」和「散文件」两条路**（`_expand_staged_folder_media_files` + `_select_missing_episode_files`，判缺优先用 `existing_episodes` 集集合——能识别中间缺集，不传才退回比 `last_episode`；同一轮内按集去重，认不出集数的文件不复制）；`cleanup_staging_empty_folders` 在每轮注册后清中转目录的空文件夹（DFS 倒序、只删确认为空的、任务根与 `cid=="0"` 受保护）；由 `run_subscription_task` 主链路调用，夸克源候选由 `subscription.find_subscription_cross_copy_candidates` 搜出 |
 
 ### 网盘与外部 provider `app/providers/`
 

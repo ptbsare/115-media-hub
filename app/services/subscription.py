@@ -1047,6 +1047,92 @@ def _load_subscription_cached_search_items(
 
 
 
+def _cross_copy_title_hit(task: Dict[str, Any], candidate: Dict[str, Any]) -> int:
+    """候选标题是否出现了这个订阅作品的名字，命中返回 1。
+
+    补源的候选池来自全频道搜索，同一条资源贴常顺带别的剧（实测「光阴之外」
+    的候选里混进了《凡人修仙传》和国漫日报贴），而补源注册不做逐文件内容校验，
+    挑错就等于把别人的剧复制进本剧目录。排序时让标题命中的压过纯高分候选。
+
+    只比对标题字段，不碰 ``raw_text``——日报正文本来就堆着一串剧名，
+    拿它判断会把所有日报贴都算成命中。
+    """
+    item = candidate.get("item") if isinstance(candidate.get("item"), dict) else {}
+    haystack = " ".join(str(item.get(key) or "") for key in ("title", "normalized_title")).strip().lower()
+    if not haystack:
+        return 0
+    for key in ("title", "name", "tmdb_title", "tmdb_original_title"):
+        value = str(task.get(key) or "").strip().lower()
+        if value and value in haystack:
+            return 1
+    for key in ("aliases", "tmdb_aliases"):
+        values = task.get(key)
+        if isinstance(values, (list, tuple)):
+            for raw_value in values:
+                value = str(raw_value or "").strip().lower()
+                if value and value in haystack:
+                    return 1
+    return 0
+
+
+async def find_subscription_cross_copy_candidates(
+    task: Dict[str, Any],
+    source_provider: str = "quark",
+    last_episode: int = 0,
+    trigger: str = "",
+    total_episodes: int = 0,
+) -> Dict[str, Any]:
+    """搜索「源网盘」候选，专供订阅跨盘补源使用。
+
+    复用 find_subscription_task_match_candidate_by_search 的搜索与评分，
+    但把 provider 过滤换成 source_provider（默认 quark），返回的候选是
+    夸克分享，供 register_cross_copy_from_candidates 注册补源任务。
+
+    返回前会按「补源专用」口径重排：只留分数达标的候选并按分数降序。
+    主链路的电视剧候选是「集数优先」排序（缺集优先导入），而跨盘候选常来自
+    TG 日报贴这类长文本，容易解析出 1170 这种假集数，会把真正高分资源挤到队尾；
+    补源每轮只注册前几条，按集数取就会挑中低分日报贴，把无关文件拉进剧集目录。
+    """
+    # 复制一份 task，临时把 provider 改成源网盘，复用现有搜索逻辑
+    cross_task = dict(task)
+    cross_task["provider"] = source_provider
+    result = await find_subscription_task_match_candidate_by_search(
+        cross_task,
+        last_episode=last_episode,
+        trigger=trigger,
+        total_episodes=total_episodes,
+    )
+    if not isinstance(result, dict):
+        return result
+    min_score = max(0, int(task.get("min_score", SUBSCRIPTION_MIN_SCORE) or SUBSCRIPTION_MIN_SCORE))
+    raw_candidates = result.get("candidates") if isinstance(result.get("candidates"), list) else []
+    qualified = [
+        candidate
+        for candidate in raw_candidates
+        if isinstance(candidate, dict)
+        and int(candidate.get("score", 0) or 0) >= min_score
+        and not bool(candidate.get("low_score_fallback", False))
+    ]
+    qualified.sort(
+        key=lambda candidate: (
+            _cross_copy_title_hit(task, candidate),
+            int(candidate.get("score", 0) or 0),
+        ),
+        reverse=True,
+    )
+    result["candidates"] = qualified
+    # 兼容旧的单候选字段：被同一个口径筛掉时不能留在返回值里
+    legacy_candidate = result.get("candidate")
+    if isinstance(legacy_candidate, dict) and legacy_candidate:
+        kept = (
+            int(legacy_candidate.get("score", 0) or 0) >= min_score
+            and not bool(legacy_candidate.get("low_score_fallback", False))
+        )
+        if not kept:
+            result["candidate"] = {}
+    return result
+
+
 async def find_subscription_task_match_candidate_by_search(
     task: Dict[str, Any],
     last_episode: int = 0,

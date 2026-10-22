@@ -433,6 +433,7 @@ function collectSettingsPayload({
         'pansou_src',
         'pansou_channels',
         'pansou_plugins',
+        'cross_copy_staging_retention_days',
         'extensions',
         'username',
         'password',

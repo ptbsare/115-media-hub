@@ -23,7 +23,7 @@ from app.services import local_storage as ls
 
 class StorageTempDirApiTest(unittest.TestCase):
     def setUp(self):
-        # 仓库里其它测试也用 mkdtemp 显式指定 dir，避免 tempfile 自检问题
+        # 临时目录交给 tempfile（根在 run_tests.py 指定的会话目录），不往仓库里写
         self.tmp = tempfile.mkdtemp(prefix="wb_settings_storage_")
         self.default_path_patch = mock.patch.object(ls, "default_storage_path", return_value=self.tmp)
         self.default_path_patch.start()

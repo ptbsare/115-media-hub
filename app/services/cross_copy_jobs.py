@@ -509,6 +509,9 @@ def retry_cross_copy_job(job_id: int) -> Dict[str, Any]:
         retry_count=int(job.get("retry_count", 0) or 0) + 1,
         started_at="",
         finished_at="",
+        # 重试会按原名重新上传，之前那次整理的结果作废，成功后重新标记
+        organize_state="",
+        organize_detail="",
     )
     submit_cross_copy_job(job_id)
     return {"ok": True, "msg": "已重新入队"}
@@ -894,6 +897,17 @@ async def run_cross_copy_job(job_id: int) -> None:
         if note:
             # 结构化字段：前端只渲染 resultHint，光写 status_detail 用户看不到
             result_payload["no_monitor_note"] = note
+        # 订阅补源的单文件任务成功后，文件还是分享里的原名（S01E42.mp4），跟订阅
+        # 导入的「片名 (年份) - S01E42.mp4」不一致。这里只打一个「待整理」标记：
+        # 改名要跑刮削任务（阻塞，最长几分钟），不能塞在这个收口里占死并发名额，
+        # 由 subscription_cross_copy_organize 的定时器成组处理。
+        finalize_fields: Dict[str, Any] = {}
+        if (
+            job_origin == "subscription"
+            and not _job_source_is_dir(job)
+            and final_status == STATUS_COMPLETED
+        ):
+            finalize_fields["organize_state"] = "pending"
         update_cross_copy_job(
             job_id,
             status=final_status,
@@ -904,6 +918,7 @@ async def run_cross_copy_job(job_id: int) -> None:
             filename=final_name or str(job.get("filename", "") or ""),
             target_path=final_target_path,
             result=result_payload,
+            **finalize_fields,
         )
         _clear_job_progress(job_id)
         _push_cross_copy_notification(cfg, job, ok=True, message=str(getattr(result, "message", "") or ""))

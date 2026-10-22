@@ -1,7 +1,7 @@
 """文件哈希备忘录（media_hash_cache）单元测试。
 
-用临时目录建一个独立 SQLite 库（参考 test_local_storage.py 的 tempfile.mkdtemp 写法），
-不碰真实数据目录，也不依赖全局 tempfile 探测。
+用临时目录建一个独立 SQLite 库（写法参考 test_local_storage.py 的 tempfile.mkdtemp），
+不碰真实数据目录；临时根由 scripts/run_tests.py 指到本轮会话目录，不落进仓库。
 """
 
 import os

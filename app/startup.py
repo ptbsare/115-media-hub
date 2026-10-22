@@ -40,6 +40,12 @@ from .services.subscription_offline_cleanup import (
     run_subscription_offline_staging_cleanup_once,
     subscription_offline_staging_cleanup_watcher,
 )
+from .services.cross_copy_staging_cleanup import (
+    cross_copy_staging_cleanup_watcher,
+)
+from .services.subscription_cross_copy_organize import (
+    cross_copy_organize_watcher,
+)
 
 
 MEMORY_HOUSEKEEPING_INTERVAL_SECONDS = max(
@@ -336,6 +342,8 @@ async def startup() -> None:
     asyncio.create_task(monitor_scheduler())
     asyncio.create_task(offline_completion_watcher())
     asyncio.create_task(subscription_offline_staging_cleanup_watcher())
+    asyncio.create_task(cross_copy_staging_cleanup_watcher())
+    asyncio.create_task(cross_copy_organize_watcher())
     asyncio.create_task(cross_copy_temp_cleanup_watcher())
     asyncio.create_task(subscription_scheduler())
     asyncio.create_task(sign115_scheduler())

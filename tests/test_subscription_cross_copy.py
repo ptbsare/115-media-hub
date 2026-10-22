@@ -35,12 +35,14 @@ class FakeQuarkProvider:
             else [{"id": "share-fid-1", "name": "movie.mkv", "size": 2048, "is_dir": False}]
         )
         self.shares = {}          # 按分享链接指定内容：{url: [条目]}
+        self.share_dirs = {}      # 分享内的子目录：{父条目 id: [条目]}，模拟真实树
         self.existing = list(existing or [])   # 每个中转目录的初始内容
         self.dirs = {}            # {中转目录 id: [条目]}
         self.staged = staged      # 显式指定「转存后目录里出现的条目」；None 表示自动生成
         self.last_share_url = ""
         self.received = []        # 每次转存提交的条目
         self.calls = []
+        self.deleted = set()      # delete_entries 真删掉的 id
 
     def resolve_share_payload(self, cookie, share_url, raw_text="", receive_code=""):
         self.calls.append(("resolve_share", share_url))
@@ -48,12 +50,16 @@ class FakeQuarkProvider:
         return {"url": share_url, "pwd_id": "pwd-1", "stoken": "st-1", "receive_code": receive_code}
 
     def list_share_entries(self, cookie, share_payload, cid="0", offset=0, limit=200):
-        self.calls.append(("list_share",))
+        self.calls.append(("list_share", str(cid)))
         if self.empty_share:
             # 与真实 provider 一致：返回 dict（见 base.list_share_entries 契约）
             return {"entries": [], "summary": {"folder_count": 0, "file_count": 0}}
-        url = str(share_payload.get("url", "") or "")
-        entries = list(self.shares.get(url, self.default_share))
+        normalized_cid = str(cid or "0")
+        if normalized_cid != "0" and normalized_cid in self.share_dirs:
+            entries = list(self.share_dirs[normalized_cid])
+        else:
+            url = str(share_payload.get("url", "") or "")
+            entries = list(self.shares.get(url, self.default_share))
         return {
             "entries": entries,
             "summary": {
@@ -98,6 +104,20 @@ class FakeQuarkProvider:
     def list_entries(self, cookie, cid="0"):
         self.calls.append(("list_entries",))
         return list(self.dirs.setdefault(str(cid or ""), []))
+
+    def resolve_folder_id_by_path(self, cookie, relative_path):
+        """只解析不创建（清理逻辑靠它定位中转目录，建目录的副作用不能有）。"""
+        self.calls.append(("resolve_folder", relative_path))
+        folder_id = f"staging::{relative_path}"
+        return folder_id if folder_id in self.dirs else ""
+
+    def delete_entries(self, cookie, entry_ids, parent_id=""):
+        self.calls.append(("delete", list(entry_ids)))
+        targets = {str(item or "").strip() for item in (entry_ids or [])}
+        self.deleted.update(targets)
+        for bucket in self.dirs.values():
+            bucket[:] = [entry for entry in bucket if str(entry.get("id", "")) not in targets]
+        return {"ids": sorted(targets)}
 
 
 class FakeTargetProvider:
@@ -172,6 +192,8 @@ class SubscriptionCrossCopyTestBase(unittest.TestCase):
         task = {
             "name": "测试剧集",
             "title": "测试剧集",
+            "year": "2024",
+            "media_type": "movie",
             "provider": "115",
             "savepath": "/影视库/测试剧集",
             "cross_copy_mode": "fallback",
@@ -190,6 +212,14 @@ class SubscriptionCrossCopyTestBase(unittest.TestCase):
         kwargs.setdefault("task", self._task())
         kwargs.setdefault("cfg", self.cfg)
         return sc.register_cross_copy_from_candidates(**kwargs)
+
+    def _stage_season_folder(self, entries, folder_name="某剧 全季"):
+        """模拟「分享里只有一个整季文件夹」转存进中转目录。"""
+        folder = {"id": "share-folder-1", "name": folder_name, "size": 0, "is_dir": True}
+        self.quark.default_share = [folder]
+        self.quark.existing = []
+        # 中转目录里「转存」出来的文件夹，id 由 Fake 在 submit 时生成
+        self.quark.dirs["fid-share-folder-1"] = list(entries)
 
 
 class TestModeGating(SubscriptionCrossCopyTestBase):
@@ -379,7 +409,10 @@ class TestMultiEntryShare(SubscriptionCrossCopyTestBase):
         self.assertEqual([job["filename"] for job in jobs], ["a.mkv", "b.mkv", "c.mkv"])
         self.assertEqual([job["file_size"] for job in jobs], [100, 200, 300])
         self.assertEqual({job["source_share_url"] for job in jobs}, {self.URL})
-        self.assertEqual({job["target_savepath"] for job in jobs}, {"/影视库/测试剧集"})
+        self.assertEqual(
+            {job["target_savepath"] for job in jobs},
+            {"影视库/测试剧集/测试剧集 2024"},
+        )
         self.assertEqual(len({job["source_file_id"] for job in jobs}), 3)
 
     def test_mixed_folder_and_files(self):
@@ -421,12 +454,42 @@ class TestMultiEntryShare(SubscriptionCrossCopyTestBase):
         # 只把缺的两个发给夸克转存，老文件不会再多存一份出来
         self.assertEqual([item["name"] for item in self.quark.received[0]], ["第03集.mkv", "第04集.mkv"])
 
-    def test_all_entries_already_staged(self):
+    def test_all_entries_already_staged_registers_missing_job(self):
+        # 中转目录里已有这个条目，但库里没有任何补源任务（上一轮转存成功、
+        # 注册/复制没走完），这轮要把它补注册上，不能当成「已经补过」跳过。
         self.quark.existing = [{"id": "old-1", "name": "movie.mkv", "size": 2048, "is_dir": False}]
         result = self._register(candidates=[self._candidate()])
 
+        self.assertEqual(len(result["registered"]), 1, result)
+        job = ccj.get_cross_copy_job(result["registered"][0])
+        self.assertEqual(job["filename"], "movie.mkv")
+        self.assertEqual(job["source_file_id"], "old-1")
+        self.assertIn("上次已经转存过", " ".join(result["skipped"]))
+        # 没有再往夸克发一次转存
+        self.assertEqual(self.quark.received, [])
+
+    def test_all_entries_already_staged_skips_completed_job(self):
+        # 上次已经复制完成，中转文件还在：不能再注册一份，否则目标目录会多一份
+        self.quark.existing = [{"id": "old-1", "name": "movie.mkv", "size": 2048, "is_dir": False}]
+        done_id = ccj.create_cross_copy_job(
+            title="测试剧集",
+            source_provider="quark",
+            target_provider="115",
+            source_file_id="old-1",
+            target_savepath="/影视库/测试剧集",
+            filename="movie.mkv",
+            file_size=2048,
+            source_mode="save_first",
+            source_share_url=self.URL,
+            origin="subscription",
+            origin_ref="测试剧集",
+        )
+        ccj.update_cross_copy_job(done_id, status="completed")
+
+        result = self._register(candidates=[self._candidate()])
+
         self.assertEqual(result["registered"], [])
-        self.assertTrue(any("上次已经转存过" in s for s in result["skipped"]))
+        self.assertIn("以前已补过，跳过：movie.mkv", " ".join(result["skipped"]))
         self.assertEqual(self.quark.received, [])
 
     def test_max_files_per_share_via_env(self):
@@ -557,6 +620,624 @@ class TestConfigNormalization(unittest.TestCase):
         task = core.normalize_subscription_task({"name": "x", "provider": "115"})
         self.assertEqual(task["cross_copy_mode"], "off")
         self.assertEqual(task["cross_copy_sources"], [])
+
+
+class TestTargetSavepath(unittest.TestCase):
+    """补源落点必须和订阅导入一致：电影进「片名 年份」，剧集进 Season 目录。"""
+
+    @staticmethod
+    def _resolve(task, candidate=None):
+        return sc._cross_copy_target_savepath(task, candidate or {})
+
+    def test_movie_goes_into_title_year_folder(self):
+        task = {"savepath": "/影视库/电影", "media_type": "movie", "title": "让子弹飞", "year": "2010"}
+        self.assertEqual(self._resolve(task), "影视库/电影/让子弹飞 2010")
+
+    def test_movie_without_year(self):
+        task = {"savepath": "/影视库/电影", "media_type": "movie", "title": "让子弹飞"}
+        self.assertEqual(self._resolve(task), "影视库/电影/让子弹飞")
+
+    def test_movie_without_title_falls_back(self):
+        task = {"savepath": "/影视库/电影", "media_type": "movie"}
+        self.assertEqual(self._resolve(task), "影视库/电影/未命名电影")
+
+    def test_movie_with_illegal_chars_sanitized(self):
+        task = {"savepath": "/影视库/电影", "media_type": "movie", "title": "A/B:C", "year": "2024"}
+        self.assertEqual(self._resolve(task), "影视库/电影/A B C 2024")
+
+    def test_tv_uses_task_season(self):
+        task = {"savepath": "/影视库/剧集", "media_type": "tv", "title": "某剧", "season": 2}
+        self.assertEqual(self._resolve(task), "影视库/剧集/Season 02")
+
+    def test_tv_prefers_candidate_season(self):
+        task = {"savepath": "/影视库/剧集", "media_type": "tv", "title": "某剧", "season": 1}
+        self.assertEqual(self._resolve(task, {"season": 3}), "影视库/剧集/Season 03")
+
+    def test_tv_season_mismatch_deferred_uses_task_season(self):
+        task = {"savepath": "/影视库/剧集", "media_type": "tv", "title": "某剧", "season": 3}
+        candidate = {"season": 2, "season_mismatch_deferred": True}
+        self.assertEqual(self._resolve(task, candidate), "影视库/剧集/Season 03")
+
+    def test_tv_does_not_double_season_folder(self):
+        # savepath 本身已经指到 Season 目录时不能再套一层
+        task = {"savepath": "/影视库/剧集/Season 01", "media_type": "tv", "title": "某剧", "season": 1}
+        self.assertEqual(self._resolve(task), "影视库/剧集/Season 01")
+
+    def test_empty_savepath_keeps_title_folder(self):
+        task = {"savepath": "", "media_type": "movie", "title": "让子弹飞", "year": "2010"}
+        self.assertEqual(self._resolve(task), "让子弹飞 2010")
+
+    def test_registered_job_target_matches_import_for_tv(self):
+        """端到端：剧集补源任务的目标目录带 Season 层。"""
+        base = SubscriptionCrossCopyTestBase()
+        base.setUp()
+        try:
+            task = base._task(media_type="tv", season=1, savepath="/影视库/剧集")
+            result = sc.register_cross_copy_from_candidates(
+                task=task,
+                cfg=self._cfg(base),
+                candidates=[base._candidate()],
+            )
+            self.assertEqual(len(result["registered"]), 1, result)
+            job = ccj.get_cross_copy_job(result["registered"][0])
+            self.assertEqual(job["target_savepath"], "影视库/剧集/Season 01")
+        finally:
+            base.tearDown()
+
+    @staticmethod
+    def _cfg(base):
+        return base.cfg
+
+
+class TestSourceGating(unittest.TestCase):
+    """补源只接通了夸克作源，其余源必须显式识别为「跳过」而不是静默忽略。"""
+
+    def test_quark_is_usable(self):
+        self.assertEqual(sc.split_cross_copy_sources(["quark"]), (["quark"], []))
+
+    def test_other_providers_are_skipped(self):
+        usable, skipped = sc.split_cross_copy_sources(["aliyun"])
+        self.assertEqual(usable, [])
+        self.assertEqual(skipped, ["aliyun"])
+
+        usable, skipped = sc.split_cross_copy_sources(["115"])
+        self.assertEqual(usable, [])
+        self.assertEqual(skipped, ["115"])
+
+    def test_mixed_sources_split(self):
+        self.assertEqual(
+            sc.split_cross_copy_sources(["aliyun", "quark", "115"]),
+            (["quark"], ["aliyun", "115"]),
+        )
+
+    def test_duplicates_and_blanks_removed(self):
+        self.assertEqual(
+            sc.split_cross_copy_sources(["quark", "quark", " ", "aliyun", "aliyun"]),
+            (["quark"], ["aliyun"]),
+        )
+
+    def test_empty_inputs(self):
+        for value in ([], None, ""):
+            self.assertEqual(sc.split_cross_copy_sources(value), ([], []))
+
+    def test_set_input(self):
+        self.assertEqual(sc.split_cross_copy_sources({"quark"}), (["quark"], []))
+
+    def test_gating_matches_core_whitelist(self):
+        # 判定名单必须就是任务归一化用的那份，避免两处漂移
+        for name in core.SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS:
+            self.assertEqual(sc.split_cross_copy_sources([name])[0], [name])
+
+
+class TestShareUrlSanity(unittest.TestCase):
+    """TG 长文本会把下一条 URL 粘到上一条尾部，这种链接转存必然失败。"""
+
+    def test_normal_quark_url_ok(self):
+        self.assertTrue(sc._is_plausible_share_url("https://pan.quark.cn/s/c0335c85e399"))
+
+    def test_polluted_url_rejected(self):
+        # 实测踩到的形态：末尾被拼上了下一条消息的 https
+        self.assertFalse(sc._is_plausible_share_url("https://pan.quark.cn/s/b1dfae35a04bhttps"))
+        self.assertFalse(
+            sc._is_plausible_share_url("https://pan.quark.cn/s/abc https://pan.quark.cn/s/def")
+        )
+
+    def test_blank_and_non_http_rejected(self):
+        for value in ("", None, "pan.quark.cn/s/abc", "magnet:?xt=urn:btih:abc"):
+            self.assertFalse(sc._is_plausible_share_url(value))
+
+    def test_pick_skips_polluted_and_keeps_good(self):
+        candidates = [
+            {"item": {"link_type": "quark", "link_url": "https://pan.quark.cn/s/badhttps"}},
+            {"item": {"link_type": "quark", "link_url": "https://pan.quark.cn/s/good1"}},
+        ]
+        picked = sc._pick_share_candidates(candidates, 5)
+        self.assertEqual([sc._extract_share_url(c) for c in picked], ["https://pan.quark.cn/s/good1"])
+
+
+class TestCrossCopyTitleHit(unittest.TestCase):
+    """补源候选池是全频道的，排序必须让「标题命中本剧」的压过纯高分别的剧。"""
+
+    def test_title_hit(self):
+        from app.services import subscription as subscription_module
+
+        task = {"title": "光阴之外", "media_type": "tv"}
+        self.assertEqual(
+            subscription_module._cross_copy_title_hit(
+                task, {"item": {"title": "名称：光阴之外（2025）4K HQ S01E01 - E44"}}
+            ),
+            1,
+        )
+
+    def test_other_show_not_hit(self):
+        from app.services import subscription as subscription_module
+
+        task = {"title": "光阴之外", "media_type": "tv"}
+        self.assertEqual(
+            subscription_module._cross_copy_title_hit(
+                task, {"item": {"title": "#凡人修仙传 #年番4 #幕兰之战 (2026) #4K 194集"}}
+            ),
+            0,
+        )
+
+    def test_raw_text_is_ignored(self):
+        # 日报贴正文里堆着一串剧名，拿 raw_text 判断会让所有日报都算命中
+        from app.services import subscription as subscription_module
+
+        task = {"title": "光阴之外"}
+        self.assertEqual(
+            subscription_module._cross_copy_title_hit(
+                task, {"item": {"title": "国漫更新目录", "raw_text": "光阴之外 更新至44集"}}
+            ),
+            0,
+        )
+
+    def test_aliases_are_considered(self):
+        from app.services import subscription as subscription_module
+
+        task = {"title": "光阴之外", "tmdb_original_title": "Sob o Olhar do Tempo"}
+        self.assertEqual(
+            subscription_module._cross_copy_title_hit(
+                task, {"item": {"title": "Sob o Olhar do Tempo (2025) 4K"}}
+            ),
+            1,
+        )
+
+
+class TestMissingEpisodeSelection(SubscriptionCrossCopyTestBase):
+    """整季文件夹分享 + 本盘已有进度：只补缺的集，且拍平到目标目录。"""
+
+    def _tv_folder_task(self, **overrides):
+        return self._task(media_type="tv", season=1, **overrides)
+
+    def test_only_missing_episodes_registered_and_flattened(self):
+        self._stage_season_folder(
+            [
+                {"id": f"f{i}", "name": f"S01E{i:02d}.mkv", "size": 100 + i, "is_dir": False}
+                for i in range(1, 9)
+            ]
+        )
+        result = self._register(task=self._tv_folder_task(), candidates=[self._candidate()], last_episode=5)
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual(sorted(job["filename"] for job in jobs), ["S01E06.mkv", "S01E07.mkv", "S01E08.mkv"])
+        # 每个文件单独立任务，不再是「一个整目录任务」，这样才不会多一层分享文件夹名
+        for job in jobs:
+            self.assertFalse(bool(job.get("source_is_dir")))
+            self.assertEqual(job["target_savepath"], "影视库/测试剧集/Season 01")
+            self.assertIn("云下载/跨盘中转/测试剧集/某剧 全季/", job["source_path"])
+            self.assertIn(job["filename"], job["source_path"])
+
+    def test_no_last_episode_keeps_whole_folder(self):
+        # 本盘一集都没有时仍整目录复制（一个任务搞定，比逐集注册快）
+        self._stage_season_folder(
+            [{"id": "f1", "name": "S01E01.mkv", "size": 100, "is_dir": False}]
+        )
+        result = self._register(task=self._tv_folder_task(), candidates=[self._candidate()], last_episode=0)
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual(len(jobs), 1)
+        self.assertTrue(bool(jobs[0].get("source_is_dir")))
+
+    def test_duplicate_episode_across_shares_registered_once(self):
+        # 两个「全季」包都含 E08：先到先得，不重复注册
+        self._stage_season_folder(
+            [
+                {"id": "a7", "name": "S01E07.mkv", "size": 107, "is_dir": False},
+                {"id": "a8", "name": "S01E08.mkv", "size": 108, "is_dir": False},
+            ]
+        )
+        result = self._register(
+            task=self._tv_folder_task(),
+            candidates=[
+                self._candidate(url="https://pan.quark.cn/s/aaa"),
+                self._candidate(url="https://pan.quark.cn/s/bbb"),
+            ],
+            last_episode=6,
+        )
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual(sorted(job["filename"] for job in jobs), ["S01E07.mkv", "S01E08.mkv"])
+        self.assertIn("本轮其它分享已补过第 7 集", " ".join(result["skipped"]))
+
+    def test_files_without_episode_are_not_copied(self):
+        self._stage_season_folder(
+            [
+                {"id": "n1", "name": "预告片.mp4", "size": 10, "is_dir": False},
+                {"id": "n2", "name": "S01E09.mkv", "size": 109, "is_dir": False},
+            ]
+        )
+        result = self._register(task=self._tv_folder_task(), candidates=[self._candidate()], last_episode=8)
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E09.mkv"])
+        self.assertIn("认不出集数，没复制：预告片.mp4", " ".join(result["skipped"]))
+
+    def test_folder_with_nothing_new_is_skipped(self):
+        self._stage_season_folder(
+            [{"id": "old", "name": "S01E05.mkv", "size": 105, "is_dir": False}]
+        )
+        result = self._register(task=self._tv_folder_task(), candidates=[self._candidate()], last_episode=5)
+
+        self.assertEqual(result["registered"], [])
+        self.assertIn("里没有本盘缺的集", " ".join(result["skipped"]))
+
+
+class TestScatteredFileEpisodeFilter(SubscriptionCrossCopyTestBase):
+    """分享里直接躺着的散文件也要按缺集筛。
+
+    以前只筛「整季文件夹」，散文件无脑全注册：本盘已有的集会被再下一遍。
+    """
+
+    def _tv_task(self, **overrides):
+        return self._task(media_type="tv", season=1, **overrides)
+
+    def test_existing_episode_file_skipped_but_missing_one_kept(self):
+        self.quark.default_share = [
+            {"id": "a42", "name": "S01E42.mkv", "size": 142, "is_dir": False},
+            {"id": "a43", "name": "S01E43.mkv", "size": 143, "is_dir": False},
+        ]
+        result = self._register(task=self._tv_task(), candidates=[self._candidate()], last_episode=42)
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E43.mkv"])
+        self.assertEqual(jobs[0]["target_savepath"], "影视库/测试剧集/Season 01")
+
+    def test_all_episodes_present_means_nothing_registered(self):
+        self.quark.default_share = [
+            {"id": "a43", "name": "S01E43.mkv", "size": 143, "is_dir": False},
+            {"id": "a44", "name": "S01E44.mkv", "size": 144, "is_dir": False},
+        ]
+        result = self._register(task=self._tv_task(), candidates=[self._candidate()], last_episode=44)
+
+        self.assertEqual(result["registered"], [])
+
+    def test_movie_still_registers_everything(self):
+        # 电影没有集数概念，不该被集数过滤误伤
+        self.quark.default_share = [
+            {"id": "m1", "name": "movie.mkv", "size": 2048, "is_dir": False},
+        ]
+        result = self._register(task=self._task(media_type="movie"), candidates=[self._candidate()], last_episode=9)
+
+        self.assertEqual(len(result["registered"]), 1)
+
+    def test_polluted_name_is_not_copied(self):
+        # 认不出集数的脏名（全角「4！2」）不复制，避免往季目录里塞杂物
+        self.quark.default_share = [
+            {"id": "bad", "name": "4！2.mp4", "size": 42, "is_dir": False},
+            {"id": "ok", "name": "S01E43.mkv", "size": 143, "is_dir": False},
+        ]
+        result = self._register(task=self._tv_task(), candidates=[self._candidate()], last_episode=42)
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E43.mkv"])
+        self.assertIn("认不出集数，没复制：4！2.mp4", " ".join(result["skipped"]))
+
+
+class TestExistingEpisodeSetSelection(SubscriptionCrossCopyTestBase):
+    """传了目标目录已有集集合时，按集合精确判缺——能识别中间缺集。"""
+
+    def _tv_task(self, **overrides):
+        return self._task(media_type="tv", season=1, **overrides)
+
+    def test_middle_gap_is_detected(self):
+        # 本盘 E1~E41 齐全但没有 E30，last_episode=41。
+        # 只看最高集会认为 E30 早就有了；按集合判才知道要补。
+        existing = set(range(1, 42)) - {30}
+        self.quark.default_share = [
+            {"id": "a30", "name": "S01E30.mkv", "size": 130, "is_dir": False},
+            {"id": "a40", "name": "S01E40.mkv", "size": 140, "is_dir": False},
+        ]
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=41,
+            existing_episodes=existing,
+        )
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E30.mkv"])
+
+    def test_empty_set_means_copy_everything(self):
+        # 空集合 = 本盘一集都没有（不是「不确定」），该全补
+        self.quark.default_share = [
+            {"id": "a1", "name": "S01E01.mkv", "size": 101, "is_dir": False},
+        ]
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=0,
+            existing_episodes=set(),
+        )
+
+        self.assertEqual(len(result["registered"]), 1)
+
+    def test_folder_expansion_uses_the_set(self):
+        self._stage_season_folder(
+            [
+                {"id": "f30", "name": "S01E30.mkv", "size": 130, "is_dir": False},
+                {"id": "f41", "name": "S01E41.mkv", "size": 141, "is_dir": False},
+            ]
+        )
+        existing = set(range(1, 42)) - {30}
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=41,
+            existing_episodes=existing,
+        )
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E30.mkv"])
+
+
+class TestStageOnlyMissingEpisodes(SubscriptionCrossCopyTestBase):
+    """转存这一步就只转存缺的集，而不是把整季包塞进夸克中转。
+
+    以前是整包转存、再在中转目录里筛：下载是筛过了，但夸克配额已经被整包占住。
+    """
+
+    def _tv_task(self, **overrides):
+        return self._task(media_type="tv", season=1, **overrides)
+
+    def _share_season(self, episodes, folder_name="某剧 全季", sizes=None):
+        """分享根是一个整季文件夹，文件夹里是各集（真实夸克的常见形态）。"""
+        self.quark.default_share = [
+            {"id": "share-folder-1", "name": folder_name, "size": 0, "is_dir": True}
+        ]
+        sizes = sizes or {}
+        self.quark.share_dirs["share-folder-1"] = [
+            {
+                "id": f"share-ep{e}",
+                "name": f"S01E{e:02d}.mp4",
+                "size": int(sizes.get(e, 1000 + e)),
+                "is_dir": False,
+                "parent_id": "share-folder-1",
+                "fid_token": f"tok-{e}",
+            }
+            for e in episodes
+        ]
+
+    def test_only_missing_episode_is_saved_to_staging(self):
+        # 本盘有 E1~E34，分享含 E1~E36：只该把 E35/E36 转存进夸克中转
+        self._share_season(range(1, 37))
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=34,
+            existing_episodes=set(range(1, 35)),
+        )
+
+        self.assertEqual(len(self.quark.received), 1, result)
+        staged_names = [item["name"] for item in self.quark.received[0]]
+        self.assertEqual(staged_names, ["S01E35.mp4", "S01E36.mp4"])
+        # 整季文件夹没有被当成一个条目提交（否则又是整包转存）
+        self.assertFalse(any(item.get("is_dir") for item in self.quark.received[0]))
+        # 每个文件都带 fid_token，夸克按文件转存要靠它
+        self.assertTrue(all(item.get("fid_token") for item in self.quark.received[0]))
+
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual(sorted(job["filename"] for job in jobs), ["S01E35.mp4", "S01E36.mp4"])
+        # 文件直接落在中转任务目录下，不再多一层分享文件夹名
+        for job in jobs:
+            self.assertEqual(job["source_path"], f"/云下载/跨盘中转/测试剧集/{job['filename']}")
+            self.assertEqual(job["target_savepath"], "影视库/测试剧集/Season 01")
+
+    def test_middle_gap_only_saves_the_missing_episode(self):
+        # 缺的是 E35，本盘 E1~E36 其它都在
+        existing = set(range(1, 37)) - {35}
+        self._share_season(range(1, 37))
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=36,
+            existing_episodes=existing,
+        )
+
+        self.assertEqual(
+            [item["name"] for item in self.quark.received[0]], ["S01E35.mp4"]
+        )
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E35.mp4"])
+
+    def test_nothing_missing_means_no_staging_at_all(self):
+        self._share_season(range(1, 9))
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=8,
+            existing_episodes=set(range(1, 9)),
+        )
+
+        self.assertEqual(result["registered"], [])
+        # 关键：一次转存都不该发，否则夸克配额被白占
+        self.assertEqual(self.quark.received, [])
+        self.assertNotIn("ensure_folder", [call[0] for call in self.quark.calls])
+        self.assertIn("没有本盘缺的集", " ".join(result["skipped"]))
+        self.assertTrue(any("未转存" in msg for msg, _ in result["logs"]))
+
+    def test_quality_duplicates_keep_the_larger_file(self):
+        # 同一集有 4K / 1080p 两份：只转存大的那份，别白占双倍配额
+        self._share_season([35], sizes={35: 800})
+        self.quark.share_dirs["share-folder-1"] = [
+            {
+                "id": "ep35-1080",
+                "name": "S01E35.mp4",
+                "size": 800,
+                "is_dir": False,
+                "parent_id": "share-folder-1",
+            },
+            {
+                "id": "ep35-4k",
+                "name": "S01E35.4K.mp4",
+                "size": 8000,
+                "is_dir": False,
+                "parent_id": "share-folder-1",
+            },
+        ]
+        self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=34,
+            existing_episodes=set(range(1, 35)),
+        )
+
+        self.assertEqual([item["name"] for item in self.quark.received[0]], ["S01E35.4K.mp4"])
+
+    def test_second_share_does_not_restage_claimed_episodes(self):
+        # 分享 A 有 E35，分享 B 有 E35+E36：B 只该转存 E36
+        self._share_season([35])
+        self.quark.shares["https://pan.quark.cn/s/bbb"] = [
+            {"id": "share-folder-b", "name": "另一份全季", "size": 0, "is_dir": True}
+        ]
+        self.quark.share_dirs["share-folder-b"] = [
+            {
+                "id": f"b-ep{e}",
+                "name": f"S01E{e:02d}.mp4",
+                "size": 2000 + e,
+                "is_dir": False,
+                "parent_id": "share-folder-b",
+                "fid_token": f"btok-{e}",
+            }
+            for e in (35, 36)
+        ]
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[
+                self._candidate(url="https://pan.quark.cn/s/abc123", score=98),
+                self._candidate(url="https://pan.quark.cn/s/bbb", score=90),
+            ],
+            last_episode=34,
+            existing_episodes=set(range(1, 35)),
+        )
+
+        self.assertEqual(len(self.quark.received), 2, result)
+        self.assertEqual([item["name"] for item in self.quark.received[0]], ["S01E35.mp4"])
+        self.assertEqual([item["name"] for item in self.quark.received[1]], ["S01E36.mp4"])
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual(sorted(job["filename"] for job in jobs), ["S01E35.mp4", "S01E36.mp4"])
+
+    def test_movie_task_still_stages_whole_share(self):
+        self.quark.default_share = [
+            {"id": "share-folder-1", "name": "电影合集", "size": 0, "is_dir": True}
+        ]
+        result = self._register(
+            task=self._task(media_type="movie"),
+            candidates=[self._candidate()],
+            last_episode=9,
+        )
+
+        self.assertEqual(len(result["registered"]), 1)
+        self.assertTrue(self.quark.received[0][0]["is_dir"])
+
+    def test_unscannable_share_falls_back_to_whole_staging(self):
+        # 分享子目录读不出来（扫不到文件）时退回整包转存，至少不会一集都不补
+        self.quark.default_share = [
+            {"id": "share-folder-1", "name": "某剧 全季", "size": 0, "is_dir": True}
+        ]
+        self.quark.dirs["fid-share-folder-1"] = [
+            {"id": "f35", "name": "S01E35.mp4", "size": 1035, "is_dir": False}
+        ]
+        original_list = self.quark.list_share_entries
+
+        def flaky(cookie, share_payload, cid="0", offset=0, limit=200):
+            if str(cid or "0") != "0":
+                raise RuntimeError("子目录接口 403")
+            return original_list(cookie, share_payload, cid, offset, limit)
+
+        self.quark.list_share_entries = flaky
+        result = self._register(
+            task=self._tv_task(),
+            candidates=[self._candidate()],
+            last_episode=34,
+            existing_episodes=set(range(1, 35)),
+        )
+
+        # 退回整包：提交的是分享文件夹本身
+        self.assertTrue(self.quark.received)
+        self.assertTrue(self.quark.received[0][0]["is_dir"])
+        self.assertIn("本轮按整包转存", " ".join(result["skipped"]))
+        # 后面的按集筛选照旧生效，不会把已有集也复制一遍
+        jobs = [ccj.get_cross_copy_job(job_id) for job_id in result["registered"]]
+        self.assertEqual([job["filename"] for job in jobs], ["S01E35.mp4"])
+
+
+class TestStagingCleanup(SubscriptionCrossCopyTestBase):
+    """复制成功后清理中转目录里的空文件夹（只删确实为空的）。"""
+
+    def _prepare_staging(self):
+        root = f"staging::{sc.CROSS_COPY_STAGING_ROOT}/测试剧集"
+        self.quark.dirs[root] = [
+            {"id": "d-empty", "name": "空的分享文件夹", "size": 0, "is_dir": True},
+            {"id": "d-keep", "name": "还有文件的", "size": 0, "is_dir": True},
+        ]
+        self.quark.dirs["d-empty"] = []
+        self.quark.dirs["d-keep"] = [
+            {"id": "x1", "name": "S01E44.mkv", "size": 1, "is_dir": False},
+        ]
+        return root
+
+    def test_only_empty_folders_removed(self):
+        self._prepare_staging()
+        removed = sc.cleanup_staging_empty_folders(self.quark, "cookie-quark", "测试剧集")
+
+        self.assertEqual(removed, 1)
+        self.assertIn("d-empty", self.quark.deleted)
+        self.assertNotIn("d-keep", self.quark.deleted)
+
+    def test_task_staging_root_is_never_removed(self):
+        root = self._prepare_staging()
+        sc.cleanup_staging_empty_folders(self.quark, "cookie-quark", "测试剧集")
+
+        self.assertNotIn(root, self.quark.deleted)
+
+    def test_missing_staging_dir_is_noop(self):
+        # 没跑过补源的任务没有中转目录，不能顺手建一个出来
+        removed = sc.cleanup_staging_empty_folders(self.quark, "cookie-quark", "没跑过补源的任务")
+        self.assertEqual(removed, 0)
+        self.assertNotIn(("ensure_folder", sc._staging_relative_path("没跑过补源的任务")), self.quark.calls)
+
+    def test_nested_empty_chain_removed_bottom_up(self):
+        root = f"staging::{sc.CROSS_COPY_STAGING_ROOT}/测试剧集"
+        self.quark.dirs[root] = [
+            {"id": "d-outer", "name": "Season 1", "size": 0, "is_dir": True},
+        ]
+        self.quark.dirs["d-outer"] = [
+            {"id": "d-inner", "name": "某剧 4K 全季", "size": 0, "is_dir": True},
+        ]
+        self.quark.dirs["d-inner"] = []
+
+        removed = sc.cleanup_staging_empty_folders(self.quark, "cookie-quark", "测试剧集")
+
+        self.assertEqual(removed, 2)
+        self.assertIn("d-inner", self.quark.deleted)
+        self.assertIn("d-outer", self.quark.deleted)
+
+    def test_provider_without_delete_is_noop(self):
+        self._prepare_staging()
+        self.quark.supports_delete = False
+        removed = sc.cleanup_staging_empty_folders(self.quark, "cookie-quark", "测试剧集")
+        self.assertEqual(removed, 0)
 
 
 if __name__ == "__main__":

@@ -117,6 +117,32 @@ class SubscriptionUiFrontendTest(unittest.TestCase):
         self.assertIn('id="subscription-folder-recommend-btn"', html)
         self.assertIn('onclick="applySubscriptionRecommendedFolderName()"', html)
 
+    def test_cross_copy_sources_narrowed_to_connected_providers(self):
+        # 跨盘引擎支持 115/夸克/阿里互传，但补源只接通了夸克作源。
+        # 界面必须只列已接通的源，否则会出现「勾了阿里、后端静默跳过」。
+        source = UI_PATH.read_text(encoding="utf-8")
+        self.assertIn("const SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES = ['quark'];", source)
+        self.assertIn(
+            "SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(String(item?.name || ''))",
+            source,
+        )
+        # 保存和卡片展示也要过滤，防止历史配置里的未接通源被重新写回 / 显示成「补源：阿里云盘」
+        self.assertIn(
+            ".filter(item => SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(item));",
+            source,
+        )
+        self.assertIn(
+            ".filter(name => name && SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(name))",
+            source,
+        )
+
+    def test_cross_copy_source_ui_says_quark_only(self):
+        html = SUBSCRIPTION_MODAL_TEMPLATE_PATH.read_text(encoding="utf-8")
+        self.assertIn("源网盘（当前仅支持夸克）", html)
+        source = UI_PATH.read_text(encoding="utf-8")
+        self.assertIn("目前跨盘补源只支持从夸克网盘复制资源", source)
+        self.assertIn("目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘", source)
+
     def test_subscription_provider_badges_use_global_tones(self):
         providers = [
             {"name": "115", "label": "115网盘", "link_type": "115share"},

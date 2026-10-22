@@ -3,8 +3,10 @@
 
 为什么不用 pytest：这台机器的安全中心会拦临时文件的创建/删除，pytest 的
 capture 一启动就要 ``TemporaryFile``，直接起不来（报「No usable temporary
-directory」）。所以统一用标准库 unittest，并把临时目录指到仓库内的可写位置，
-再把「清理临时目录失败」这类无关噪音吞掉（拦截是环境问题，不是代码问题）。
+directory」）。所以统一用标准库 unittest，沿用 tempfile 的标准语义——测试代码
+照常写 ``mkdtemp()`` / ``TemporaryDirectory()``，只是把 tempfile 的根指到
+**本轮会话目录**（默认在系统临时区）。清理失败只在「落在会话目录内」时被
+容忍并计数，其它路径照原样抛错，免得把真实 bug 一起吞掉。
 
 本机拦的是「删除文件」这个系统调用本身，**跟目录归属无关**：项目文件夹也一样删不掉。
 所以「删文件」类用例在本机注定假失败。要一份完全干净的结果，用容器跑::
@@ -20,6 +22,12 @@ directory」）。所以统一用标准库 unittest，并把临时目录指到�
     python scripts/run_tests.py pan115 cross     # 按关键字挑模块
     python scripts/run_tests.py tests.test_pan115_downurl   # 精确指定模块（可多个）
     python scripts/run_tests.py --list --changed # 只看会跑哪些模块，不执行
+    python scripts/run_tests.py --clean-temp     # 把项目里的测试临时目录整体移出项目（不跑测试）
+
+临时文件怎么放：默认落在**系统临时目录**（``<系统temp>/115-media-hub-tests/run-XXXX``），
+项目目录里不留渣，也不用为删文件反复确认。只有系统临时目录也不可用时才退回
+``.workbuddy/tmp/work``，那种情况下会打印提示，并可用 ``--clean-temp`` 一次性
+把残渣整体移出项目。
 
 挑选规则（--changed / 关键字）：
     * 公共层（app/core.py、app/db.py、app/config_store.py、app/providers/base.py、
@@ -31,6 +39,7 @@ directory」）。所以统一用标准库 unittest，并把临时目录指到�
 
 import argparse
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -40,7 +49,40 @@ import unittest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TESTS_DIR = os.path.join(REPO, "tests")
-TMP_DIR = os.path.join(REPO, ".workbuddy", "tmp", "work")
+
+# 临时文件放哪：优先系统临时目录，项目目录只作兜底。
+# 为什么不放项目里：这台机器的安全策略对「项目目录内的文件操作」逐次审查，
+# 在项目里建/删成千上万个临时目录既慢又会被要求确认；一旦删除被拦，
+# 残渣还会永远留在项目里、出现在文件树里。放项目外，删不掉的渣由系统自己回收。
+#
+# 注意：这里**不能**调 tempfile.gettempdir()。它的实现是「建一个探测文件再删掉」，
+# 删除被安全策略拦住时会一路退到 cwd（也就是仓库根目录），在那里留下一个
+# 8 字符的 4 字节空文件——正是工作区里那些删不掉的细碎文件的来源。
+# 直接读环境变量就没有这个问题。
+def _system_temp_base():
+    for env in ("TMPDIR", "TEMP", "TMP"):
+        base = os.environ.get(env)
+        if base and os.path.isdir(base):
+            return base
+    return "/tmp" if os.path.isdir("/tmp") else None
+
+
+SYS_TMP_BASE = _system_temp_base()
+SYS_TMP_ROOT = os.path.join(SYS_TMP_BASE, "115-media-hub-tests") if SYS_TMP_BASE else None
+REPO_TMP_ROOT = os.path.join(REPO, ".workbuddy", "tmp")
+REPO_TMP_DIR = os.path.join(REPO_TMP_ROOT, "work")
+# .workbuddy/tmp 下历次「把临时目录指进项目内」留下的同类残渣，统一收掉
+LEGACY_TEST_TEMP_DIRS = ("work", "debug-tests")
+# tempfile 探测失败时会在 cwd 留下的东西：8 位小写字母数字、不超过 4 字节
+PROBE_FILE_RE = re.compile(r"^[0-9a-z]{8}$")
+# 兜底模式（临时目录只能落在项目里）下，每轮最多清多少个历史残留：
+# 项目内删除很慢，一次清几千个会把测试启动拖成十几分钟。
+PRUNE_LIMIT = 50
+STALE_TEMP_SECONDS = 30 * 60
+TEMP_ROOT = None
+SESSION_DIR = None
+# 落在会话目录内、被安全策略拦掉的清理次数。只记不抛，收尾时统一说一句。
+TOLERATED_CLEANUP_FAILURES = []
 
 # 改这些文件等于改公共层，跑子集没意义，直接全量
 SHARED_PATHS = {
@@ -87,46 +129,323 @@ STOPWORDS = {
 ALWAYS_RUN = ["test_modules_doc"]
 
 
-def _probe_tempdir_writable():
-    """自检：能不能在本机建临时文件并删掉。
+def _human_size(num):
+    for unit in ("B", "KB", "MB", "GB"):
+        if num < 1024 or unit == "GB":
+            return f"{num:.0f}{unit}" if unit == "B" else f"{num:.1f}{unit}"
+        num /= 1024.0
 
-    这台机器的安全中心会拦「删除文件」，删不掉时 SQLite 的 journal/wal、
-    跨盘复制的 .part 临时文件都会残留，测试会刷出一堆和代码无关的失败。
+
+def _path_size(path):
+    """粗算目录占用。只用于打印提示，算不准不影响测试。"""
+    total = 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            try:
+                total += os.lstat(os.path.join(root, name)).st_size
+            except OSError:
+                pass
+    return total
+
+
+def _can_create(base):
+    """这个目录能不能写文件（只看写，不看删）。
+
+    刻意不看删除：安全策略拦删除时，写文件往往还是可以的，这时候把临时文件
+    放到项目外的系统临时区依然更好——删不掉的渣不在项目里，系统会自己回收。
     """
-    probe = os.path.join(TMP_DIR, ".probe-delete-check")
+    probe = os.path.join(base, ".probe-write-check")
     try:
-        with open(probe, "w", encoding="utf-8") as handle:
-            handle.write("x")
+        os.makedirs(base, exist_ok=True)
+        with open(probe, "a", encoding="utf-8") as handle:
+            handle.write("")
+        return True
+    except Exception:
+        return False
+
+
+def _can_delete(base):
+    """这个目录里的文件能不能删掉。复用固定名字的探针，删不掉也只留一个文件。"""
+    probe = os.path.join(base, ".probe-delete-check")
+    try:
+        if not os.path.exists(probe):
+            with open(probe, "w", encoding="utf-8") as handle:
+                handle.write("x")
         os.unlink(probe)
         return True
     except Exception:
         return False
 
 
+def _pick_temp_root():
+    """优先项目外的系统临时目录（能写就行），实在写不了才退回项目内。"""
+    for base in (SYS_TMP_ROOT, REPO_TMP_DIR):
+        if base and _can_create(base):
+            return base
+    return REPO_TMP_DIR
+
+
+def _prune_stale_tempdirs(limit=PRUNE_LIMIT):
+    """清掉项目内的历史残留，返回 (删掉几个, 还剩几个)。
+
+    只在兜底模式（临时目录只能落在项目里）时调用，而且限量：项目内的删除在这台
+    机器上很慢，一次清几千个会把测试启动拖成十几分钟。要一次清完用 --clean-temp。
+    """
+    if not os.path.isdir(REPO_TMP_DIR):
+        return 0, 0
+    now = time.time()
+    removed = 0
+    remaining = 0
+    for name in os.listdir(REPO_TMP_DIR):
+        path = os.path.join(REPO_TMP_DIR, name)
+        if SESSION_DIR and os.path.abspath(path) == os.path.abspath(SESSION_DIR):
+            continue
+        if removed >= limit:
+            remaining += 1
+            continue
+        try:
+            if now - os.lstat(path).st_mtime < STALE_TEMP_SECONDS:
+                remaining += 1
+                continue
+            if os.path.isdir(path) and not os.path.islink(path):
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+        except OSError:
+            remaining += 1
+            continue
+        if os.path.exists(path):
+            remaining += 1
+        else:
+            removed += 1
+    return removed, remaining
+
+
+def _prune_temp_root(base, max_age=STALE_TEMP_SECONDS):
+    """清掉临时根目录下的历史残留，返回 (清掉几个, 释放多少字节)。
+
+    和项目内那套的区别：系统临时区删除很快，可以按时间清、不限个数；
+    正在跑的其它测试（含容器里的）会话目录年龄不到 ``max_age``，不会被误删。
+    这是「会话目录自己删不掉」时的兜底——本机能拦删除，残渣就会一直留着。
+    """
+    if not base or not os.path.isdir(base):
+        return 0, 0
+    now = time.time()
+    removed = 0
+    freed = 0
+    try:
+        names = os.listdir(base)
+    except OSError:
+        return 0, 0
+    for name in names:
+        path = os.path.join(base, name)
+        if SESSION_DIR and os.path.abspath(path) == os.path.abspath(SESSION_DIR):
+            continue
+        try:
+            stat = os.lstat(path)
+        except OSError:
+            continue
+        if now - stat.st_mtime < max_age:
+            continue
+        is_dir = os.path.isdir(path) and not os.path.islink(path)
+        size = _path_size(path) if is_dir else stat.st_size
+        try:
+            if is_dir:
+                shutil.rmtree(path, ignore_errors=True)
+            else:
+                os.unlink(path)
+        except OSError:
+            continue
+        if not os.path.exists(path):
+            removed += 1
+            freed += size
+    return removed, freed
+
+
+def _start_temp_session():
+    """开一个本轮专用的临时目录；顺手回收上一轮的残留。"""
+    global TEMP_ROOT, SESSION_DIR
+    TEMP_ROOT = _pick_temp_root()
+    if os.path.abspath(TEMP_ROOT) != os.path.abspath(REPO_TMP_DIR):
+        removed, freed = _prune_temp_root(TEMP_ROOT)
+        if removed:
+            print(f"→ 回收上次中断留下的临时目录 {removed} 个（{_human_size(freed)}）")
+    else:
+        removed, remaining = _prune_stale_tempdirs()
+        print(
+            f"→ 临时目录只能放在项目内（{REPO_TMP_DIR}）：本轮清了 {removed} 个历史残留，还剩 {remaining} 个\n"
+            "    项目内清理很慢，要一次清干净：python scripts/run_tests.py --clean-temp"
+        )
+    SESSION_DIR = tempfile.mkdtemp(prefix="run-", dir=TEMP_ROOT)
+    return SESSION_DIR
+
+
+def _report_tolerated_cleanup():
+    """把「被拦掉的清理」显式说一句——容忍可以，静默不行。"""
+    if not TOLERATED_CLEANUP_FAILURES:
+        return
+    print(
+        f"→ 本轮有 {len(TOLERATED_CLEANUP_FAILURES)} 次临时文件清理被安全策略拦下"
+        "（环境问题，不是代码问题）"
+    )
+
+
+def _finish_temp_session():
+    """删掉本轮会话目录；删不干净就明确说一句，别让项目里默默堆渣。"""
+    if not SESSION_DIR or not os.path.isdir(SESSION_DIR):
+        _report_tolerated_cleanup()
+        return
+    shutil.rmtree(SESSION_DIR, ignore_errors=True)
+    if not os.path.exists(SESSION_DIR):
+        _report_tolerated_cleanup()
+        return
+    leftover = len(os.listdir(SESSION_DIR))
+    if not os.path.abspath(SESSION_DIR).startswith(REPO + os.sep):
+        # 临时目录在项目外：系统会自己回收，只报一句，不要求人工介入
+        print(f"→ 本轮临时目录没删净（剩 {leftover} 项），留在系统临时区由系统回收：{SESSION_DIR}")
+        _report_tolerated_cleanup()
+        return
+    print(
+        f"⚠️  本轮有 {leftover} 项临时文件没删掉（{_human_size(_path_size(SESSION_DIR))}）：{SESSION_DIR}\n"
+        "    这台机器拦「删除文件」，测试自己清不掉是环境问题，不是代码问题。\n"
+        "    下次跑测试会自动清扫；想立刻清干净：python scripts/run_tests.py --clean-temp\n"
+        "    要一份零残留的结果，用容器跑：scripts/test_in_container.sh"
+    )
+    _report_tolerated_cleanup()
+
+
+def _git_tracks(name):
+    return (
+        subprocess.run(
+            ["git", "ls-files", "--error-unmatch", "--", name],
+            cwd=REPO,
+            capture_output=True,
+            text=True,
+            check=False,
+        ).returncode
+        == 0
+    )
+
+
+def _sweep_probe_files():
+    """删掉仓库根目录那些 8 字符 4 字节无名文件。
+
+    它们是 ``tempfile.gettempdir()`` 的候选探测留下的：探针建好文件后删不掉
+    （安全策略拦删除），就一路退到 cwd，把残骸留在仓库根目录。删不掉的会
+    一直堆在那里，每次清理都要人工确认——所以给一条命令一次性收掉。
+    只删「8 位小写字母数字 + ≤4 字节 + git 没跟踪」的文件，不动任何正常文件。
+    """
+    removed, kept = [], []
+    for name in os.listdir(REPO):
+        path = os.path.join(REPO, name)
+        if not PROBE_FILE_RE.match(name) or os.path.isdir(path) or os.path.islink(path):
+            continue
+        try:
+            if os.path.getsize(path) > 4:
+                continue
+        except OSError:
+            continue
+        if _git_tracks(name):
+            continue
+        try:
+            os.unlink(path)
+            removed.append(name)
+        except OSError:
+            kept.append(name)
+    return removed, kept
+
+
+def _relocate_dir(path, label):
+    """把整个目录 rename 到系统临时区的回收目录（瞬时，不逐个删）。
+
+    返回 (状态, 条目数, 字节数, 目标路径或错误信息)，状态是 empty/moved/failed。
+    """
+    entries = os.listdir(path)
+    if not entries:
+        return "empty", 0, 0, ""
+    size = _path_size(path)
+    trash_base = SYS_TMP_BASE or os.path.join(REPO_TMP_ROOT, "trash")
+    trash_root = os.path.join(trash_base, "115-media-hub-test-trash")
+    os.makedirs(trash_root, exist_ok=True)
+    dest = os.path.join(trash_root, f"{label}-" + time.strftime("%Y%m%d-%H%M%S"))
+    try:
+        os.rename(path, dest)
+    except OSError as exc:
+        return "failed", len(entries), size, str(exc)
+    return "moved", len(entries), size, dest
+
+
+def _clean_temp_all():
+    """收拾项目内所有测试残留：临时目录整体移出项目，仓库根目录的探测文件删掉。"""
+    code = 0
+    removed, kept = _sweep_probe_files()
+    if removed:
+        print(f"已删除仓库根目录的探测残留文件 {len(removed)} 个：{' '.join(removed)}")
+    if kept:
+        print(f"⚠️  还有 {len(kept)} 个探测残留删不掉（需要授权）：{' '.join(kept)}")
+
+    for name in LEGACY_TEST_TEMP_DIRS:
+        path = os.path.join(REPO_TMP_ROOT, name)
+        if not os.path.isdir(path):
+            continue
+        status, count, size, detail = _relocate_dir(path, name)
+        if status == "empty":
+            continue
+        if status == "moved":
+            print(f"已把 {name} 下的 {count} 项（{_human_size(size)}）移出项目：{detail}")
+        else:
+            print(f"⚠️  {path} 移不出去（{detail}），请手动删除：rm -rf {path}")
+            code = 1
+    print("移出的东西在系统临时区，系统会自动回收；想立刻腾空间就删掉打印出来的路径")
+    return code
+
+
+def _probe_tempdir_writable():
+    """自检：能不能在本机删掉临时文件。
+
+    这台机器的安全中心会拦「删除文件」，删不掉时 SQLite 的 journal/wal、
+    跨盘复制的 .part 临时文件都会残留，测试会刷出一堆和代码无关的失败。
+    """
+    return _can_delete(SESSION_DIR or TEMP_ROOT or REPO_TMP_DIR)
+
+
+def _inside_session(path) -> bool:
+    """这个路径是否落在本轮临时目录里（只有它们的清理失败才算环境噪音）。"""
+    bases = [os.path.abspath(base) for base in (SESSION_DIR, TEMP_ROOT) if base]
+    try:
+        target = os.path.abspath(path)
+    except (TypeError, ValueError):
+        return False
+    return any(target == base or target.startswith(base + os.sep) for base in bases)
+
+
 def _harden_tempdir() -> None:
-    """把临时目录挪进仓库，并让「清理失败」不再炸掉整轮测试。"""
-    os.makedirs(TMP_DIR, exist_ok=True)
-    tempfile.tempdir = TMP_DIR
+    """把 tempfile 指到本轮会话目录，并只在会话目录内容忍清理失败。
+
+    为什么还要容忍：安全中心拦的是「删除文件」这个系统调用，删不掉时
+    SQLite 的 journal/wal、跨盘复制的 .part 都会残留在会话目录里，进而把
+    一堆正常用例刷成失败。这类失败是环境问题，不是代码问题。
+
+    为什么**只**在会话目录内容忍：以前是全局无条件忽略，连生产代码里
+    真写错的清理（比如路径算错、权限没判）也一起吞掉，测试就再也看不见了。
+    现在会话目录外的失败照原样抛出，真实 bug 不会被静默掩盖。
+    """
+    tempfile.tempdir = SESSION_DIR or TEMP_ROOT or REPO_TMP_DIR
 
     real_rmtree = shutil.rmtree
 
-    def tolerant_rmtree(path, ignore_errors=False, onerror=None):
+    # 3.12 起 rmtree/TemporaryDirectory 改用 onexc，3.9/3.10 用 onerror。
+    # 用 *args/**kwargs 原样透传，才不会在某个 Python 版本上突然 TypeError。
+    def tolerant_rmtree(path, ignore_errors=False, *args, **kwargs):
         try:
-            return real_rmtree(path, ignore_errors=True)
-        except Exception:
-            return None
+            return real_rmtree(path, ignore_errors=ignore_errors, *args, **kwargs)
+        except OSError:
+            if _inside_session(path):
+                TOLERATED_CLEANUP_FAILURES.append(str(path))
+                return None
+            raise
 
     shutil.rmtree = tolerant_rmtree
-
-    real_cleanup = tempfile.TemporaryDirectory.cleanup
-
-    def tolerant_cleanup(self):
-        try:
-            real_cleanup(self)
-        except Exception:
-            pass
-
-    tempfile.TemporaryDirectory.cleanup = tolerant_cleanup
 
     # 生产用 WAL，测试里换成内存 journal：WAL 会额外产生 -wal/-shm，
     # 在被拦删除的机器上删不掉，SQLite 直接抛 disk I/O error，一崩一大片。
@@ -246,7 +565,11 @@ def main(argv):
     parser.add_argument("--changed", nargs="?", const="HEAD", default=None, help="按 git 改动挑选（可选基线，默认 HEAD）")
     parser.add_argument("--list", action="store_true", help="只列出将运行的模块")
     parser.add_argument("--quiet", action="store_true", help="不打印每条用例名")
+    parser.add_argument("--clean-temp", action="store_true", help="清掉所有测试临时目录（不区分新旧）后退出")
     args = parser.parse_args(argv)
+
+    if args.clean_temp:
+        return _clean_temp_all()
 
     explicit = [name[len("tests."):] for name in args.modules if name.startswith("tests.")]
     keywords = [name for name in args.modules if not name.startswith("tests.")]
@@ -274,6 +597,7 @@ def main(argv):
 
     # 先补好搜索路径：_harden_tempdir 里要 import app.db 给连接层打补丁
     sys.path.insert(0, REPO)
+    _start_temp_session()
     _harden_tempdir()
     if not _probe_tempdir_writable():
         print(
@@ -283,6 +607,13 @@ def main(argv):
             "        scripts/test_in_container.sh [--changed|模块名...]\n"
         )
 
+    try:
+        return _run_suite(modules, args)
+    finally:
+        _finish_temp_session()
+
+
+def _run_suite(modules, args):
     loader = unittest.TestLoader()
     suite = unittest.TestSuite()
     load_failed = []

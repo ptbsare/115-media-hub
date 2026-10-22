@@ -1,7 +1,7 @@
 """本地暂存目录管理测试（跨盘复制暂存目录，2026-10-21 起为单目录模型）。
 
-注意：本会话环境的 tempfile 自检被破坏，测试统一用 tempfile.mkdtemp()
-显式指定 dir（mkdtemp 本身不触发自检），并在 tearDown 手动清理。
+临时目录用 ``tempfile.mkdtemp()`` 建、tearDown 里清；根目录由
+``scripts/run_tests.py`` 指到本轮会话目录（系统临时区），不落进仓库。
 """
 
 import os

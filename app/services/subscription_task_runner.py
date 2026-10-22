@@ -20,7 +20,16 @@ from .resource import (
     _pick_submit_offline_hash,
     build_offline_job_identity,
 )
-from .subscription_cross_copy import register_cross_copy_from_candidates
+from .subscription_cross_copy import (
+    cleanup_staging_empty_folders,
+    register_cross_copy_from_candidates,
+    split_cross_copy_sources,
+)
+from .subscription_cross_copy_organize import (
+    SUBSCRIPTION_ORGANIZE_JOB_WAIT_SECONDS,
+    locate_subscription_imported_files,
+    organize_files_for_subscription_task,
+)
 from .subscription_episode import _extract_subscription_season_from_name
 
 
@@ -313,6 +322,193 @@ def _build_subscription_episode_batch_decision(
         "target_missing_count": len(target_missing),
         "candidate_count": candidate_count,
     }
+
+
+def _subscription_cross_copy_needed(
+    task: Dict[str, Any],
+    ranked_candidates: List[Dict[str, Any]],
+    last_episode: int,
+) -> bool:
+    """判断本盘本轮是否缺资源（fallback 补源的口径 1）。
+
+    电影：本盘无候选 → 缺。
+    电视剧：本盘候选里没有比 last_episode 更靠后的集数 → 缺。
+    """
+    media_type = str(task.get("media_type", "movie") or "movie").strip().lower()
+    if not ranked_candidates:
+        return True
+    if media_type != "tv":
+        return False
+    # 电视剧：看候选集数有没有超过本地已保存的最高集
+    for candidate in ranked_candidates:
+        if not isinstance(candidate, dict):
+            continue
+        candidate_episode = max(
+            0,
+            int(candidate.get("episode", 0) or 0),
+            int(candidate.get("range_end", 0) or 0),
+        )
+        if candidate_episode > last_episode:
+            return False
+    return True
+
+
+async def _scan_subscription_existing_episodes_quietly(
+    task: Dict[str, Any], cfg: Dict[str, Any]
+) -> Set[int]:
+    """为补源取「目标目录实际落盘的集」，扫不到就返回空集合。
+
+    补源有两条调用路径。有候选的那条走目录校准之后，扫描结果现成；无候选早退
+    那条发生在校准之前，只有进度里的旧值（常为 0）。拿旧值当判缺依据，会把
+    本盘已有的集整季重下一遍。这里现场扫一次兜住这个缺口。
+
+    扫描是递归的（`_scan_provider_existing_tv_episodes` 走 BFS），所以文件平铺
+    在片名目录、还是躺在 `Season NN` 子目录里，都能识别到——补源落点是 Season，
+    而历史遗留的平铺文件不会因此被当成「不存在」。
+    """
+    provider_name = str(task.get("provider", "115") or "115").strip() or "115"
+    provider_meta = _get_provider_or_none(provider_name)
+    if provider_meta is None:
+        return set()
+    try:
+        cookie = provider_meta.get_cookie(cfg)
+    except Exception:
+        return set()
+    if not str(cookie or "").strip():
+        return set()
+    base_savepath = normalize_relative_path(str(task.get("savepath", "") or "").strip())
+    scan_savepath = resolve_subscription_tv_scan_savepath(task, base_savepath) or base_savepath
+    try:
+        folder_id = str(
+            await asyncio.to_thread(provider_meta.resolve_folder_id_by_path, cookie, scan_savepath) or ""
+        ).strip()
+        if not folder_id:
+            return set()
+        scan_result = await asyncio.to_thread(
+            _scan_provider_existing_tv_episodes, provider_meta, cookie, folder_id, task
+        )
+    except Exception as exc:
+        logging.getLogger(__name__).info("跨盘补源：现场扫描目标目录失败（%s），按进度值判缺", exc)
+        return set()
+    episodes = scan_result.get("episodes", []) if isinstance(scan_result, dict) else []
+    return {
+        max(0, int(item or 0))
+        for item in (episodes if isinstance(episodes, list) else [])
+        if max(0, int(item or 0)) > 0
+    }
+
+
+async def _subscription_cross_copy_dispatch(
+    task: Dict[str, Any],
+    cfg: Dict[str, Any],
+    ranked_candidates: List[Dict[str, Any]],
+    last_episode: int,
+    trigger: str,
+    total_episodes: int,
+    existing_episodes: Optional[Set[int]] = None,
+) -> None:
+    """跨盘补源：判定本盘缺不缺 → 搜源网盘候选 → 注册复制任务。
+
+    只有一个源接通（夸克），名单来自 ``core.SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS``。
+    ``off`` 或没有已接通的源时一次搜索都不发；未接通的源写 warn 说明已跳过，
+    否则界面勾着却毫无动静，用户无从判断。
+
+    **必须在「目标目录已校准」之后调用**：fallback 的缺集判定要拿目标目录里
+    实际已有的最高集去比候选集数，用任务进度里的旧值会恒判「不缺」而永不补源。
+    无候选场景例外——本盘一条候选都没有时必然缺，判定不依赖 last_episode。
+
+    :param existing_episodes: 目标目录实际落盘的集集合。传了就按集合精确判缺
+        （能识别中间缺集）；不传时剧集任务会现场扫一次目录补齐。
+    """
+    cross_copy_mode = str(task.get("cross_copy_mode", "off") or "off")
+    if cross_copy_mode == "off":
+        return
+    # 引擎支持 115/夸克/阿里互传，但补源只接通了夸克作源；
+    # 其余源必须显式告知「已跳过」，否则界面勾着却一次搜索都不发，用户无从判断。
+    usable_sources, skipped_sources = split_cross_copy_sources(task.get("cross_copy_sources", []))
+    if skipped_sources:
+        skipped_labels = "、".join(provider_display_name(name, name) for name in skipped_sources)
+        await write_subscription_log(
+            f"跨盘补源：{skipped_labels} 暂未接通补源，本次已跳过（当前只支持从夸克网盘补源）",
+            "warn",
+        )
+    if not usable_sources:
+        await write_subscription_log(
+            "跨盘补源：没有已接通的源网盘，本次未执行（当前只支持从夸克网盘补源）",
+            "warn",
+        )
+        return
+    # 只在「本盘缺」时补源：prefer 命中即补，fallback 本盘缺才补
+    if cross_copy_mode == "prefer":
+        should_cross_copy = True
+    else:  # fallback
+        should_cross_copy = _subscription_cross_copy_needed(task, ranked_candidates, last_episode)
+    if not should_cross_copy:
+        return
+
+    # 精确判缺需要一个「本盘到底有哪些集」的集合。有候选那条路径校准阶段已经扫过，
+    # 直接传进来；无候选早退这条还没扫，现场补一次，避免拿进度旧值判缺。
+    if (
+        existing_episodes is None
+        and str(task.get("media_type", "") or "").strip().lower() == "tv"
+    ):
+        existing_episodes = await _scan_subscription_existing_episodes_quietly(task, cfg)
+        scanned_max = max(existing_episodes) if existing_episodes else 0
+        if scanned_max > int(last_episode or 0):
+            last_episode = scanned_max
+
+    cross_search = await find_subscription_cross_copy_candidates(
+        task,
+        source_provider="quark",
+        last_episode=last_episode,
+        trigger=trigger,
+        total_episodes=total_episodes,
+    )
+    cross_copy_candidates = (
+        cross_search.get("candidates", []) if isinstance(cross_search.get("candidates"), list) else []
+    )
+    if not cross_copy_candidates:
+        await write_subscription_log(
+            f"跨盘补源：本盘{'缺最新资源' if cross_copy_mode == 'fallback' else '优先跨盘'}，"
+            "但夸克也未找到可补候选",
+            "info",
+        )
+        return
+
+    await write_subscription_log(
+        f"跨盘补源：本盘{'缺最新资源' if cross_copy_mode == 'fallback' else '优先跨盘'}，"
+        f"从夸克找到 {len(cross_copy_candidates)} 条候选，尝试注册补源",
+        "info",
+    )
+    try:
+        cross_copy_stats = await asyncio.to_thread(
+            register_cross_copy_from_candidates,
+            task=task,
+            cfg=cfg,
+            candidates=cross_copy_candidates,
+            last_episode=last_episode,
+            existing_episodes=existing_episodes,
+        )
+        for log_message, log_level in (cross_copy_stats.get("logs", []) or []):
+            await write_subscription_log(log_message, log_level)
+    except Exception as exc:
+        await write_subscription_log(f"跨盘补源注册失败（不影响本次订阅）：{exc}", "warn")
+
+    # 收尾清一次中转空壳：逐文件复制成功后源文件会被删掉，分享带进来的文件夹
+    # 留在夸克中转目录里只是空目录。只删确实为空的，非空一律不动。
+    try:
+        cleaned = await asyncio.to_thread(
+            cleanup_staging_empty_folders,
+            _get_provider_or_none("quark"),
+            str(cfg.get("cookie_quark", "") or ""),
+            str(task.get("name", "") or task.get("title", "") or ""),
+        )
+        if int(cleaned or 0) > 0:
+            await write_subscription_log(
+                f"跨盘补源：已清理夸克中转目录里 {int(cleaned)} 个空文件夹", "info"
+            )
+    except Exception as exc:
+        await write_subscription_log(f"跨盘补源中转目录清理失败（不影响补源）：{exc}", "info")
 
 
 def _build_subscription_candidate_manifest_cache_key(provider: str, candidate: Dict[str, Any]) -> str:
@@ -1030,68 +1226,7 @@ def _select_subscription_offline_entries(
     }
 
 
-# 订阅「入库后整理」改名任务的等待上限：先于计划执行，阻塞也不该拖死整轮订阅。
-SUBSCRIPTION_ORGANIZE_JOB_WAIT_SECONDS = max(
-    30,
-    int(os.environ.get("SUBSCRIPTION_ORGANIZE_JOB_WAIT_SECONDS", 300) or 300),
-)
-
-
-async def _locate_subscription_imported_files(
-    provider_meta: Any,
-    cookie: str,
-    target_cid: str,
-    target_savepath: str,
-    imported_entries: Any,
-) -> List[Dict[str, Any]]:
-    """在目标目录里按「文件名 + 大小」定位本次新入库的文件。
-
-    转存 / 移动都可能换掉原来的 fid，不能沿用源条目的 id；必须回目标目录重新取一条，
-    再把单文件条目交给刮削引擎做原地改名。
-    """
-    wanted: List[Tuple[str, int]] = []
-    for entry in imported_entries if isinstance(imported_entries, list) else []:
-        if not isinstance(entry, dict) or bool(entry.get("is_dir", False)):
-            continue
-        name = str(entry.get("name", "") or "").strip()
-        if not name:
-            continue
-        wanted.append((name, max(0, int(entry.get("size", 0) or 0))))
-    if not wanted or not provider_meta:
-        return []
-    try:
-        listed = await asyncio.to_thread(provider_meta.list_entries, cookie, target_cid)
-    except Exception:
-        return []
-    by_key: Dict[Tuple[str, int], Dict[str, Any]] = {}
-    for item in listed if isinstance(listed, list) else []:
-        if not isinstance(item, dict) or bool(item.get("is_dir", False)):
-            continue
-        name = str(item.get("name", "") or "").strip()
-        if not name:
-            continue
-        by_key[(name, max(0, int(item.get("size", 0) or 0)))] = item
-    normalized_parent = normalize_relative_path(str(target_savepath or "").strip())
-    located: List[Dict[str, Any]] = []
-    for name, size in wanted:
-        item = by_key.get((name, size))
-        if not item:
-            continue
-        fid = str(item.get("fid", "") or item.get("id", "") or "").strip()
-        if not fid:
-            continue
-        located.append(
-            {
-                "id": fid,
-                "cid": fid,
-                "name": name,
-                "is_dir": False,
-                "size": size,
-                "parent_id": str(target_cid or "").strip() or "0",
-                "parent_path": normalized_parent,
-            }
-        )
-    return located
+_locate_subscription_imported_files = locate_subscription_imported_files
 
 
 async def _organize_subscription_imported_files(
@@ -1109,104 +1244,39 @@ async def _organize_subscription_imported_files(
     触发条件：电视剧 + ``organize_on_import`` + ``tmdb_id > 0``，任一不满足直接跳过。
     识别失败 / 计划为空 / 执行失败都只写订阅日志、保留原名，不阻塞入库。
     返回是否真的提交过改名任务。
-    """
-    if str(task.get("media_type", "movie") or "movie").strip().lower() != "tv":
-        return False
-    if not bool(task.get("organize_on_import", False)):
-        return False
-    tmdb_id = max(0, int(task.get("tmdb_id", 0) or 0))
-    if tmdb_id <= 0:
-        return False
-    normalized_cid = str(target_cid or "").strip()
-    normalized_savepath = normalize_relative_path(str(target_savepath or "").strip())
-    if not normalized_cid or not normalized_savepath:
-        return False
-    target_files = await _locate_subscription_imported_files(
-        provider_meta,
-        cookie,
-        normalized_cid,
-        normalized_savepath,
-        imported_entries,
-    )
-    if not target_files:
-        await write_subscription_log(
-            "入库后整理：未在目标目录找到本次新入库的文件，保留原名",
-            "info",
-        )
-        return False
-    payload = {
-        "provider": normalize_mount_provider(provider) or "115",
-        "base_cid": normalized_cid,
-        "base_path": normalized_savepath,
-        "entries": target_files,
-        "tmdb": {
-            "tmdb_id": tmdb_id,
-            "tmdb_media_type": str(task.get("tmdb_media_type", "") or "tv").strip() or "tv",
-            "tmdb_title": str(task.get("tmdb_title", "") or "").strip(),
-            "tmdb_year": str(task.get("tmdb_year", "") or "").strip(),
-            "tmdb_season_episode_map": task.get("tmdb_season_episode_map", {}),
-        },
-        "options": dict(task.get("organize_options", {}) or {}),
-    }
-    try:
-        from .scraper import (
-            build_scraper_rename_plan,
-            create_scraper_job_from_plan,
-            get_scraper_jobs_state,
-            submit_scraper_job,
-        )
 
-        plan = await asyncio.to_thread(build_scraper_rename_plan, payload)
-    except Exception as exc:
-        await write_subscription_log(
-            f"入库后整理：生成改名计划失败（{str(exc)[:120]}），保留原名",
-            "warn",
-        )
+    具体实现在 ``subscription_cross_copy_organize``（跨盘补源复制完成后要复用同一套
+    逻辑，而那边不能反向 import 本模块）。这里保留原函数名与签名，日志也仍然从这里
+    写，订阅导入的两处调用点与既有测试都不用动。
+    """
+    result = await organize_files_for_subscription_task(
+        task=task,
+        provider=provider,
+        cookie=cookie,
+        provider_meta=provider_meta,
+        target_cid=target_cid,
+        target_savepath=target_savepath,
+        imported_entries=imported_entries,
+    )
+    if result.get("silent"):
         return False
-    actions = [
-        action
-        for action in (plan.get("actions") if isinstance(plan.get("actions"), list) else [])
-        if isinstance(action, dict) and action.get("ready") and not action.get("issue")
-    ]
-    if not actions:
-        await write_subscription_log("入库后整理：没有可执行的改名动作，保留原名", "info")
-        return False
-    executable_plan = {**plan, "actions": actions, "ready_count": len(actions)}
-    job_id = 0
-    try:
-        created = await asyncio.to_thread(create_scraper_job_from_plan, {"plan": executable_plan})
-        job_id = max(0, int((created or {}).get("job_id", 0) or 0))
-        if job_id <= 0:
-            raise RuntimeError("创建改名任务失败")
-        await asyncio.to_thread(
-            lambda: submit_scraper_job(job_id).result(timeout=SUBSCRIPTION_ORGANIZE_JOB_WAIT_SECONDS)
-        )
-        state = get_scraper_jobs_state(job_id=job_id)
-        jobs = state.get("jobs") if isinstance(state, dict) else []
-        actual = jobs[0] if isinstance(jobs, list) and jobs else {}
-    except Exception as exc:
-        await write_subscription_log(
-            f"入库后整理：执行改名失败（{str(exc)[:120]}），保留原名",
-            "warn",
-        )
-        return False
-    status = str((actual or {}).get("status", "") or "").strip()
-    succeeded = max(0, int((actual or {}).get("succeeded_actions", 0) or 0))
-    failed = max(0, int((actual or {}).get("failed_actions", 0) or 0))
-    if status == "completed":
-        await write_subscription_log(
-            f"入库后整理：已原地改名 {succeeded} 个文件（任务 #{job_id}）",
-            "success",
-        )
+    if result.get("ok"):
+        succeeded = int(result.get("succeeded", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+        job_id = int(result.get("job_id", 0) or 0)
+        if str(result.get("status", "") or "") == "partial":
+            await write_subscription_log(
+                f"入库后整理：部分完成，成功 {succeeded} 个 / 失败 {failed} 个（任务 #{job_id}）",
+                "warn",
+            )
+        else:
+            await write_subscription_log(f"入库后整理：已原地改名 {succeeded} 个文件（任务 #{job_id}）", "success")
         return True
-    if status == "partial":
-        await write_subscription_log(
-            f"入库后整理：部分完成，成功 {succeeded} 个 / 失败 {failed} 个（任务 #{job_id}）",
-            "warn",
-        )
-        return True
-    detail = str((actual or {}).get("status_detail", "") or "改名未完成").strip()
-    await write_subscription_log(f"入库后整理：改名未完成（{detail[:120]}），保留原名", "warn")
+    reason = str(result.get("reason", "") or "整理未完成，保留原名").strip()
+    await write_subscription_log(
+        f"入库后整理：{reason}",
+        str(result.get("level", "warn") or "warn"),
+    )
     return False
 
 
@@ -2221,26 +2291,6 @@ async def _run_subscription_task_quark(
         if legacy_candidate:
             ranked_candidates = [legacy_candidate]
 
-    # ---- 跨盘补源：夸克候选注册为复制任务（省去手动跨盘复制） ----
-    # fallback 语义由幂等跳过保证：订阅转存成功 → 文件已在目标盘 → 补源任务跳过；
-    # 转存失败/未命中 → 补源任务把资源复制进目标网盘。
-    cross_copy_registered_job_ids: List[int] = []
-    if str(task.get("cross_copy_mode", "off") or "off") != "off" and list(task.get("cross_copy_sources", []) or []):
-        try:
-            cross_copy_stats = await asyncio.to_thread(
-                register_cross_copy_from_candidates,
-                task=task,
-                cfg=cfg,
-                candidates=ranked_candidates,
-            )
-            cross_copy_registered_job_ids = [
-                max(0, int(job_id or 0)) for job_id in (cross_copy_stats.get("registered", []) or [])
-            ]
-            for log_message, log_level in (cross_copy_stats.get("logs", []) or []):
-                await write_subscription_log(log_message, log_level)
-        except Exception as exc:
-            await write_subscription_log(f"跨盘补源注册失败（不影响本次订阅）：{exc}", "warn")
-
     if not ranked_candidates:
         _subscription_stage_timer_enter(stage_timer, "finalize")
         if completed_locked:
@@ -2297,11 +2347,7 @@ async def _run_subscription_task_quark(
     base_savepath = normalize_relative_path(str(task.get("savepath", "")).strip())
     effective_savepath = base_savepath
     if task["media_type"] == "movie":
-        movie_folder = sanitize_115_folder_name(
-            f"{task.get('title', '')} {task.get('year', '')}".strip() or "未命名电影",
-            fallback="未命名电影",
-        )
-        effective_savepath = join_relative_path(base_savepath, movie_folder)
+        effective_savepath = build_subscription_movie_savepath(task, base_savepath) or base_savepath
     elif task["media_type"] == "tv":
         effective_savepath = resolve_subscription_tv_scan_savepath(task, base_savepath) or base_savepath
     check_subscription_cancelled()
@@ -3797,6 +3843,18 @@ async def run_subscription_task(
             legacy_candidate = search_result.get("candidate", {}) if isinstance(search_result.get("candidate"), dict) else {}
             if legacy_candidate:
                 ranked_candidates = [legacy_candidate]
+        # 无候选 = 本盘必然缺，先补源再走「等待资源」收口。
+        # 有候选的场景不在这里判定：fallback 要比对「目标目录实际已落盘的最高集」，
+        # 而那个值要到下面 calibrate 阶段扫完目录才有，此处用进度旧值会恒判「不缺」。
+        if not ranked_candidates:
+            await _subscription_cross_copy_dispatch(
+                task,
+                cfg,
+                ranked_candidates,
+                last_episode,
+                trigger,
+                known_total,
+            )
         if not ranked_candidates:
             _subscription_stage_timer_enter(stage_timer, "finalize")
             if completed_locked:
@@ -3863,11 +3921,7 @@ async def run_subscription_task(
         base_savepath = normalize_relative_path(str(task.get("savepath", "")).strip())
         effective_savepath = base_savepath
         if task["media_type"] == "movie":
-            movie_folder = sanitize_115_folder_name(
-                f"{task.get('title', '')} {task.get('year', '')}".strip() or "未命名电影",
-                fallback="未命名电影",
-            )
-            effective_savepath = join_relative_path(base_savepath, movie_folder)
+            effective_savepath = build_subscription_movie_savepath(task, base_savepath) or base_savepath
         elif task["media_type"] == "tv":
             effective_savepath = resolve_subscription_tv_scan_savepath(task, base_savepath) or base_savepath
         check_subscription_cancelled()
@@ -3983,6 +4037,19 @@ async def run_subscription_task(
                         f"已按目标目录校准追更进度：E{previous_last_episode} -> E{last_episode}",
                         "info",
                     )
+
+        # 到这里 last_episode 才是「目标目录实际已落盘的最高集」，fallback 的缺集判定
+        # 必须用这个值：用校准前的进度值会得出「本盘不缺」而永不补源（实测踩过）。
+        if ranked_candidates:
+            await _subscription_cross_copy_dispatch(
+                task,
+                cfg,
+                ranked_candidates,
+                last_episode,
+                trigger,
+                known_total,
+                existing_episodes=existing_folder_episodes,
+            )
 
         trigger_is_manual = str(trigger or "").strip().lower() == "manual"
         attempt_candidates = ranked_candidates

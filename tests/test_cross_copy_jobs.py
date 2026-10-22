@@ -1,7 +1,8 @@
 """跨盘复制任务测试（#9 任务接入与手动入口）。
 
-注意：本会话环境 tempfile 自检不稳定，统一用 tempfile.mkdtemp()
-显式建目录并在 tearDown 手动清理。
+临时目录用 ``tempfile.mkdtemp()`` 建、tearDown 里清。根目录由
+``scripts/run_tests.py`` 指到本轮会话目录（系统临时区），不落进仓库，
+所以不用自己拼路径、也不该往项目里写。
 """
 
 import asyncio

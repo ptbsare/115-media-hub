@@ -322,6 +322,24 @@
                             </details>
                             <div id="settings-storage-form-status" class="settings-storage-status" hidden></div>
                         </div>
+
+                        <div class="settings-storage-card">
+                            <div class="settings-storage-card-head">
+                                <div class="settings-storage-card-title">夸克中转残留清理</div>
+                            </div>
+                            <div class="settings-storage-hint">
+                                订阅跨盘补源会先把缺的集转存到夸克 <code class="font-mono">云下载/跨盘中转</code>。复制成功后中转副本会自动删；被取消或失败的任务为了能续传会先留着。这里按天兜底清理，防止它们长期占着夸克空间。
+                            </div>
+                            <div class="settings-storage-form">
+                                <label class="block min-w-0">
+                                    <span class="text-xs text-slate-500">保留天数（0 = 不自动清理）</span>
+                                    <input id="cross_copy_staging_retention_days" type="number" min="0" max="365" step="1" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="7">
+                                </label>
+                            </div>
+                            <div class="text-[11px] text-slate-500 mt-2 leading-5">
+                                只清理超过该天数、且没有任务在跑的中转文件；正在复制的、以及还没超期的取消/失败任务一律不动。删除是移到<strong class="text-slate-300">夸克回收站</strong>，配额要等回收站被清空或系统回收之后才真正释放。清理之后，旧任务「重试可续传」就不再成立，重试会重新转存一遍。
+                            </div>
+                        </div>
                     </div>
                 </section>
 
