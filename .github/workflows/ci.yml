@@ -1,0 +1,128 @@
+name: CI
+
+# 一次推送只跑一遍：先测试，测试绿了并且 version.json 有改动，才构建并推送镜像。
+# 也就是说「测试红 → 不出镜像」是硬约束，不是靠人记得。
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: xianer235/115-media-hub
+
+jobs:
+  test:
+    name: 测试与静态检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: test-${{ github.ref }}
+      # 连续推送时只保留最新那次测试（省时间），但绝不影响正在跑的镜像构建
+      cancel-in-progress: true
+    outputs:
+      version_changed: ${{ steps.version_file.outputs.changed }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # 需要对比「这次推送改了哪些文件」，所以要完整历史而不是浅克隆
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install --prefer-binary -r requirements.txt httpx
+
+      - name: Compile Python
+        run: python -m compileall -q app main.py
+
+      - name: Check JS syntax
+        run: |
+          set -euo pipefail
+          node --version
+          fail=0
+          while IFS= read -r js; do
+            node --check "$js" || fail=1
+          done < <(find static/js -name '*.js' -type f)
+          exit "$fail"
+
+      - name: Run unit tests
+        # CI 机器上没有本机那条「禁止删除文件」的限制，所以直接跑全量，
+        # 不需要 scripts/test_in_container.sh 那套容器绕行方案。
+        run: python scripts/run_tests.py
+
+      - name: Detect version.json change
+        id: version_file
+        shell: bash
+        run: |
+          set -euo pipefail
+          changed=false
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            changed=true
+          else
+            base="${{ github.event.before }}"
+            if [ -z "$base" ] || [ "$base" = "0000000000000000000000000000000000000000" ]; then
+              base="$(git rev-parse "${{ github.sha }}^" 2>/dev/null || true)"
+            fi
+            if [ -n "$base" ] && git diff --name-only "$base" "${{ github.sha }}" | grep -qx 'version.json'; then
+              changed=true
+            fi
+          fi
+          echo "changed=$changed" >> "$GITHUB_OUTPUT"
+
+  build-and-push:
+    name: 构建并推送镜像
+    needs: test
+    # 三个条件同时成立才出镜像：测试绿了、version.json 改过、且不是 PR 触发
+    if: >-
+      needs.test.outputs.version_changed == 'true' &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    concurrency:
+      group: release-${{ github.ref }}
+      # 发版构建一旦开始就让它跑完：后面再推个文档提交，不该把镜像构建掐掉
+      cancel-in-progress: false
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Read version
+        id: version
+        shell: bash
+        run: |
+          version="$(jq -r '.version // empty' version.json)"
+          if [[ -z "$version" || "$version" == "dev" ]]; then
+            echo "version.json must contain a release version" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/amd64
+          push: true
+          build-args: |
+            APP_VERSION=${{ steps.version.outputs.version }}
+          tags: |
+            ${{ env.IMAGE_NAME }}:latest
+            ${{ env.IMAGE_NAME }}:${{ steps.version.outputs.version }}
