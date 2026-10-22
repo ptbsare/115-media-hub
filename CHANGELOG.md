@@ -4,14 +4,14 @@ All notable changes to this project will be documented in this file. The format 
 
 ## [0.15.6] - 2026-10-23
 
-这一版不改功能，改的是「怎么保证发出去的东西是对的」：把测试从「有空才跑」变成「流水线里必须过」，同时收拾了几处工程配置。
+这一版不改功能，改的是「怎么保证发出去的东西是对的」：把测试挂到发版那一步上，同时收拾了几处工程配置。日常开发不受影响 —— 普通提交不会触发任何自动任务。
 
 ### 发版门禁：测试不绿就不出镜像
 
-- **测试与镜像构建合并成一条流水线**（`.github/workflows/ci.yml`，替代原来的 `docker-release.yml`）：每次推送到 `main` 先跑 Python 编译检查、全量 JS 语法检查、全量单元测试；只有测试通过、并且这次推送改过 `version.json`，才会进入构建并推送镜像。以前这两件事互不相干 —— 测试写在本地的 `check.sh` 里，发版流水线里一条测试都不跑，所以「测试全红但坏镜像照样上 Docker Hub」是真实存在的路径，现在这条路径被 `needs: test` 从流程上堵死。
-- **连续推送不会打断正在跑的构建**：并发控制拆成两组 —— 测试组「只留最新一次」，旧的排队测试直接取消（省时间）；构建组「一旦开始就跑到完」，避免发版构建进行中再推一个文档提交、把镜像 tag 掐在半路。
-- **提供手动重建通道**：`workflow_dispatch` 手动触发会被当作「要发版」，用于「代码修好了但不想动版本号」的场景。否则修完 bug 再推一次（没改 `version.json`）不会自动重建镜像，容易误以为修好了而线上还是旧镜像。
-- **`version.json` 变更检测需要完整 git 历史**：`actions/checkout` 显式设 `fetch-depth: 0`，浅克隆下 `git diff` 会因缺少父提交而判定失败（表现为永远不出镜像）。
+- **测试与镜像构建合并成一条流水线**（`.github/workflows/ci.yml`，替代原来的 `docker-release.yml`）：以前这两件事互不相干 —— 测试写在本地的 `check.sh` 里，发版流水线里一条测试都不跑，所以「测试全红但坏镜像照样上 Docker Hub」是真实存在的路径。现在构建 job 用 `needs: test` 挂在测试后面，测试不过就直接跳过构建。
+- **只在改版本号时触发，不占用日常开发**：流水线限定 `paths: version.json` —— 只有「准备发版」的那种推送才跑，改代码、改文档一律不触发。日常验证仍然是本机 `scripts/check.sh`，想跑多快就跑多快。
+- **手动触发可选「只跑检查、不出镜像」**：`workflow_dispatch` 带一个 `publish` 开关，默认会重建镜像（覆盖同版本 tag），勾掉就只跑一遍测试与语法检查，适合「想确认干净机器上也是绿的」但不打算发版的时候。
+- **连续触发不会打断正在跑的构建**：并发控制拆成两组 —— 测试组「只留最新一次」，旧的排队测试直接取消；构建组「一旦开始就跑到完」，避免镜像 tag 掐在半路。
 
 ### 工程配置整理
 
@@ -23,7 +23,7 @@ All notable changes to this project will be documented in this file. The format 
 ### 验证
 
 - 容器内全量 **1991 条零失败**（`scripts/test_in_container.sh`）。
-- `node --check` 全量 33 个 JS 文件通过；`version.json` 变更检测用真实历史分别跑出 `true` / `false`；工作流 YAML 结构经解析校验（`needs`、条件、job 级并发组、输出传递）。
+- `node --check` 全量 33 个 JS 文件通过；工作流 YAML 结构经解析校验（触发路径、`needs`、`publish` 开关、job 级并发组）。
 - **用「只含已跟踪文件」的导出版本复现干净机器**：`git archive` 出一份不带 `AGENTS.md` 的副本，在里面跑 `tests.test_modules_doc` → 5 条通过、1 条跳过（修好前是 `FileNotFoundError`）。
 - **新流水线的真实运行验证了门禁本身**：首次（`5d35d24`）测试红、构建 `skipped`，镜像没有被覆盖 —— 这正是要的效果，也暴露了上面那个隐患；修复后测试绿、构建按预期 `skipped`（该次未改 `version.json`）；随后用 `workflow_dispatch` 手动触发，测试绿 + 构建成功，`0.15.6` 与 `latest` 已推送到 Docker Hub。
 

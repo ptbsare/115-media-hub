@@ -57,7 +57,7 @@
 - **主题必须日夜双查**：页面用到 `html.theme-day` / `html:not(.theme-day)` 两套配色，只看夜间模式容易漏掉日间可见性问题。
 - **115 相关代码偏脆弱**：下载链接解析依赖逆向出来的 RSA/加密 downurl 协议（`app/routes/strm.py`）；大目录读取可能触发 `IncompleteRead`，现有策略是断连/超时类错误重试并逐级缩小单页大小。改动这些地方要同时验证“正常路径”和“服务端掐断”路径。
 - **外部授权只能在部署环境验证**：115 扫码登录、阿里云盘 OAuth、token 过期与刷新都无法在本地沙箱验证，回复时必须把“单测通过”和“实盘待验”分开表述。
-- **CI 是唯一的强制门，本机 `check.sh` 只是开发期快跑**：`.github/workflows/ci.yml` 在每次推 main 时跑全量测试 + 编译 + 全量 JS 语法检查，构建镜像的 job 用 `needs: test` 挂在它后面——**测试不绿不会出镜像**，本次推送没改 `version.json` 也不出镜像。所以「镜像已发布」等价于「那份代码当时测试全绿」。要发版就改 `version.json` 推上去；只想验测试就正常提交推送。CI 机器上没有本机那条「禁止删除文件」的限制，直接 `python scripts/run_tests.py` 跑全量即可，不需要 `test_in_container.sh` 那套容器绕行。
+- **CI 只在发版那一步跑，日常开发只用本机 `check.sh`**：`.github/workflows/ci.yml` 限定 `paths: version.json` —— 只有改版本号（= 要发版）的推送才触发，跑全量测试 + 编译 + 全量 JS 语法检查，构建 job 用 `needs: test` 挂在后面，**测试不绿不会出镜像**。平时提交代码不触发任何自动任务，别为了“等 CI”阻塞开发。要单独确认干净机器是否绿，用 `workflow_dispatch` 并把 `publish` 勾掉（只跑测试、不覆盖镜像 tag）。CI 机器上没有本机那条「禁止删除文件」的限制，直接 `python scripts/run_tests.py` 跑全量即可，不需要 `test_in_container.sh` 那套容器绕行。
 - **`AGENTS.md` / `CLAUDE.md` 是本机开发用的，不入库**（`.gitignore` 明确挡着，同 `.workbuddy/`、`.claude/`、`.worktrees/`）。因此**任何测试或代码读它们之前必须先判存在**（`test_modules_doc.test_agents_md_points_to_modules_doc` 用 `skipTest`），否则干净 clone / CI 会 `FileNotFoundError`。判断方法：写断言涉及仓库根文件前先 `git ls-files --error-unmatch <文件>` 确认它已入库；本地全绿不代表干净机器全绿，用 `git write-tree` + `git archive <tree>` 导出「只含已跟踪文件」的副本验证。
 
 ## 文档维护方式
