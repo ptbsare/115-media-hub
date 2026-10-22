@@ -9,10 +9,10 @@
 ## 基线
 
 - **更新日期**: 2026-10-22（补源整链修复 + 精准选集 + 中转残留清理 + 补源入库后整理 + 手动转存等落地，0.15.3 发版）
-- **分支**: `main`，0.15.0 已推送；0.15.1 / 0.15.2 / 0.15.3 均为本地提交，**待推送 / 待打 tag**
+- **分支**: `main`，0.15.1 / 0.15.2 / 0.15.3 均已推送；tag `v0.15.3` 已推并发布 Release，Docker 镜像 `xianer235/115-media-hub:0.15.3`（含 `latest`）由 GitHub Actions 自动构建成功
 - **版本**: `0.15.3`（2026-10-22 发布：补源精准选集 + 补源入库后整理 + 夸克中转残留清理 + 手动转存等落地 + MIT 许可证）
-- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。容器内 `app/services/subscription_cross_copy.py` 等是 `docker cp` 的热更文件，**重建镜像后才是 0.15.3 代码**
-- **最近提交**: `2ca9a79` 功能提交（补源精准选集 / 入库后整理 / 中转残留清理 / 手动转存等落地）+ 本轮 0.15.3 发版提交（2026-10-22）
+- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。本机容器仍是 `docker cp` 热更的同一份代码，**重建 / 重拉镜像后才是正式 0.15.3 镜像**
+- **最近提交**: `a11f6a0` 0.15.3 发版（2026-10-22，已推送）
 - **工作区**: 干净（本轮改动已提交，含 `LICENSE`）
 
 
