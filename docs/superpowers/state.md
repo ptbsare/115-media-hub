@@ -8,12 +8,13 @@
 
 ## 基线
 
-- **更新日期**: 2026-10-22（补源整链修复 + 精准选集 + 中转残留清理 + 补源入库后整理 + 手动转存等落地，未发版）
-- **分支**: `main`，0.15.0 已推送；0.15.1 与 0.15.2 均为本地提交，**待推送 / 待打 tag**
-- **版本**: `0.15.2`（2026-10-21 发布：暂存目录点选挂载盘 + 三层防呆 + compose 映射说明修正）
-- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。容器内 `app/services/subscription_cross_copy.py` 等是 `docker cp` 的热更文件，**重建镜像后才是 0.15.2 + 本轮全部修复**
-- **最近提交**: `34babed` 0.15.2 发版（2026-10-21）
-- **工作区**: 有未提交改动（本轮：补源整链修复 + 源网盘收窄 + 精准选集 + 中转空目录清理 + **中转残留定时清理** + **补源入库后整理** + **手动转存等落地再判完成**）。新增模块 `cross_copy_staging_cleanup.py`、`subscription_cross_copy_organize.py`；改动面 `core.py` / `db.py` / `startup.py` / `resource.py` / `cross_copy_jobs.py` / `subscription.py` / `subscription_task_runner.py` / `subscription_cross_copy.py` / `providers/quark.py` / `ui.js` / `settings.js` / 两个页面模板 / 测试 + 文档
+- **更新日期**: 2026-10-22（补源整链修复 + 精准选集 + 中转残留清理 + 补源入库后整理 + 手动转存等落地，0.15.3 发版）
+- **分支**: `main`，0.15.0 已推送；0.15.1 / 0.15.2 / 0.15.3 均为本地提交，**待推送 / 待打 tag**
+- **版本**: `0.15.3`（2026-10-22 发布：补源精准选集 + 补源入库后整理 + 夸克中转残留清理 + 手动转存等落地 + MIT 许可证）
+- **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。容器内 `app/services/subscription_cross_copy.py` 等是 `docker cp` 的热更文件，**重建镜像后才是 0.15.3 代码**
+- **最近提交**: `2ca9a79` 功能提交（补源精准选集 / 入库后整理 / 中转残留清理 / 手动转存等落地）+ 本轮 0.15.3 发版提交（2026-10-22）
+- **工作区**: 干净（本轮改动已提交，含 `LICENSE`）
+
 
 
 ## 最近一次验证
