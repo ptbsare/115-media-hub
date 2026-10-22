@@ -649,6 +649,19 @@ async def _wait_share_receive_landing(
                 "reason": last_reason,
             }
         if last_status == 3:
+            # 转存任务报失败时，目录里可能已经有部分文件落地（夸克的 status==3
+            # 常是「某个文件失败」而非整批失败）。先复核目标目录再决定，避免把
+            # 已经转存进来的文件误判成「整体失败」，用户重试后在目录里堆出重复。
+            if await _share_landing_seen_in_target(provider, cookie, target_cid, expected):
+                return {
+                    "supported": True,
+                    "confirmed": True,
+                    "skipped": False,
+                    "status": last_status,
+                    "elapsed": elapsed,
+                    "reason": last_reason,
+                    "directory_confirmed": True,
+                }
             return {
                 "supported": True,
                 "confirmed": False,

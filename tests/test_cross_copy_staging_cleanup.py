@@ -256,8 +256,17 @@ class StagingRetentionSettingTest(unittest.TestCase):
         self.assertEqual(core._clamp_cross_copy_staging_retention_days("abc"), 7)
 
     def test_clamped_to_range(self):
-        self.assertEqual(core._clamp_cross_copy_staging_retention_days(-5), 0)
         self.assertEqual(core._clamp_cross_copy_staging_retention_days(999), 365)
+
+    def test_negative_falls_back_to_default(self):
+        # 负数不是「关闭清理」（0 才是），是填错了，回落默认而不是夹成 0
+        self.assertEqual(core._clamp_cross_copy_staging_retention_days(-5), 7)
+
+    def test_non_finite_falls_back_to_default(self):
+        # inf / nan 会让 int(float(...)) 抛 OverflowError，不能搞崩整份配置读取
+        self.assertEqual(core._clamp_cross_copy_staging_retention_days("inf"), 7)
+        self.assertEqual(core._clamp_cross_copy_staging_retention_days("nan"), 7)
+        self.assertEqual(core._clamp_cross_copy_staging_retention_days(float("inf")), 7)
 
     def test_normalize_config_applies_clamp(self):
         merged = {"cross_copy_staging_retention_days": "30"}

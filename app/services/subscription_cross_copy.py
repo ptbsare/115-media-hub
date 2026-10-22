@@ -177,11 +177,14 @@ def find_processed_cross_copy_job(
     source_share_url: str,
     source_file_id: str = "",
 ) -> Optional[Dict[str, Any]]:
-    """查重：这个分享条目以前是否已经处理完（成功或被用户取消）。
+    """查重：这个分享条目以前是否已经处理完（成功 / 跳过 / 被用户取消）。
 
     只用来兜住「中转目录里已经有文件」这条分支——那种情况下不重新转存，
     但也不能无脑注册：
       - 已成功复制过 → 跳过，否则会往目标目录再塞一份；
+      - 被跳过（skipped）过 → 跳过。skipped 是确定性结论（目标已有同名文件 /
+        认不出集数），下一轮再注册只会再 skipped 一次，还把中转副本留到过期、
+        日志持续膨胀；
       - 用户手动取消过 → 跳过，尊重用户的决定；
       - 失败过（failed）→ 允许重试，订阅每轮都该有机会补上。
     """
@@ -189,7 +192,7 @@ def find_processed_cross_copy_job(
     sql = """
         SELECT * FROM cross_copy_jobs
         WHERE origin = 'subscription' AND origin_ref = ? AND source_share_url = ?
-          AND status IN ('completed', 'cancelled')
+          AND status IN ('completed', 'cancelled', 'skipped')
     """
     params: List[Any] = [str(origin_ref or ""), str(source_share_url or "")]
     wanted_file_id = str(source_file_id or "").strip()
@@ -790,9 +793,16 @@ def _select_missing_episode_files(
         else None
     )
     for item in files:
+        # 优先用带相对路径的条目名解析集数：分享里内嵌 `Season 2/` 子目录时，
+        # 裸文件名 `S01E42.mp4` 里的 "S01" 会被误当成季号，把 S02 的集判成 S01
+        # 并落进 Season 01。把 `rel_path`（含父目录）传进去，`_extract_task_episodes_
+        # from_file_entry` 会拆出父目录参与季号识别——季号不符的文件（单季任务）
+        # 会被正确丢弃，而不是污染别的季目录。
+        entry_path = str(item.get("rel_path", "") or "").strip()
+        parse_name = entry_path or str(item.get("name", "") or "")
         episodes = _extract_task_episodes_from_file_entry(
             task,
-            str(item.get("name", "") or ""),
+            parse_name,
             parent_path=parent_path,
         )
         if not episodes:

@@ -2772,7 +2772,12 @@ def _clamp_cross_copy_staging_retention_days(value: Any) -> int:
     raw = value if value not in (None, "") else DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS
     try:
         days = int(float(str(raw).strip()))
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
+        # inf / nan 这类会让 int(float(...)) 抛 OverflowError，直接回落默认；
+        # 不能让一个非法配置值把整份配置读取搞崩。
+        return DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS
+    if days < 0:
+        # 负数不是「关闭清理」（0 才是），是填错了，回落默认而不是夹成 0。
         return DEFAULT_CROSS_COPY_STAGING_RETENTION_DAYS
     return max(0, min(365, days))
 

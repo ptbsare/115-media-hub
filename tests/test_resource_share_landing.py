@@ -112,6 +112,26 @@ class ShareLandingWaitTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["confirmed"])
         self.assertIn("空间不足", result["reason"])
 
+    async def test_status3_with_landed_files_is_confirmed(self):
+        # 转存任务报失败（status==3）但目录里其实有文件落地 → 不该判整体失败，
+        # 否则用户重试会在目录里堆出重复文件
+        provider = ScriptedWaitProvider(
+            outcomes=[{"ok": False, "status": 3, "reason": "部分失败"}],
+            entries=[{"id": "f1", "name": "S01E42.mp4", "size": 1024, "is_dir": False}],
+        )
+        result = await resource_service._wait_share_receive_landing(
+            provider=provider,
+            cookie="c",
+            bundle={},
+            target_cid="target-cid",
+            expected=EXPECTED,
+            total_timeout=5,
+        )
+
+        self.assertTrue(result["confirmed"])
+        self.assertTrue(result.get("directory_confirmed"))
+        self.assertFalse(result.get("failed"))
+
     async def test_timeout_confirmed_by_directory(self):
         # 任务接口一直说还在跑，但目录里已经有文件 → 按落地成功收口
         provider = ScriptedWaitProvider(
