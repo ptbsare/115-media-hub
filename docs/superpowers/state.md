@@ -8,19 +8,20 @@
 
 ## 基线
 
-- **更新日期**: 2026-10-22（修掉 4 条 P1：补源季号错位、手动转存 status=3 不复核目录、skipped 重复注册、配置夹取边界；0.15.5 发版）
-- **分支**: `main`，0.15.1 ~ 0.15.5 均已推送；tag `v0.15.5` 已推并发布 Release，Docker 镜像 `xianer235/115-media-hub:0.15.5`（含 `latest`）由 GitHub Actions 自动构建成功
-- **版本**: `0.15.5`（2026-10-22 发布：补源季号按目录识别 + 转存失败先复核目录 + skipped 不再重复注册 + 保留天数非法值兜底）
+- **更新日期**: 2026-10-23（接上 CI 硬门：测试不绿不出镜像；忽略规则整理；0.15.6 发版）
+- **分支**: `main`，0.15.1 ~ 0.15.6 均已推送；tag `v0.15.6` 已推并发布 Release，Docker 镜像 `xianer235/115-media-hub:0.15.6`（含 `latest`）由 GitHub Actions 自动构建成功
+- **版本**: `0.15.6`（2026-10-23 发布：发版前强制跑测试 + `needs: test` 门控镜像构建 + 并发组拆测试/构建 + 手动重建通道；工程配置整理）
+- **CI**: 单一工作流 `.github/workflows/ci.yml`（`docker-release.yml` 已并入并移除）：`test` job 跑 `compileall` + 全量 `node --check` + `scripts/run_tests.py`，`build-and-push` 用 `needs: test` 挂在后面。**CI 是唯一强制门，本机 `check.sh` 只是开发期快跑**
 - **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。挂载路径与端口已改为从根目录 `.env` 读取（模板 `.env.example`），本机 `.env` 写的是原来的绝对路径
-- **最近提交**: `5ebc162` 0.15.5 发版（2026-10-22，已推送）
+- **最近提交**: 0.15.6 发版（2026-10-23，已推送）
 - **工作区**: 干净
 
 
 
 ## 最近一次验证
 
+- **0.15.6 发版前全量**（2026-10-23）：容器内 `scripts/test_in_container.sh` **1991 条零失败**（61.2s），也就是 CI 里跑的同一条命令；`node --check` 全量 33 个 JS 通过；`version.json` 变更检测用本地两段真实历史分别得到 `true` / `false`；工作流 YAML 经解析确认 `needs` / 条件 / 输出链正确。**CI 首次真实运行结果待首次推送后到 Actions 页确认**。
 - **订阅补源真机跑通（2026-10-22，`origin=subscription` 三条任务，用户中途手动取消）**：115 任务「光阴之外」（本盘已到 E41）一次跑出 3 条补源任务 `id=12/13/14`，`target_savepath=115连载中/光阴之外 (2025)/Season 01`，文件名 `S01E42/43/44.mp4`——**分享里 11 个文件只转存并注册了缺的 3 集**，说明「转存即挑缺集」生效。夸克中转目录 `/云下载/跨盘中转/光阴之外` 里正好只有这 3 个文件。取消后 `id=12/13` 保留 `resume_json`（断点可续传）、`id=14` 未开始；本机暂存留 2 个 `.part` 共 214MB。**「复制完成 + 中转副本被删」这一段仍缺一次完整真机**（用户主动中断）。附带发现 `/app/config/cross_copy_tmp` 有 3 个 10-21 的旧 `.part` 共 5.7GB（历史测试残留，与本次无关）。
-- 容器全量 **1974 项零失败**（2026-10-22 末轮，`scripts/check.sh --all --container`，73.8s）。此前那个「`chmod 0500` 目录仍可写」的假失败本轮没复现——测试容器是用宿主机 uid 跑的（`docker run -u $(id -u)`），不是 root，权限判定正常生效。
 - 补源模块单跑 `test_subscription_cross_copy` **78 条零失败**（含 `TestMissingEpisodeSelection` / `TestStagingCleanup` / `TestStageSharePrecision`）。
 - 容器内实测补源搜索（「光阴之外」，provider=quark）：修复前 275 条候选按集数排序，TOP3 是 3 条 score 44 的 TG 日报贴 + 《凡人修仙传》；修复后过滤出 55 条，TOP15 全是《光阴之外》，TOP1 为 score 98 / E44（本盘 E41，正是缺的集）。
 - 本机 8 模块 284 条零失败（`test_local_storage` / `test_settings_storage_ui` / `test_settings_layout_frontend` / `test_settings_notify_ui` / `test_modules_doc` / 复制引擎三件）。

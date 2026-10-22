@@ -2,6 +2,28 @@
 
 All notable changes to this project will be documented in this file. The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.15.6] - 2026-10-23
+
+这一版不改功能，改的是「怎么保证发出去的东西是对的」：把测试从「有空才跑」变成「流水线里必须过」，同时收拾了几处工程配置。
+
+### 发版门禁：测试不绿就不出镜像
+
+- **测试与镜像构建合并成一条流水线**（`.github/workflows/ci.yml`，替代原来的 `docker-release.yml`）：每次推送到 `main` 先跑 Python 编译检查、全量 JS 语法检查、全量单元测试；只有测试通过、并且这次推送改过 `version.json`，才会进入构建并推送镜像。以前这两件事互不相干 —— 测试写在本地的 `check.sh` 里，发版流水线里一条测试都不跑，所以「测试全红但坏镜像照样上 Docker Hub」是真实存在的路径，现在这条路径被 `needs: test` 从流程上堵死。
+- **连续推送不会打断正在跑的构建**：并发控制拆成两组 —— 测试组「只留最新一次」，旧的排队测试直接取消（省时间）；构建组「一旦开始就跑到完」，避免发版构建进行中再推一个文档提交、把镜像 tag 掐在半路。
+- **提供手动重建通道**：`workflow_dispatch` 手动触发会被当作「要发版」，用于「代码修好了但不想动版本号」的场景。否则修完 bug 再推一次（没改 `version.json`）不会自动重建镜像，容易误以为修好了而线上还是旧镜像。
+- **`version.json` 变更检测需要完整 git 历史**：`actions/checkout` 显式设 `fetch-depth: 0`，浅克隆下 `git diff` 会因缺少父提交而判定失败（表现为永远不出镜像）。
+
+### 工程配置整理
+
+- **`.dockerignore` 补齐本地目录**：`.workbuddy/`、`.worktrees/`、`.claude/`、`.playwright-cli/`、`.env.example` 之前没排除。`Dockerfile` 是选择性 COPY，镜像内容本来不受影响，但构建上下文每次都要白传这 ~700KB；现在与文件里原有的「本地 agent 上下文不进构建上下文」注释对齐。
+- **README→Word 转换脚本从 `tests/` 移到 `scripts/`**：它是一次性手动工具，不是测试用例，也不该被 `tests/*` 忽略规则藏起来。同时改掉「产物写死在脚本目录」的行为 —— 现在默认输出到系统临时目录 `$TMPDIR/115-media-hub-README.docx`，也可显式指定路径，不会再往仓库里落未跟踪文件。
+- **`.gitignore` 清掉一段空注释**（`# 忽略敏感配置…` 下面已经没有任何规则）。
+
+### 验证
+
+- 容器内全量 **1991 条零失败**（`scripts/test_in_container.sh`）。
+- `node --check` 全量 33 个 JS 文件通过；`version.json` 变更检测用真实历史分别跑出 `true` / `false`；工作流 YAML 结构经解析校验（`needs`、条件、job 级并发组、输出传递）。
+
 ## [0.15.5] - 2026-10-22
 
 这一版继续修 0.15.4 代码审查里记录的四条 P1，都落在补源/转存/配置的边界情况上，不会影响正常链路。
