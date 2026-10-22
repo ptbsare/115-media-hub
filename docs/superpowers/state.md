@@ -14,7 +14,7 @@
 - **CI**: 单一工作流 `.github/workflows/ci.yml`（`docker-release.yml` 已并入并移除）：`test` job 跑 `compileall` + 全量 `node --check` + `scripts/run_tests.py`，`build-and-push` 用 `needs: test` 挂在后面。**CI 是唯一强制门，本机 `check.sh` 只是开发期快跑**。已真实运行：红（`5d35d24` → 构建 `skipped`）→ 绿（`b3d670a`，构建 `skipped` 因未改版本号）→ 手动触发出镜像成功
 - **本地不入库文件**: `AGENTS.md` / `CLAUDE.md` / `.workbuddy/` / `.claude/` / `.worktrees/` 是本机开发用，**按约定不入库**。任何测试/代码读它们前必须判存在（`test_modules_doc` 已这么做），否则干净 clone 跑测试必挂。
 - **运行环境**: `docker compose` 服务名 `115-media-hub-test`（应用本体），端口 18080；`/app/storage` 已映射到宿主机 `/Users/xianer/Documents/docker/115strmxianer/storage`（virtiofs，空间读数正常）。挂载路径与端口已改为从根目录 `.env` 读取（模板 `.env.example`），本机 `.env` 写的是原来的绝对路径
-- **最近提交**: `b3d670a` 修复 AGENTS.md/CLAUDE.md 入库（2026-10-23，已推送）
+- **最近提交**: `d06e51c` 修正 AGENTS.md 保持本地不入库（2026-10-23，已推送）
 - **工作区**: 干净
 
 
