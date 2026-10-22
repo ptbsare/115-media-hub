@@ -30,3 +30,8 @@ docs/
 
 # tracked export template, excluded from image build context
 tg-resource.json
+
+# 本机部署配置与默认数据目录（有路径信息，不该进镜像）
+.env
+.env.local
+data/
