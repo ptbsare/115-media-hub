@@ -873,6 +873,42 @@ class TestResumePipeline(CrossCloudCopyTestBase):
             sorted(item["downloaded_bytes"] for item in snapshots),
         )
 
+    def test_resume_non_aligned_offset_rewinds_to_segment_boundary(self):
+        """历史坏断点（段中间位置）自动回退到段边界，不再判死。
+
+        真实故障：downloaded_bytes=3828076306（16MB 的 228.17 段）+ sha1 为空，
+        引擎直接抛「续传起始偏移未按分段边界对齐」。这种状态必须向下回退到
+        floor 边界照常续完，并把状态改写成合法值——连续前缀包含对齐后的全部
+        字节，重下不足一段是安全代价。
+        """
+        aligned = 8 * self.SEGMENT
+        stale = aligned + 1234  # 落在第 8 段中间
+        temp_path = self._write_temp_file("xcopy-misaligned.part", self.data[:stale])
+        resume = self._resume_state(temp_path, downloaded=stale)
+        seen = {}
+        real_download = xcc._download_to_sink
+
+        def spy(**kwargs):
+            seen.update(kwargs)
+            return real_download(**kwargs)
+
+        with patch.object(xcc, "_download_to_sink", side_effect=spy):
+            result = self._copy_resume(resume)
+        self.assertEqual(seen["start_offset"], aligned)  # 回退到段边界
+        self.assertEqual(resume["downloaded_bytes"], len(self.data))  # 已完成 → 全量
+        self.assertEqual(result.status, "uploaded")
+        self.assertEqual(result.sha1, hashlib.sha1(self.data).hexdigest().upper())
+        self.assertEqual(self.target.upload_calls[0]["data"], self.data)
+
+    def test_note_downloaded_snaps_to_segment_boundary(self):
+        """断点只记分段栅格值：末段/文件尾位置不能被原样写进 downloaded_bytes。"""
+        state = {"downloaded_bytes": 0}
+        tracker = xcc._ResumeTracker(state, None)
+        tracker.note_downloaded(3 * self.SEGMENT + 777)
+        self.assertEqual(state["downloaded_bytes"], 3 * self.SEGMENT)
+        tracker.note_downloaded(2 * self.SEGMENT)
+        self.assertEqual(state["downloaded_bytes"], 2 * self.SEGMENT)
+
     # ---- 分支三：resume 无效 → 按 None 处理 ----
 
     def test_resume_invalid_fields_treated_as_none(self):

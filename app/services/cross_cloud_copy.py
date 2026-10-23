@@ -1377,10 +1377,19 @@ class _ResumeTracker:
             logger.info("cross-cloud resume update callback failed (ignored): %s", exc)
 
     def note_downloaded(self, downloaded_bytes: int) -> None:
-        """下载进度更新（连续前缀字节数，节流）。"""
+        """下载进度更新（连续前缀字节数，节流）。
+
+        入参按分段栅格向下对齐后再记：并行路径的末段、200 降级路径上报的是
+        「文件末尾」，文件大小不是段整数倍时该值天然不对齐；把它当续传起点
+        存下去，下次续传就会被引擎的栅格校验拦死（「续传起始偏移未按分段
+        边界对齐」）。对齐只少记不足一段，属于安全方向。
+        """
         if self._resume is None:
             return
-        self._resume["downloaded_bytes"] = int(downloaded_bytes)
+        value = int(downloaded_bytes)
+        if value > 0 and value % DOWNLOAD_SEGMENT_BYTES:
+            value = (value // DOWNLOAD_SEGMENT_BYTES) * DOWNLOAD_SEGMENT_BYTES
+        self._resume["downloaded_bytes"] = value
         now = time.monotonic()
         if now - self._last_fire < self._MIN_INTERVAL_SECONDS:
             return
@@ -1574,6 +1583,23 @@ def copy_file_across_clouds(
         resume_sha1 = _normalize_sha1(resume_state.get("sha1", ""))
         resume_md5 = str(resume_state.get("md5", "") or "").strip().lower()
         resume_downloaded = _safe_int(resume_state.get("downloaded_bytes"), 0)
+        # 续传起点必须落在下载分段栅格上，否则 _download_to_sink 会拒绝（从段
+        # 中间接下去写出的文件是错位的）。历史状态里出现非栅格值的原因：末段
+        # 完成 / 200 降级路径上报的是「文件末尾」，落库时没跟哈希一起写成功就
+        # 留下「位置是文件尾、哈希为空」的半套状态。这里向下取整到段边界——
+        # 连续前缀 [0, downloaded) 必然包含 [0, 对齐后)，所以永远安全，最坏
+        # 只多重下不足一段；同时对就地把状态修正成合法值，避免反复失败。
+        if resume_downloaded > 0 and resume_downloaded % DOWNLOAD_SEGMENT_BYTES:
+            aligned_offset = (
+                resume_downloaded // DOWNLOAD_SEGMENT_BYTES
+            ) * DOWNLOAD_SEGMENT_BYTES
+            logger.info(
+                "cross-cloud resume offset %s not segment-aligned, rewinding to %s",
+                resume_downloaded,
+                aligned_offset,
+            )
+            resume_downloaded = aligned_offset
+            resume_state["downloaded_bytes"] = aligned_offset
         valid = (
             bool(resume_temp_path)
             and resume_size > 0
