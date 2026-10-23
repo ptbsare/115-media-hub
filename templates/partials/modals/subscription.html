@@ -134,31 +134,12 @@
                     <div id="subscription-cross-copy-block" class="rounded-2xl border border-slate-700 bg-slate-900/60 p-4 space-y-3">
                         <div>
                             <div class="text-sm font-bold">跨盘补源</div>
-                            <div class="text-[11px] text-slate-500 leading-5 mt-1">自家网盘命中就不复制；只有没命中或更差时，才从源网盘复制（比同盘转存慢，但更新更快）。复制完成后照常走监控刷新与刮削。</div>
+                            <div class="text-[11px] text-slate-500 leading-5 mt-1">自家网盘搜到新资源时走网盘转存（最快，不耗本地带宽）；只有自家网盘没有新资源时，才从夸克网盘搜索并复制到本盘（需要先下载再上传，比转存慢）。<strong class="text-slate-300">补源文件与订阅导入落在同一目录</strong>：电影进“保存目录/影片名”子文件夹，电视剧进“保存目录/Season NN”子目录。复制完成后照常走监控刷新与刮削。</div>
                         </div>
-                        <div class="grid grid-cols-1 sm:grid-cols-3 gap-2" role="radiogroup" aria-label="跨盘补源模式">
-                            <label class="flex items-start gap-2 rounded-xl border border-slate-700 bg-slate-950/40 p-3 cursor-pointer">
-                                <input type="radio" name="subscription_cross_copy_mode" value="off" class="mt-0.5" onchange="syncSubscriptionCrossCopyUI()">
-                                <span>
-                                    <span class="block text-sm font-bold">关闭</span>
-                                    <span class="block text-[11px] text-slate-500 leading-5">只用自家网盘候选</span>
-                                </span>
-                            </label>
-                            <label class="flex items-start gap-2 rounded-xl border border-slate-700 bg-slate-950/40 p-3 cursor-pointer">
-                                <input type="radio" name="subscription_cross_copy_mode" value="fallback" class="mt-0.5" onchange="syncSubscriptionCrossCopyUI()">
-                                <span>
-                                    <span class="block text-sm font-bold">兜底（推荐）</span>
-                                    <span class="block text-[11px] text-slate-500 leading-5">自家没命中才跨盘复制</span>
-                                </span>
-                            </label>
-                            <label class="flex items-start gap-2 rounded-xl border border-slate-700 bg-slate-950/40 p-3 cursor-pointer">
-                                <input type="radio" name="subscription_cross_copy_mode" value="prefer" class="mt-0.5" onchange="syncSubscriptionCrossCopyUI()">
-                                <span>
-                                    <span class="block text-sm font-bold">优先跨盘</span>
-                                    <span class="block text-[11px] text-slate-500 leading-5">更新最快，但每次命中都要复制一遍</span>
-                                </span>
-                            </label>
-                        </div>
+                        <label class="flex items-center gap-3 cursor-pointer text-sm">
+                            <input type="checkbox" id="subscription-cross-copy-enabled" class="ui-checkbox" onchange="syncSubscriptionCrossCopyUI()">
+                            <span>启用跨盘补源（本盘没有新资源时，从夸克网盘复制）</span>
+                        </label>
                         <div>
                             <div class="text-xs text-slate-500">源网盘（当前仅支持夸克）</div>
                             <div id="subscription-cross-copy-sources" class="flex flex-wrap gap-2 mt-2"></div>

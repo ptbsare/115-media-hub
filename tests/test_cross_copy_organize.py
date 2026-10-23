@@ -82,8 +82,14 @@ class OrganizeTestBase(unittest.TestCase):
             "cross_copy_delete_source_after": False,
             "provider_enabled": {"115": True, "quark": True},
         }
+        # 后台提交必须桩掉：retry 之类会真的把「跑任务」的协程丢到后台 loop 上，
+        # 那条协程活得比用例长，等下一个用例换掉 db.DB_PATH 后它才写状态，
+        # 于是把新库里同号（都从 1 开始）的任务改成 running —— 表现为随机失败。
+        self._bg_patcher = mock.patch.object(ccj, "submit_background", mock.MagicMock())
+        self._bg_patcher.start()
 
     def tearDown(self):
+        self._bg_patcher.stop()
         db.DB_PATH = self.original_db_path
         db._DB_ENSURED = self.original_db_ensured
         shutil.rmtree(self.tmp, ignore_errors=True)
@@ -155,8 +161,8 @@ class OrganizeMarkingTest(OrganizeTestBase):
         self._run_job(job_id, FakeCopyResult(status="skipped", message="目标已存在同文件"))
 
         row = self._row(job_id)
-        self.assertEqual(row["status"], "skipped")
-        self.assertEqual(row["organize_state"], "")
+        self.assertEqual(row["status"], "skipped", row)
+        self.assertEqual(row["organize_state"], "", row)
 
     def test_retry_clears_marking(self):
         job_id = self._job()

@@ -97,8 +97,9 @@ class CrossCopyFrontendTest(unittest.TestCase):
             "subscription-cross-copy-hint",
         ):
             self.assertIn(f'id="{element_id}"', subscription_modal)
-        for mode in ("off", "fallback", "prefer"):
-            self.assertIn(f'value="{mode}"', subscription_modal)
+        # 2026-10-23 起补源是单开关（开 = fallback），不再是 off/fallback/prefer 三选一
+        self.assertIn('id="subscription-cross-copy-enabled"', subscription_modal)
+        self.assertNotIn('name="subscription_cross_copy_mode"', subscription_modal)
         self.assertIn("cross_copy_mode: getSubscriptionCrossCopyMode()", subscription_ui)
         self.assertIn("cross_copy_sources: getSelectedSubscriptionCrossCopySources()", subscription_ui)
         self.assertIn("目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘", subscription_ui)

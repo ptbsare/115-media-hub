@@ -623,17 +623,26 @@
             return `${dateText} ${hours}:${minutes}`;
         }
 
-        function buildSubscriptionLastHitBadge(task) {
+        function buildSubscriptionLastHitBadge(task, taskName = '') {
             const payload = task && typeof task === 'object' ? task : {};
             const matchedTitle = String(payload.matched_resource_title || '').trim();
             const timestamp = String(payload.last_success_at || '').trim();
             const dateText = formatSubscriptionLastHitDateTime(timestamp);
             const hasDate = !!dateText;
-            const label = hasDate
+            // 「资源库里已经保存到第几集」和卡片里的「追更进度」取同一个值，避免两处说法不一致
+            const isTv = normalizeSubscriptionMediaType(payload.media_type || 'movie') === 'tv';
+            const episodeNo = isTv
+                ? resolveSubscriptionTaskEpisodeProgress(payload, taskName || payload.name).episode
+                : 0;
+            const episodeLabel = episodeNo > 0 ? `已到 E${episodeNo}` : '';
+            const baseLabel = hasDate
                 ? `最近命中 · ${formatSubscriptionLastHitAge(timestamp)}`
                 : (matchedTitle ? '命中日期未知' : '尚未命中');
+            const label = episodeLabel ? `${baseLabel} · ${episodeLabel}` : baseLabel;
             const className = `subscription-last-hit-badge${hasDate ? '' : ' subscription-last-hit-badge-empty'}`;
-            const title = hasDate ? `最近命中：${dateText}` : label;
+            const titleParts = [hasDate ? `最近命中：${dateText}` : baseLabel];
+            if (episodeLabel) titleParts.push(`资源库里已保存到 E${episodeNo}`);
+            const title = titleParts.join('；');
             return `<span class="${className}" title="${escapeHtml(title)}">${escapeHtml(label)}</span>`;
         }
 
@@ -1482,20 +1491,20 @@
         let subscriptionCrossCopySourcesPromise = null;
         let subscriptionCrossCopyPendingSources = [];
 
+        // 2026-10-23 起补源只剩「开 / 关」两态：开 = fallback（本盘没有新资源才跨盘复制）。
+        // 「优先跨盘」（prefer）已删除：同盘有资源时转存是服务端秒传，跨盘要下载再上传，
+        // 命中也复制纯属浪费，还会和同盘导入重复下载同一批集。历史 prefer 值按 fallback 接管。
         function getSubscriptionCrossCopyMode() {
-            const checked = document.querySelector('input[name="subscription_cross_copy_mode"]:checked');
-            const value = String(checked?.value || 'off').trim().toLowerCase();
-            return ['off', 'fallback', 'prefer'].includes(value) ? value : 'off';
+            const enabled = !!document.getElementById('subscription-cross-copy-enabled')?.checked;
+            return enabled ? 'fallback' : 'off';
         }
 
         function setSubscriptionCrossCopyMode(mode = 'off') {
-            const normalized = ['off', 'fallback', 'prefer'].includes(String(mode || '').trim().toLowerCase())
-                ? String(mode || '').trim().toLowerCase()
+            const normalized = ['fallback', 'prefer', 'priority', 'preferred', 'on', 'true'].includes(String(mode || '').trim().toLowerCase())
+                ? 'fallback'
                 : 'off';
-            const inputs = document.querySelectorAll('input[name="subscription_cross_copy_mode"]');
-            inputs.forEach(input => {
-                input.checked = String(input.value) === normalized;
-            });
+            const input = document.getElementById('subscription-cross-copy-enabled');
+            if (input) input.checked = normalized === 'fallback';
         }
 
         function getSelectedSubscriptionCrossCopySources() {
@@ -1806,7 +1815,7 @@
                 .filter(item => item && item !== task.provider)
                 .filter(item => SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(item));
             if (crossCopyMode !== 'off' && !crossCopySources.length) {
-                return showToast('目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘，或把补源模式改为「关闭」', { tone: 'warn', duration: 3400, placement: 'top-center' });
+                return showToast('目前跨盘补源只支持夸克网盘，请勾选夸克作为源网盘，或关闭跨盘补源', { tone: 'warn', duration: 3400, placement: 'top-center' });
             }
             task.cross_copy_mode = crossCopyMode === 'off' ? 'off' : crossCopyMode;
             task.cross_copy_sources = task.cross_copy_mode === 'off' ? [] : crossCopySources;
@@ -2402,14 +2411,14 @@
                 const strictBadgeHtml = task?.strict_title_match
                     ? '<span class="subscription-strict-match-badge">精准</span>'
                     : '';
-                const lastHitBadgeHtml = buildSubscriptionLastHitBadge(task);
+                const lastHitBadgeHtml = buildSubscriptionLastHitBadge(task, taskName);
                 const crossCopyMode = String(task?.cross_copy_mode || 'off').trim().toLowerCase();
                 const crossCopySourceNames = Array.isArray(task?.cross_copy_sources)
                     ? task.cross_copy_sources.map(name => String(name || '').trim())
                         .filter(name => name && SUBSCRIPTION_CROSS_COPY_SUPPORTED_SOURCES.includes(name))
                     : [];
                 const crossCopyBadgeHtml = crossCopyMode !== 'off' && crossCopySourceNames.length
-                    ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-400/25" title="${escapeHtml(crossCopyMode === 'prefer' ? '优先跨盘：每次命中都从源网盘复制' : '兜底：自家网盘没命中才跨盘复制')}">补源：${escapeHtml(crossCopySourceNames.map(name => getSubscriptionProviderLabel(name)).join('、'))}</span>`
+                    ? `<span class="text-[10px] px-2 py-0.5 rounded-full bg-cyan-500/15 text-cyan-200 border border-cyan-400/25" title="${escapeHtml('兜底：自家网盘没有新资源时才跨盘复制')}">补源：${escapeHtml(crossCopySourceNames.map(name => getSubscriptionProviderLabel(name)).join('、'))}</span>`
                     : '';
                 const running = subscriptionState.running && subscriptionState.current_task === taskName;
                 const queued = (subscriptionState.queued || []).includes(taskName);
@@ -2589,13 +2598,23 @@
             };
         }
 
+        function resolveSubscriptionTaskEpisodeProgress(task, taskName) {
+            const savedEpisode = resolveSubscriptionTaskSavedEpisode(taskName, task);
+            const stateEpisode = Math.max(0, parseInt(task?.last_episode || '0', 10) || 0);
+            // 目录扫描值（stats）和推进记录（last_episode）都是只增不减的「已保存到第几集」，
+            // 取大者：增量轮询只带 last_episode，若只信旧的 stats，补源落地后界面会停在旧集数。
+            const episode = savedEpisode.confirmed
+                ? Math.max(savedEpisode.episode, stateEpisode)
+                : stateEpisode;
+            return { episode, confirmed: savedEpisode.confirmed };
+        }
+
         function buildSubscriptionTaskEpisodeText(task, taskName, { introExpanded = false } = {}) {
             const totalEpisodes = Math.max(0, parseInt(task?.total_episodes || '0', 10) || 0);
-            const stateEpisode = Math.max(0, parseInt(task?.last_episode || '0', 10) || 0);
-            const savedEpisode = resolveSubscriptionTaskSavedEpisode(taskName, task);
-            const progressEpisode = savedEpisode.confirmed ? savedEpisode.episode : stateEpisode;
+            const progress = resolveSubscriptionTaskEpisodeProgress(task, taskName);
+            const progressEpisode = progress.episode;
             let suffix = '';
-            if (savedEpisode.confirmed) suffix = '（按保存文件确认）';
+            if (progress.confirmed) suffix = '（按保存文件确认）';
             else if (introExpanded && subscriptionIntroEpisodeLookupLoading[taskName]) suffix = '（正在按保存文件核对）';
             return `追更进度：E${progressEpisode}${totalEpisodes > 0 ? ` / E${totalEpisodes}` : ''}${suffix}`;
         }

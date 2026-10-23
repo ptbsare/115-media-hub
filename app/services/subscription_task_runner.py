@@ -418,8 +418,8 @@ async def _subscription_cross_copy_dispatch(
     ``off`` 或没有已接通的源时一次搜索都不发；未接通的源写 warn 说明已跳过，
     否则界面勾着却毫无动静，用户无从判断。
 
-    **必须在「目标目录已校准」之后调用**：fallback 的缺集判定要拿目标目录里
-    实际已有的最高集去比候选集数，用任务进度里的旧值会恒判「不缺」而永不补源。
+    **必须在「目标目录已校准」之后调用**：缺集判定要拿目标目录里实际已有的
+    最高集去比候选集数，用任务进度里的旧值会恒判「不缺」而永不补源。
     无候选场景例外——本盘一条候选都没有时必然缺，判定不依赖 last_episode。
 
     :param existing_episodes: 目标目录实际落盘的集集合。传了就按集合精确判缺
@@ -443,11 +443,9 @@ async def _subscription_cross_copy_dispatch(
             "warn",
         )
         return
-    # 只在「本盘缺」时补源：prefer 命中即补，fallback 本盘缺才补
-    if cross_copy_mode == "prefer":
-        should_cross_copy = True
-    else:  # fallback
-        should_cross_copy = _subscription_cross_copy_needed(task, ranked_candidates, last_episode)
+    # 本盘缺才补源：同盘有资源时走转存（服务端秒传）更快，跨盘要下载再上传，
+    # 命中也复制纯属浪费（2026-10-23 删 prefer 档后这里是唯一口径）。
+    should_cross_copy = _subscription_cross_copy_needed(task, ranked_candidates, last_episode)
     if not should_cross_copy:
         return
 
@@ -474,15 +472,13 @@ async def _subscription_cross_copy_dispatch(
     )
     if not cross_copy_candidates:
         await write_subscription_log(
-            f"跨盘补源：本盘{'缺最新资源' if cross_copy_mode == 'fallback' else '优先跨盘'}，"
-            "但夸克也未找到可补候选",
+            "跨盘补源：本盘缺最新资源，但夸克也未找到可补候选",
             "info",
         )
         return
 
     await write_subscription_log(
-        f"跨盘补源：本盘{'缺最新资源' if cross_copy_mode == 'fallback' else '优先跨盘'}，"
-        f"从夸克找到 {len(cross_copy_candidates)} 条候选，尝试注册补源",
+        f"跨盘补源：本盘缺最新资源，从夸克找到 {len(cross_copy_candidates)} 条候选，尝试注册补源",
         "info",
     )
     try:

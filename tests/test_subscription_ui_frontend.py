@@ -14,6 +14,14 @@ SUBSCRIPTION_MODAL_TEMPLATE_PATH = ROOT / "templates/partials/modals/subscriptio
 
 def run_subscription_ui(expression, provider_meta=None):
     provider_meta = provider_meta or []
+    # ui.js 用到的几个状态变量声明在 index.js 里（浏览器中同一全局词法作用域），
+    # 单独加载 ui.js 时得先补上，否则引用到缓存的函数会 ReferenceError。
+    prelude = (
+        "let subscriptionEpisodeViewCache = {};\n"
+        "const SUBSCRIPTION_EPISODE_CACHE_TTL_MS = 180000;\n"
+        "let subscriptionIntroEpisodeLookupLoading = {};\n"
+        "let subscriptionIntroEpisodeLookupFailedAt = {};\n"
+    )
     script = f"""
 const fs = require('fs');
 const vm = require('vm');
@@ -22,6 +30,7 @@ const context = {{
   escapeHtml: value => String(value ?? ''),
 }};
 vm.createContext(context);
+vm.runInContext({json.dumps(prelude)}, context);
 vm.runInContext(fs.readFileSync({json.dumps(str(LINK_TAGS_PATH))}, 'utf8'), context);
 vm.runInContext(fs.readFileSync({json.dumps(str(UI_PATH))}, 'utf8'), context);
 const result = vm.runInContext({json.dumps(expression)}, context);
@@ -204,6 +213,51 @@ class SubscriptionUiFrontendTest(unittest.TestCase):
         self.assertIn("最近命中", result["badge"])
         self.assertIn("仙逆", result["detail"])
         self.assertIn("2026-08-02 04:34", result["detail"])
+
+    def test_subscription_last_hit_badge_shows_saved_episode(self):
+        task = {
+            "name": "仙逆",
+            "media_type": "tv",
+            "last_success_at": "2026-08-02T04:34:25",
+            "last_episode": 42,
+        }
+        html = run_subscription_ui(
+            f"buildSubscriptionLastHitBadge({json.dumps(task, ensure_ascii=False)})"
+        )
+        self.assertIn("最近命中", html)
+        self.assertIn("已到 E42", html)
+        self.assertIn("资源库里已保存到 E42", html)
+
+    def test_subscription_last_hit_badge_prefers_higher_scanned_episode(self):
+        task = {
+            "name": "仙逆",
+            "media_type": "tv",
+            "last_success_at": "2026-08-02T04:34:25",
+            "last_episode": 42,
+            "stats": {"existing_episode_max": 43},
+        }
+        html = run_subscription_ui(
+            f"buildSubscriptionLastHitBadge({json.dumps(task, ensure_ascii=False)})"
+        )
+        self.assertIn("已到 E43", html)
+
+    def test_subscription_last_hit_badge_keeps_movie_clean(self):
+        task = {
+            "name": "流浪地球",
+            "media_type": "movie",
+            "last_success_at": "2026-08-02T04:34:25",
+            "last_episode": 0,
+        }
+        html = run_subscription_ui(
+            f"buildSubscriptionLastHitBadge({json.dumps(task, ensure_ascii=False)})"
+        )
+        self.assertIn("最近命中", html)
+        self.assertNotIn("已到", html)
+
+    def test_subscription_last_hit_badge_without_episode_unchanged(self):
+        html = run_subscription_ui("buildSubscriptionLastHitBadge({ media_type: 'tv' })")
+        self.assertIn("尚未命中", html)
+        self.assertNotIn("已到", html)
 
 
 if __name__ == "__main__":

@@ -41,13 +41,16 @@ class SettingsNotifySectionFrontendTest(unittest.TestCase):
 
     def test_cross_copy_switches_labelled_by_origin(self):
         body = self._notify_body()
-        self.assertIn("订阅补源的跨盘复制推送", body)
-        self.assertIn("手动跨盘复制推送", body)
+        self.assertIn("启用订阅补源通知", body)
+        self.assertIn("启用手动跨盘复制通知", body)
+        # 合并后要让人知道两者的关系，否则「成功通知去哪了」说不清
+        self.assertIn("只发一条汇总", body)
 
     def test_help_fold_mentions_cross_copy(self):
         body = self._notify_body()
-        self.assertIn("跨盘复制结果", body)
-        self.assertIn("订阅补源/手动复制各一个开关", body)
+        self.assertIn("跨盘补源", body)
+        self.assertIn("手动跨盘复制结果", body)
+        self.assertIn("补源失败始终单独提醒", body)
 
     def test_summary_counts_four_switches(self):
         for switch_id in NOTIFY_SWITCH_IDS:

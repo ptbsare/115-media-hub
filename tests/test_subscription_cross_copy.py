@@ -616,9 +616,24 @@ class TestConfigNormalization(unittest.TestCase):
     def test_mode_values(self):
         self.assertEqual(core.normalize_subscription_cross_copy_mode("off"), "off")
         self.assertEqual(core.normalize_subscription_cross_copy_mode("fallback"), "fallback")
-        self.assertEqual(core.normalize_subscription_cross_copy_mode("prefer"), "prefer")
         self.assertEqual(core.normalize_subscription_cross_copy_mode(""), "off")
         self.assertEqual(core.normalize_subscription_cross_copy_mode("junk"), "off")
+
+    def test_legacy_prefer_mode_falls_back(self):
+        """2026-10-23 删 prefer 档：历史值必须按 fallback 接管，不能静默变成 off。"""
+        for legacy in ("prefer", "priority", "preferred", "PREFER"):
+            self.assertEqual(core.normalize_subscription_cross_copy_mode(legacy), "fallback")
+        self.assertNotIn("prefer", core.SUBSCRIPTION_CROSS_COPY_MODES)
+        task = core.normalize_subscription_task(
+            {
+                "name": "x",
+                "provider": "115",
+                "cross_copy_mode": "prefer",
+                "cross_copy_sources": ["quark"],
+            }
+        )
+        self.assertEqual(task["cross_copy_mode"], "fallback")
+        self.assertEqual(task["cross_copy_sources"], ["quark"])
 
     def test_sources_normalization(self):
         self.assertEqual(core.normalize_subscription_cross_copy_sources(["quark"]), ["quark"])

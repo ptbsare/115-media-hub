@@ -512,6 +512,9 @@ def retry_cross_copy_job(job_id: int) -> Dict[str, Any]:
         # 重试会按原名重新上传，之前那次整理的结果作废，成功后重新标记
         organize_state="",
         organize_detail="",
+        # 进度回写同理：上次的回写结果作废，这次成功后重新算一遍
+        progress_state="",
+        progress_detail="",
     )
     submit_cross_copy_job(job_id)
     return {"ok": True, "msg": "已重新入队"}
@@ -908,6 +911,13 @@ async def run_cross_copy_job(job_id: int) -> None:
             and final_status == STATUS_COMPLETED
         ):
             finalize_fields["organize_state"] = "pending"
+        # 补源是旁路：订阅主流程注册完任务就结束了，复制跑完没人回写
+        # subscription_task_state，界面上的「最近命中 / 追更进度」会一直停在上一次
+        # 同盘导入的旧值。这里只打一个「待回写」标记，真正的写回交给
+        # subscription_cross_copy_progress 的定时器成组做（一轮常补 3~5 集，
+        # 逐条写会互相覆盖，也会把「这一轮补了哪些集」写散）。
+        if job_origin == "subscription" and final_status == STATUS_COMPLETED:
+            finalize_fields["progress_state"] = "pending"
         update_cross_copy_job(
             job_id,
             status=final_status,
@@ -1031,6 +1041,10 @@ def _finish_folder_job(job_id: int, job: Dict[str, Any], cfg: Dict[str, Any], re
         _fail_job(job_id, message or "整个文件夹都没复制成功")
         return
 
+    finalize_fields: Dict[str, Any] = {}
+    # 整包补源也要回写「最近命中」——只是文件名解析不出集数，进度那一项不动。
+    if str(job.get("origin", "") or "").strip().lower() == "subscription":
+        finalize_fields["progress_state"] = "pending"
     update_cross_copy_job(
         job_id,
         status=STATUS_COMPLETED,
@@ -1039,6 +1053,7 @@ def _finish_folder_job(job_id: int, job: Dict[str, Any], cfg: Dict[str, Any], re
         phase="done",
         error_message="",
         finished_at=now_text(),
+        **finalize_fields,
     )
     _clear_job_progress(job_id)
     _push_cross_copy_notification(cfg, job, ok=True, message=message)
@@ -1086,13 +1101,36 @@ def _cross_copy_notify_enabled(cfg: Dict[str, Any], job: Dict[str, Any]) -> bool
     return bool(cfg.get(key, True))
 
 
+def subscription_cross_copy_notify_merged(cfg: Dict[str, Any]) -> bool:
+    """订阅补源的成功通知是否并入「订阅更新成功」那一条。
+
+    两个开关都开着才合并：订阅成功推送负责这条消息的内容，补源开关负责
+    「要不要收补源相关消息」。只开订阅推送、关掉补源时什么都不发（用户就是
+    不想收补源消息）；只开补源时退回逐条「跨盘复制完成」，不至于把消息吞掉。
+    """
+    return bool(cfg.get("notify_push_enabled", False)) and bool(
+        cfg.get("cross_copy_notify_subscription", True)
+    )
+
+
 def _push_cross_copy_notification(cfg: Dict[str, Any], job: Dict[str, Any], *, ok: bool, message: str) -> None:
     """跨盘复制完成/失败通知。
 
     开关按任务来源区分（订阅补源 / 手动复制），渠道是否可用只看通知渠道
     配置，不依赖其他场景的开关。
+
+    订阅补源**成功**时不在这里发：补 5 集就是 5 条长得一样的消息（正文的
+    「文件」取的是片名，不是集名），用户看不出补了哪几集。改由
+    ``subscription_cross_copy_progress`` 成组回写时发一条「订阅更新成功」。
+    失败仍然逐条发——得知道是哪一集挂了。
     """
     if not _cross_copy_notify_enabled(cfg, job):
+        return
+    if (
+        ok
+        and str(job.get("origin", "") or "").strip().lower() == "subscription"
+        and subscription_cross_copy_notify_merged(cfg)
+    ):
         return
     if not notify_channel_ready(cfg):
         return

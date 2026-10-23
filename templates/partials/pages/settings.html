@@ -294,6 +294,20 @@
                             </div>
                         </div>
 
+                        <div class="settings-storage-card">
+                            <div class="settings-storage-card-head">
+                                <div class="settings-storage-card-title">临时文件清理策略</div>
+                            </div>
+                            <div class="settings-storage-hint">
+                                跨盘复制下载到本目录的文件，按以下规则清理，不需要手动干预：
+                            </div>
+                            <div class="space-y-2">
+                                <div class="text-[11px] text-slate-500 leading-5">复制完成或失败后，本次下载的临时文件<strong class="text-slate-300">立即删除</strong>。</div>
+                                <div class="text-[11px] text-slate-500 leading-5">容器被强行停止等异常中断留下的残留：启动时扫一遍，之后每 30 分钟再扫一遍，超过 24 小时没有更新的自动删除。</div>
+                                <div class="text-[11px] text-slate-500 leading-5">取消或失败的任务会保留已下载的部分以便续传（重试接着下，不重复下载）；确定不需要了，到「任务中心」删掉该任务记录，临时文件会一起清掉。</div>
+                            </div>
+                        </div>
+
                         <div id="settings-storage-form-card" class="settings-storage-card" hidden>
                             <div class="settings-storage-card-title">更换暂存目录</div>
                             <div class="settings-storage-hint">
@@ -687,7 +701,7 @@
                     <div id="settings-body-notify" class="space-y-4 settings-section-body" hidden>
                         <label class="flex items-center gap-3 cursor-pointer text-sm">
                             <input type="checkbox" id="notify_push_enabled" class="ui-checkbox">
-                            启用订阅更新成功推送（仅推送成功）
+                            启用订阅更新成功推送（同盘导入 / 跨盘补源，仅推送成功）
                         </label>
                         <label class="flex items-center gap-3 cursor-pointer text-sm">
                             <input type="checkbox" id="notify_monitor_enabled" class="ui-checkbox">
@@ -695,14 +709,14 @@
                         </label>
                         <label class="flex items-center gap-3 cursor-pointer text-sm">
                             <input type="checkbox" id="cross_copy_notify_subscription" class="ui-checkbox">
-                            启用订阅补源的跨盘复制推送（成功/失败）
+                            启用订阅补源通知（补源成功与失败）
                         </label>
                         <label class="flex items-center gap-3 cursor-pointer text-sm">
                             <input type="checkbox" id="cross_copy_notify_manual" class="ui-checkbox">
-                            启用手动跨盘复制推送（成功/失败）
+                            启用手动跨盘复制通知（成功/失败）
                         </label>
                         <div class="text-[11px] text-slate-500 leading-5">
-                            跨盘复制指从其他网盘复制文件到本网盘（如夸克 → 115）。按发起方式分两种：订阅补源是订阅任务自动发起的，手动复制是你在页面上自己点发起的，两种通知分开开关。
+                            跨盘复制指从其他网盘复制文件到本网盘（如夸克 → 115）。补源补进来的几集算订阅更新：上面「订阅更新成功推送」和「订阅补源通知」都开着时，只发一条汇总，不再一个文件一条；只开「订阅补源通知」时按文件逐条推送。手动复制是你自己在页面上点发起的，单独开关。
                         </div>
                         <label class="block">
                             <span class="text-xs text-slate-500">通知渠道</span>
@@ -745,7 +759,8 @@
                         <details class="settings-help-fold">
                             <summary>查看说明：推送范围与去重规则</summary>
                             <div class="settings-help-fold-body">
-                                推送范围：订阅成功入库、文件夹监控成功生成 `.strm`、跨盘复制结果（订阅补源/手动复制各一个开关，成功与失败都推）——均可独立开关。
+                                推送范围：订阅成功入库（同盘导入、跨盘补源）、文件夹监控成功生成 `.strm`、手动跨盘复制结果——均可独立开关。
+                                <br>补源补进来的几集算订阅更新：「订阅更新成功推送」和「订阅补源通知」都开着时只发一条汇总，不再一个文件一条；只开「订阅补源通知」时按文件逐条推送。补源失败始终单独提醒。
                                 <br>其余失败、无更新、过滤跳过等情况保留在 Web 日志查看。
                                 <br>去重规则：任务名 + 集数 + 保存路径，避免同一更新重复提醒。
                             </div>

@@ -379,6 +379,39 @@ class TestJobExecution(CrossCopyJobsTestBase):
         content = ccj._send_notify_content.call_args[0][1]
         self.assertIn("触发：手动复制", content)
 
+    def test_subscription_success_merged_into_subscription_notify(self):
+        """两个开关都开时，补源成功不再逐文件发，由订阅通知统一发一条。"""
+        self.cfg["notify_push_enabled"] = True
+        job_id = self._create_job(origin="subscription")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        ccj._send_notify_content.assert_not_called()
+
+    def test_manual_success_still_sent_when_merge_on(self):
+        """合并只针对订阅补源，手动复制照旧逐条发。"""
+        self.cfg["notify_push_enabled"] = True
+        job_id = self._create_job(origin="manual")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        ccj._send_notify_content.assert_called_once()
+
+    def test_subscription_success_sent_when_push_switch_off(self):
+        """订阅成功推送关着（只开补源开关）时退回逐条发，消息不能丢。"""
+        self.cfg["notify_push_enabled"] = False
+        job_id = self._create_job(origin="subscription")
+        with patch.object(xcc, "copy_file_across_clouds", return_value=_uploaded_result()):
+            self._run(job_id)
+        ccj._send_notify_content.assert_called_once()
+
+    def test_subscription_failure_still_sent_when_merge_on(self):
+        """失败不合并：得知道是哪一集挂了。"""
+        self.cfg["notify_push_enabled"] = True
+        job_id = self._create_job(origin="subscription")
+        with patch.object(xcc, "copy_file_across_clouds", side_effect=xcc.CrossCloudCopyError("下载失败")):
+            self._run(job_id)
+        ccj._send_notify_content.assert_called_once()
+        self.assertIn("跨盘复制失败", ccj._send_notify_content.call_args[0][1])
+
     def test_missing_cookie_fails(self):
         self.target_provider._cookie = ""
         job_id = self._create_job()

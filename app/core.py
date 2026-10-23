@@ -2194,19 +2194,24 @@ SUBSCRIPTION_ORGANIZE_OPTION_DEFAULTS: Dict[str, Any] = {
 
 
 # === 跨盘补源（订阅任务字段归一化） ===
-SUBSCRIPTION_CROSS_COPY_MODES = ("off", "fallback", "prefer")
+# 2026-10-23 起只剩两态：off=关闭；fallback=本盘没新资源才补源。
+# 「优先跨盘」（prefer）已删除：同盘有资源时转存是服务端秒传，跨盘要下载再上传，
+# 命中也复制纯属浪费；且注册判缺用导入前状态，会和同盘导入重复下载同一批集。
+SUBSCRIPTION_CROSS_COPY_MODES = ("off", "fallback")
 SUBSCRIPTION_CROSS_COPY_SOURCE_PROVIDERS = ("quark",)
 
 
 def normalize_subscription_cross_copy_mode(value: Any) -> str:
-    """跨盘补源模式：off=关闭；fallback=自家盘未命中才补源；prefer=命中即复制。"""
+    """跨盘补源模式：off=关闭；fallback=自家盘未命中才补源。
+
+    历史值 prefer/priority/preferred 按 fallback 接管（2026-10-23 删档），
+    避免存量订阅任务静默变成 off、补源莫名失效。
+    """
     mode = str(value or "").strip().lower()
     if mode in {"off", "disabled", "none", "false", "0"}:
         return "off"
-    if mode in {"fallback", "backup", "reserve"}:
+    if mode in {"fallback", "backup", "reserve", "prefer", "priority", "preferred"}:
         return "fallback"
-    if mode in {"prefer", "priority", "preferred"}:
-        return "prefer"
     return "off"
 
 

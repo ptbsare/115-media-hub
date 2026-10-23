@@ -669,6 +669,137 @@ async def push_subscription_success_notification(
     }
 
 
+def _build_cross_copy_subscription_markdown(
+    task: Dict[str, Any],
+    episodes: List[int],
+    savepath: str,
+    job_ids: List[int],
+    file_count: int,
+    source_label: str,
+    target_label: str,
+    next_episode: int,
+    total_episodes: int,
+) -> str:
+    """跨盘补源成功 = 订阅更新成功，只是来源是另一个网盘。
+
+    和同盘导入共用同一个标题与字段顺序，只在「来源」那行替换成补源链路——
+    用户关心的是「剧更新了」，搬运细节属于二级信息。
+    """
+    media_type = str(task.get("media_type", "movie") or "movie").strip().lower()
+    media_label = "电视剧" if media_type == "tv" else "电影"
+    task_label = _compact_text(task.get("title", "") or task.get("name", "") or "未命名任务", 64)
+    savepath_label = _compact_text(normalize_relative_path(savepath) or "--", 128)
+    now_label = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    normalized_episodes = sorted(
+        {max(0, int(item or 0)) for item in (episodes or []) if max(0, int(item or 0)) > 0}
+    )
+
+    lines = [
+        "### 订阅更新成功",
+        f"> 时间：{now_label}",
+        f"> 任务：{task_label}（{media_label}）",
+        f"> 来源：跨盘补源（{_compact_text(source_label or '源网盘', 24)} → {_compact_text(target_label or '目标网盘', 24)}）",
+    ]
+    if media_type == "tv" and normalized_episodes:
+        episode_summary = _format_notify_episode_summary(normalized_episodes)
+        lines.append(
+            f"> 概览：新增 {_format_notify_highlight(episode_summary, 'warning')}"
+            f"（共 {len(normalized_episodes)} 集）"
+        )
+        progress_label = f"E{int(next_episode)}" if int(next_episode or 0) > 0 else "--"
+        if int(total_episodes or 0) > 0 and int(next_episode or 0) > 0:
+            progress_label = f"{progress_label} / {int(total_episodes)}"
+        if progress_label != "--":
+            lines.append(f"> 当前进度：{progress_label}")
+    elif media_type == "tv":
+        # 整包补源（只在本盘一集都没有时发生）解析不出集数，别编一个数字出来
+        lines.append(f"> 概览：整包补入 {max(1, int(file_count or 0))} 个条目（进度以目录扫描为准）")
+    else:
+        lines.append("> 概览：电影资源已通过跨盘补源入库")
+
+    lines.extend([">", "> 入库详情：", f"> - 保存路径：`{savepath_label}`"])
+    if int(file_count or 0) > 1:
+        lines.append(f"> - 补源文件：{int(file_count)} 个")
+    normalized_job_ids = [max(0, int(item or 0)) for item in (job_ids or []) if max(0, int(item or 0)) > 0]
+    if normalized_job_ids:
+        shown = "、".join(f"#{item}" for item in normalized_job_ids[:6])
+        suffix = f" 等 {len(normalized_job_ids)} 个" if len(normalized_job_ids) > 6 else ""
+        lines.append(f"> - 复制任务：{shown}{suffix}")
+    return "\n".join(lines)
+
+
+async def push_cross_copy_subscription_notification(
+    cfg: Dict[str, Any],
+    task: Dict[str, Any],
+    episodes: List[int],
+    savepath: str,
+    job_ids: List[int],
+    file_count: int,
+    source_label: str,
+    target_label: str,
+    next_episode: int = 0,
+    total_episodes: int = 0,
+) -> Dict[str, Any]:
+    """补源成功后发的那一条「订阅更新成功」。
+
+    集数去重与同盘导入共用一张表（任务 + 保存路径 + 集数），所以补源补的集
+    和后续同盘导入的集不会重复报两次；整包补源解析不出集数，没有去重粒度，
+    直接发（这种场景只在本盘一条候选都没有时发生，频率极低）。
+    """
+    runtime_cfg = build_notify_runtime_config(cfg)
+    if not bool(runtime_cfg.get("enabled", False)):
+        return {"pushed": False, "reason": "disabled"}
+
+    channel = _validate_notify_runtime_config(runtime_cfg)
+    normalized_episodes = sorted(
+        {max(0, int(item or 0)) for item in (episodes or []) if max(0, int(item or 0)) > 0}
+    )
+    task_name = str(task.get("name", "") or task.get("title", "") or "").strip()
+    normalized_savepath = normalize_relative_path(savepath)
+
+    fresh_pairs: List[Tuple[int, str]] = []
+    if normalized_episodes:
+        fresh_pairs = await asyncio.to_thread(
+            _filter_fresh_subscription_notification_pairs,
+            task_name,
+            normalized_savepath,
+            normalized_episodes,
+        )
+        if not fresh_pairs:
+            return {"pushed": False, "reason": "deduped", "channel": channel}
+        notify_episodes = [episode_no for episode_no, _ in fresh_pairs]
+    else:
+        notify_episodes = []
+
+    content = _build_cross_copy_subscription_markdown(
+        task=task,
+        episodes=notify_episodes,
+        savepath=normalized_savepath,
+        job_ids=job_ids,
+        file_count=file_count,
+        source_label=source_label,
+        target_label=target_label,
+        next_episode=next_episode,
+        total_episodes=total_episodes,
+    )
+    await asyncio.to_thread(_send_notify_content, runtime_cfg, content, 20)
+    if fresh_pairs:
+        await asyncio.to_thread(
+            _record_subscription_notification_pairs,
+            task_name,
+            normalized_savepath,
+            fresh_pairs,
+        )
+    return {
+        "pushed": True,
+        "reason": "",
+        "scene": NOTIFY_SCENE_SUBSCRIPTION_SUCCESS,
+        "episodes": notify_episodes,
+        "episode_summary": _format_notify_episode_summary(notify_episodes),
+        "channel": channel,
+    }
+
+
 def _strip_monitor_media_extension(file_name: str) -> str:
     raw_name = str(file_name or "").strip()
     if not raw_name:

@@ -541,6 +541,8 @@ def ensure_db() -> None:
                     resume_json TEXT NOT NULL DEFAULT '{}',
                     organize_state TEXT NOT NULL DEFAULT '',
                     organize_detail TEXT NOT NULL DEFAULT '',
+                    progress_state TEXT NOT NULL DEFAULT '',
+                    progress_detail TEXT NOT NULL DEFAULT '',
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL,
                     started_at TEXT NOT NULL DEFAULT '',
@@ -599,9 +601,22 @@ def ensure_db() -> None:
                 cursor.execute(
                     "ALTER TABLE cross_copy_jobs ADD COLUMN organize_detail TEXT NOT NULL DEFAULT ''"
                 )
+            if "progress_state" not in cross_copy_job_columns:
+                # 补源落地后「回写订阅任务进度」的状态：'' 不涉及 / pending 待回写 /
+                # running 回写中 / done 已回写 / skipped 无需回写 / failed 回写失败
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN progress_state TEXT NOT NULL DEFAULT ''"
+                )
+            if "progress_detail" not in cross_copy_job_columns:
+                cursor.execute(
+                    "ALTER TABLE cross_copy_jobs ADD COLUMN progress_detail TEXT NOT NULL DEFAULT ''"
+                )
             # 索引必须放在补列之后：老库这张表还没有 organize_state 时不能建
             cursor.execute(
                 "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_organize ON cross_copy_jobs(organize_state)"
+            )
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_cross_copy_jobs_progress ON cross_copy_jobs(progress_state)"
             )
             cursor.execute("PRAGMA table_info(local_files)")
             local_file_columns = {str(row[1]) for row in cursor.fetchall()}
