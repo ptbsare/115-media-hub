@@ -1351,6 +1351,62 @@ class TestResumeTaskLayer(CrossCopyJobsTestBase):
         self.assertEqual(sorted(removed), sorted(paths))
 
 
+class TestFolderMonitorTrigger(CrossCopyJobsTestBase):
+    """订阅补源整包文件夹落地后触发监控扫描（单文件走整理定时器，先改名再扫描）。"""
+
+    def _folder_result(self):
+        from types import SimpleNamespace
+
+        return SimpleNamespace(
+            status="completed",
+            folder_name="光阴之外 (2025)",
+            total_bytes=10,
+            message="ok",
+            to_dict=lambda: {"status": "completed"},
+        )
+
+    def test_subscription_folder_job_triggers_monitor(self):
+        from app.services import cross_cloud_copy_folder as xccf
+
+        self.cfg["mount_points"] = [{"provider": "115", "prefix": "/115"}]
+        self.cfg["monitor_tasks"] = [{"name": "影视库监控", "scan_path": "/115/115连载中"}]
+        job_id = self._create_job(
+            source_is_dir=True,
+            filename="光阴之外 (2025)",
+            origin="subscription",
+            origin_ref="光阴之外",
+            target_savepath="115连载中/光阴之外 (2025)",
+        )
+
+        with patch.object(xccf, "copy_folder_across_clouds", return_value=self._folder_result()), \
+             patch("app.services.monitor.queue_monitor_job", return_value="queued") as queue_mock:
+            self._run(job_id)
+
+        queue_mock.assert_called_once_with(
+            "影视库监控",
+            "subscription",
+            {"savepath": "115连载中/光阴之外 (2025)", "title": "跨盘补源：光阴之外"},
+        )
+
+    def test_manual_folder_job_does_not_trigger_monitor(self):
+        """手动复制的文件夹不触发监控：没有「落地即入库」的意图依据。"""
+        from app.services import cross_cloud_copy_folder as xccf
+
+        self.cfg["mount_points"] = [{"provider": "115", "prefix": "/115"}]
+        self.cfg["monitor_tasks"] = [{"name": "影视库监控", "scan_path": "/115/115连载中"}]
+        job_id = self._create_job(
+            source_is_dir=True,
+            filename="某文件夹",
+            target_savepath="115连载中/某文件夹",
+        )
+
+        with patch.object(xccf, "copy_folder_across_clouds", return_value=self._folder_result()), \
+             patch("app.services.monitor.queue_monitor_job", return_value="queued") as queue_mock:
+            self._run(job_id)
+
+        queue_mock.assert_not_called()
+
+
 class TestCrossCopyNotifyConfig(unittest.TestCase):
     """core 的配置归一化：跨盘复制通知按任务来源分两个开关，旧字段一次性迁移。"""
 

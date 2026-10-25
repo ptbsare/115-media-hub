@@ -392,5 +392,170 @@ class OrganizeRunOnceTest(OrganizeTestBase):
         self.assertEqual(json.loads(row["result_json"] or "{}"), {})
 
 
+class OrganizeMonitorRefreshTest(OrganizeTestBase):
+    """分组结束后触发监控扫描：先改名后扫描、口径与订阅导入一致。"""
+
+    def _seed(self, **overrides):
+        job_id = self._job(**overrides)
+        ccj.update_cross_copy_job(
+            job_id, status="completed", finished_at="2026-10-22T10:00:00", organize_state="pending"
+        )
+        return job_id
+
+    def _run(self, task, result, monitor_tasks=None, queue_return="queued", provider="default"):
+        fake_provider = FakeProvider() if provider == "default" else provider
+        cfg = {
+            "provider_enabled": {"115": True},
+            "subscription_tasks": [task] if task else [],
+            "mount_points": [{"provider": "115", "prefix": "/115"}],
+            "monitor_tasks": (
+                [{"name": "影视库监控", "scan_path": "/115/115连载中"}]
+                if monitor_tasks is None
+                else monitor_tasks
+            ),
+        }
+        logs = []
+
+        async def fake_log(text, level="info", compact=None):
+            logs.append((text, level))
+
+        with mock.patch.object(organize, "get_config", return_value=cfg), \
+             mock.patch.object(organize, "_get_provider_or_none", return_value=fake_provider), \
+             mock.patch.object(organize, "write_subscription_log", side_effect=fake_log), \
+             mock.patch.object(
+                 organize,
+                 "organize_files_for_subscription_task",
+                 new=mock.AsyncMock(return_value=result),
+             ), \
+             mock.patch("app.services.monitor.queue_monitor_job", return_value=queue_return) as queue_mock:
+            stats = asyncio.run(organize.run_pending_organize_once())
+        return stats, logs, queue_mock
+
+    def _task(self, **overrides):
+        task = {
+            "name": TASK_NAME,
+            "media_type": "tv",
+            "organize_on_import": True,
+            "tmdb_id": 281233,
+            "organize_options": {"file_name_mode": "standard"},
+        }
+        task.update(overrides)
+        return task
+
+    def test_triggers_monitor_after_rename(self):
+        self._seed()
+        stats, logs, queue_mock = self._run(
+            self._task(),
+            {"ok": True, "job_id": 77, "succeeded": 1, "failed": 0, "status": "completed"},
+        )
+
+        self.assertEqual(stats["done"], 1)
+        queue_mock.assert_called_once_with(
+            "影视库监控",
+            "subscription",
+            {"savepath": "115连载中/光阴之外 (2025)/Season 01", "title": "跨盘补源：光阴之外"},
+        )
+        self.assertTrue(any("已触发监控精准刷新" in text for text, _level in logs), logs)
+
+    def test_no_monitor_match_logs_warning_and_skips_queue(self):
+        self._seed()
+        stats, logs, queue_mock = self._run(
+            self._task(),
+            {"ok": True, "job_id": 77, "succeeded": 1, "failed": 0, "status": "completed"},
+            monitor_tasks=[],
+        )
+
+        self.assertEqual(stats["done"], 1)
+        queue_mock.assert_not_called()
+        self.assertTrue(any("未纳入文件夹监控" in text for text, _level in logs), logs)
+
+    def test_rename_failure_still_triggers_monitor(self):
+        self._seed()
+        stats, _logs, queue_mock = self._run(
+            self._task(),
+            {"ok": False, "reason": "未在目标目录找到本次新入库的文件，保留原名", "level": "info"},
+        )
+
+        self.assertEqual(stats["failed"], 1)
+        queue_mock.assert_called_once()
+
+    def test_missing_task_still_triggers_monitor(self):
+        self._seed()
+        stats, _logs, queue_mock = self._run(None, {})
+
+        self.assertEqual(stats["skipped"], 1)
+        queue_mock.assert_called_once()
+
+    def test_non_115_target_does_not_trigger(self):
+        self._seed(target_provider="quark", target_dir_id="quark-dir")
+        stats, logs, queue_mock = self._run(
+            self._task(),
+            {"ok": True, "job_id": 5, "succeeded": 1, "failed": 0, "status": "completed"},
+        )
+
+        self.assertEqual(stats["done"], 1)
+        queue_mock.assert_not_called()
+        self.assertFalse(any("刷新" in text for text, _level in logs), logs)
+
+    def test_helper_short_circuits_non_115(self):
+        result = organize.trigger_cross_copy_monitor_refresh(
+            {"mount_points": [{"provider": "115", "prefix": "/115"}]},
+            "quark",
+            "某目录",
+            TASK_NAME,
+        )
+
+        self.assertEqual(result, {"triggered": False, "reason": "not_115"})
+
+    def test_disabled_monitor_task_does_not_claim_triggered(self):
+        """监控任务停用：入队返回 disabled，日志不能谎报「已触发」。"""
+        self._seed()
+        stats, logs, queue_mock = self._run(
+            self._task(),
+            {"ok": True, "job_id": 77, "succeeded": 1, "failed": 0, "status": "completed"},
+            queue_return="disabled",
+        )
+
+        self.assertEqual(stats["done"], 1)
+        queue_mock.assert_called_once()
+        self.assertTrue(any("已停用" in text for text, _level in logs), logs)
+        self.assertFalse(any("已触发监控精准刷新" in text for text, _level in logs), logs)
+
+    def test_unconfigured_provider_skips_monitor_trigger(self):
+        """目标网盘未配置：整组放弃，不排必然失败的扫描，也不再叠一条归因错误的警告。"""
+        self._seed()
+        stats, logs, queue_mock = self._run(
+            self._task(),
+            {"ok": True, "job_id": 77, "succeeded": 1, "failed": 0, "status": "completed"},
+            provider=None,
+        )
+
+        self.assertEqual(stats["skipped"], 1)
+        queue_mock.assert_not_called()
+        self.assertTrue(any("未配置" in text for text, _level in logs), logs)
+        self.assertFalse(any("刷新" in text for text, _level in logs), logs)
+        self.assertFalse(any("未纳入文件夹监控" in text for text, _level in logs), logs)
+
+    def test_helper_marks_disabled_monitor_as_not_triggered(self):
+        cfg = {
+            "mount_points": [{"provider": "115", "prefix": "/115"}],
+            "monitor_tasks": [{"name": "影视库监控", "scan_path": "/115/115连载中"}],
+        }
+        with mock.patch("app.services.monitor.queue_monitor_job", return_value="disabled"):
+            result = organize.trigger_cross_copy_monitor_refresh(
+                cfg, "115", "115连载中/光阴之外 (2025)", TASK_NAME
+            )
+
+        self.assertEqual(
+            result,
+            {
+                "triggered": False,
+                "reason": "monitor_disabled",
+                "task_name": "影视库监控",
+                "savepath": "115连载中/光阴之外 (2025)",
+            },
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

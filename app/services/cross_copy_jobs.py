@@ -1057,6 +1057,44 @@ def _finish_folder_job(job_id: int, job: Dict[str, Any], cfg: Dict[str, Any], re
     )
     _clear_job_progress(job_id)
     _push_cross_copy_notification(cfg, job, ok=True, message=message)
+    _trigger_folder_monitor_refresh(job, cfg)
+
+
+def _trigger_folder_monitor_refresh(job: Dict[str, Any], cfg: Dict[str, Any]) -> None:
+    """订阅补源整包文件夹落地后触发监控扫描。
+
+    单文件补源走整理定时器（先改名再扫描，顺序不能反）；文件夹不逐文件改名，
+    没有顺序问题，落地即扫。与订阅导入收口同一口径：用落点目录匹配监控任务，
+    匹配上才入队。手动复制与非 115 目标不触发——前者没有「落地即入库」的
+    意图依据，后者没有监控目录。
+    """
+    if str(job.get("origin", "") or "").strip().lower() != "subscription":
+        return
+    try:
+        # 延迟 import：organize 不依赖本模块，但 startup 两边都会拉，函数内 import 最稳
+        from .subscription_cross_copy_organize import trigger_cross_copy_monitor_refresh
+
+        result = trigger_cross_copy_monitor_refresh(
+            cfg,
+            str(job.get("target_provider", "") or ""),
+            str(job.get("target_savepath", "") or ""),
+            str(job.get("origin_ref", "") or ""),
+        )
+    except Exception as exc:  # noqa: BLE001 - 监控触发失败不影响复制收口
+        logger.info("cross-copy folder monitor refresh skipped (job=%s): %s", job.get("id"), exc)
+        return
+    if result.get("triggered"):
+        logger.info(
+            "cross-copy folder monitor refresh queued (job=%s, monitor_task=%s)",
+            job.get("id"),
+            result.get("task_name"),
+        )
+    elif result.get("reason") == "monitor_disabled":
+        logger.info(
+            "cross-copy folder monitor refresh skipped: task disabled (job=%s, monitor_task=%s)",
+            job.get("id"),
+            result.get("task_name"),
+        )
 
 
 def _delete_source_file(source_provider, source_cookie: str, source_file_id: str) -> None:

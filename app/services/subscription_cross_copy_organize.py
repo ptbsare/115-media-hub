@@ -30,6 +30,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from ..core import (
     get_config,
+    match_monitor_task_for_savepath,
     normalize_mount_provider,
     normalize_relative_path,
     reset_subscription_log_context,
@@ -357,6 +358,92 @@ async def organize_files_for_subscription_task(
     return {"ok": False, "job_id": job_id, "reason": f"改名未完成（{detail[:120]}），保留原名", "level": "warn"}
 
 
+def trigger_cross_copy_monitor_refresh(
+    cfg: Dict[str, Any],
+    provider: str,
+    savepath: str,
+    task_name: str,
+) -> Dict[str, Any]:
+    """补源文件落进 115 监控目录后，登记一次目录扫描（生成 / 刷新 STRM）。
+
+    与订阅导入收口同一套口径（``subscription_task_runner`` 移动文件后那段）：
+    用落点目录匹配监控任务，匹配上才入队，匹配不上由调用方写明「不会自动
+    生成 STRM」。定时器分组与文件夹整包收口都走这个函数。
+
+    两条硬约束：
+    - **必须先改名再扫描**：监控按改名后的文件名生成播放文件。放在复制收口
+      会扫出旧文件名（``S01E42.strm``），而改名事件不会追溯修正它——新文件
+      还不在监控索引里，改名同步事件无从改起。所以本函数只允许被「改名尝试
+      已结束」的调用方触发；
+    - **只接 115**：监控任务只绑在 115 上（``queue_inbox_dispatch_scan`` 对
+      非 115 直接返回），其他网盘没有监控目录可作意图依据。
+    """
+    provider_key = normalize_mount_provider(provider) or str(provider or "").strip().lower()
+    if provider_key != "115":
+        return {"triggered": False, "reason": "not_115"}
+    normalized = normalize_relative_path(str(savepath or "").strip())
+    if not normalized:
+        return {"triggered": False, "reason": "empty_savepath"}
+    try:
+        matched = match_monitor_task_for_savepath(cfg, normalized, provider="115")
+    except Exception as exc:  # noqa: BLE001 - 匹配失败不该把整理收口带崩
+        logger.info("跨盘补源监控匹配失败（%s）：%s", normalized, exc)
+        return {"triggered": False, "reason": "match_failed", "savepath": normalized}
+    monitor_task = str(matched.get("task_name", "") or "").strip()
+    if not monitor_task:
+        return {"triggered": False, "reason": "no_monitor_task", "savepath": normalized}
+    try:
+        # 延迟 import：monitor 不依赖本模块，但 startup 两边都会拉，函数内 import 最稳
+        from .monitor import queue_monitor_job
+
+        status = queue_monitor_job(
+            monitor_task,
+            "subscription",
+            {
+                "savepath": normalized,
+                "title": f"跨盘补源：{str(task_name or '').strip() or normalized}",
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - 入队失败只记录，不影响改名结果
+        logger.info("跨盘补源监控入队失败（%s）：%s", monitor_task, exc)
+        return {"triggered": False, "reason": "queue_failed", "task_name": monitor_task}
+    if str(status or "").strip().lower() == "disabled":
+        # 任务被明确停用：非手动触发不入队。别说成「已触发」，用户去监控页面
+        # 找不到对应运行记录，等于日志说谎。
+        return {
+            "triggered": False,
+            "reason": "monitor_disabled",
+            "task_name": monitor_task,
+            "savepath": normalized,
+        }
+    return {
+        "triggered": True,
+        "task_name": monitor_task,
+        "savepath": normalized,
+        "status": str(status or ""),
+    }
+
+
+async def _trigger_group_monitor_refresh(provider_name: str, savepath: str, task_name: str) -> None:
+    """定时器分组专用：触发监控扫描并把结果写进订阅日志。"""
+    result = trigger_cross_copy_monitor_refresh(get_config(), provider_name, savepath, task_name)
+    if result.get("triggered"):
+        await write_subscription_log(
+            f"跨盘补源已触发监控精准刷新：{result.get('savepath') or savepath}"
+            f"（监控任务「{result.get('task_name')}」）",
+            "info",
+        )
+        return
+    if str(result.get("reason", "") or "") == "no_monitor_task":
+        # 与订阅导入收口同一句文案：用户看到就知道为什么库里没有这个文件
+        await write_subscription_log("命中目录未纳入文件夹监控，入库后不会自动生成 STRM", "warn")
+    elif str(result.get("reason", "") or "") == "monitor_disabled":
+        await write_subscription_log(
+            f"监控任务「{result.get('task_name')}」已停用，未自动扫描（需要时可手动立即扫描）",
+            "info",
+        )
+
+
 def _log_context(task_name: str, provider: str) -> Any:
     """订阅日志靠 contextvar 补任务名，定时器里得手动包一层。"""
     return set_subscription_log_context(
@@ -382,6 +469,11 @@ async def _organize_group(
     stats["groups"] += 1
     claimed_set = set(claimed)
     claimed_jobs = [job for job in jobs if int(job.get("id", 0) or 0) in claimed_set]
+    # 落点目录在 try 外取：finally 里的监控触发要用，异常路径也不能 NameError
+    target_savepath = str(claimed_jobs[0].get("target_savepath", "") or "").strip()
+    # 目标网盘未配置时整组放弃：此时触发监控只会排一次必然失败的扫描（没有认证
+    # 信息），还会在「未配置」警告后面再叠一条归因错误的提示。
+    monitor_ready = True
     token = _log_context(task_name, provider_name)
     try:
         cfg = get_config()
@@ -400,8 +492,8 @@ async def _organize_group(
             _finish_jobs(claimed, ORGANIZE_STATE_SKIPPED, "目标网盘未配置或未启用，保留原名")
             stats["skipped"] += len(claimed)
             await write_subscription_log("跨盘补源入库后整理：目标网盘未配置，保留原名", "warn")
+            monitor_ready = False
             return
-        target_savepath = str(claimed_jobs[0].get("target_savepath", "") or "").strip()
         imported_entries = [
             {
                 "name": str(job.get("filename", "") or "").strip(),
@@ -438,6 +530,14 @@ async def _organize_group(
         _finish_jobs(claimed, ORGANIZE_STATE_FAILED, f"整理异常：{str(exc)[:120]}")
         stats["failed"] += len(claimed)
     finally:
+        # 改名尝试结束（成功/跳过/失败/异常都算）后再触发监控扫描：监控要按
+        # 改名后的文件名生成 STRM，与订阅导入「先改名再刷新」同一顺序；非 115
+        # 目标与未纳入监控的目录由 _trigger_group_monitor_refresh 写清原因。
+        if monitor_ready:
+            try:
+                await _trigger_group_monitor_refresh(provider_name, target_savepath, task_name)
+            except Exception as exc:  # noqa: BLE001 - 监控触发失败不能盖掉整理结果
+                logger.info("跨盘补源监控触发失败（%s）：%s", task_name, exc)
         reset_subscription_log_context(token)
 
 
