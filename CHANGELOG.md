@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented in this file. The format loosely follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 
+## [0.15.9] - 2026-10-25
+
+两块内容：新增 Seerr / Jellyseerr / Overseerr 点播对接（10-24 完成、一直未发版，随本版一起发出），并修掉 0.15.x 漏接的一条线——订阅跨盘补源复制进 115 监控目录后不触发文件夹监控扫描、不出 STRM。
+
+### 补源落地后自动触发监控扫描
+
+- **症状**：从夸克补进来的集落到 115 监控目录后，「文件夹监控」不会自己跑一轮，要手动点「立即扫描」或等下一次触发才入库。
+- **根因**：所有「文件落到 115」的链路（订阅导入、订阅批次收口、资源 / 离线导入、接收夹分发）在文件落地后都会按落点目录匹配监控任务、登记一次扫描，唯独跨盘复制收口从未调用——只做了清暂存、写任务状态、发通知。2026-10-20 那次「监控联动验证」用的是手动扫描，把缺口盖住了。
+- **现在**：单文件补源在整理定时器分组改名结束后（成功 / 跳过 / 失败都触发）按落点匹配监控任务入队；整包文件夹补源在复制收口直接触发。顺序必须是先改名再扫描——监控按改名后的文件名生成 STRM，放在复制收口会扫出旧文件名的播放文件，而改名事件不会追溯修正。
+- 只对 115 目标、只对订阅补源生效：手动复制与非 115 目标不触发（没有「落地即入库」的意图依据）。落点没纳入任何监控任务时写订阅日志「命中目录未纳入文件夹监控，入库后不会自动生成 STRM」（与订阅导入同文案）。
+- 两条不误报口径：监控任务被停用（`enabled=False`）时入队直接返回 disabled，日志写「已停用，未自动扫描」，不能说「已触发」；目标网盘未配置时整组放弃触发（没有认证信息扫描必然失败，还会在「未配置」警告后再叠一条归因错误的提示）。
+
+### Seerr / Overseerr 点播对接
+
+- **家人点播自动入库**：让 Seerr / Jellyseerr / Overseerr 把本面板当成 Radarr（电影）/ Sonarr（剧集）服务器，点播自动转成现有订阅任务（provider 固定 115）并立即触发一次全量搜索，复用「找资源 → 转存 → 入库 → STRM」全链路，零新增第三方依赖。
+- 新增 `app/routes/servarr.py`：16 个端点（`system/status`、`qualityProfile`、`rootfolder`、`tag`、`languageprofile` 五个静态端点 + 电影 / 剧集的 lookup / list / detail / add / delete，`PUT /series` 与 `POST` 同行为）；X-Api-Key 独立鉴权，未配置密钥时接口整体关闭（503），不走面板登录会话。
+- 新增 `find_tmdb_id_by_tvdb_id`：Seerr 点播剧集只带 tvdbId，经 TMDB `/find` 转 tmdbId；解析失败明确报错，不建降级任务。
+- 配置两项：`servarr_api_key`（敏感键，脱敏返回）与 `servarr_default_savepath`（点播默认保存目录，留空拒点播）；CORS 放行 X-Api-Key；设置页「后台安全管理」新增两个字段与对接说明，分区摘要显示「点播接口已开启」。逐字段配置教程见 `docs/seerr-setup-guide.md`。
+- 测试 `tests/test_servarr_api.py` 36 条全绿（鉴权、静态端点、点播映射、多季拆分、判重幂等、删除连带、重名后缀）。**真机联调待用户侧完成**。
+
+### 验证
+
+- 监控修复：`test_cross_copy_organize` + `test_cross_copy_jobs` **137 条零失败**（新增 11 条回归：触发参数与订阅导入一致、先改名再触发、无监控任务时写警告、改名失败仍触发、订阅任务已删仍触发、非 115 不触发、文件夹触发 / 手动不触发、停用不谎报、未配置不触发）；`scripts/check.sh --changed` **699 条零失败**。
+- Seerr：`tests/test_servarr_api.py` 36 条全绿；`test_modules_doc` / `test_settings_storage_ui` / `test_subscription_ui_frontend` 回归 78 条零失败；改动 JS `node --check` 通过。
+
 ## [0.15.8] - 2026-10-24
 
 只影响「上次失败过、这次点重试」的跨盘复制任务：不再因为断点里那个位置差了几兆字节就彻底卡死。
