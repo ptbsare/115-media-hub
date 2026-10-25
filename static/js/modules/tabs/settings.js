@@ -182,7 +182,8 @@ function buildSettingsSectionSummary(key) {
         case 'security': {
             const account = settingsValue('username') ? '账号已填' : '账号未填';
             const secretConfigured = !!settingsValue('webhook_secret') || !!latestSettingsSensitiveMeta.webhook_secret;
-            return `${account} · ${secretConfigured ? '签名密钥已配置' : '签名密钥未配置'}`;
+            const servarrConfigured = !!settingsValue('servarr_api_key') || !!latestSettingsSensitiveMeta.servarr_api_key;
+            return `${account} · ${secretConfigured ? '签名密钥已配置' : '签名密钥未配置'}${servarrConfigured ? ' · 点播接口已开启' : ''}`;
         }
         case 'storage': {
             const dir = String(latestStorageState.dir || '').trim();
@@ -437,7 +438,9 @@ function collectSettingsPayload({
         'extensions',
         'username',
         'password',
-        'webhook_secret'
+        'webhook_secret',
+        'servarr_api_key',
+        'servarr_default_savepath'
     ];
     const sensitiveFieldSet = new Set(Array.isArray(sensitiveSettingFields) ? sensitiveSettingFields : []);
     standardIds.forEach((id) => {
@@ -1050,6 +1053,17 @@ export async function manualSign115({
 
 export function generateWebhookSecret({ showToast } = {}) {
     const input = document.getElementById('webhook_secret');
+    if (!input) return;
+    input.value = randomAlphaNumericSecret(32);
+    input.focus();
+    input.select();
+    if (typeof showToast === 'function') {
+        showToast('已生成随机密钥，请记得点击“保存全部配置”', { tone: 'success', duration: 3000, placement: 'top-center' });
+    }
+}
+
+export function generateServarrApiKey({ showToast } = {}) {
+    const input = document.getElementById('servarr_api_key');
     if (!input) return;
     input.value = randomAlphaNumericSecret(32);
     input.focus();

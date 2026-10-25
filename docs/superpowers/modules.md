@@ -44,6 +44,14 @@
 - **相关代码**：`app/routes/subscription.py`、`app/services/subscription.py`、`app/services/subscription_cross_copy_organize.py`、`app/services/subscription_cross_copy_progress.py`；页面 `templates/partials/pages/subscription.html`
 - **细节**：README 的「方案三 / 方案四」；磁力 / 电驴手动离线入库的实现说明用 `rg "磁力/电驴离线入库" docs/superpowers/handoff-archive.md` 定位
 
+### Seerr 点播对接（servarr）
+- **用途**：让 Seerr / Jellyseerr / Overseerr 把本面板当成 Radarr / Sonarr 服务器，家人的点播请求自动转成订阅任务（电影一部一任务、剧集按季拆多任务，provider 固定 115），立即触发一次全量搜索，之后与手动订阅完全同链路。
+- **入口**：Seerr 侧「设置 → Radarr / Sonarr」添加服务器（地址 = 面板地址，API Key = 设置页生成）；本侧入口是 `/api/v3/*` 端点。
+- **会做**：16 个 Radarr/Sonarr v3 端点（system/status、qualityProfile、rootfolder、tag、languageprofile、movie 的 lookup/list/detail/add/delete、series 的 lookup/list/detail/add/update/delete）；X-Api-Key 鉴权；tvdbId 经 TMDB /find 转 tmdbId；删除点播连带删订阅任务。
+- **不会做**：不实现 queue / command / health 端点；不接 TVDB 直连；不管 Seerr 用户权限；不代理播放；不新建第二套任务存储。
+- **相关代码**：`app/routes/servarr.py`、`app/providers/tmdb.py`（find_tmdb_id_by_tvdb_id）；设置页「后台安全管理」的「点播接口 API Key / 点播默认保存目录」
+- **细节**：`docs/superpowers/plans/2026-10-24-servarr-seerr-api.md`
+
 ### 文件夹监控（folder monitor）
 - **用途**：持续扫描网盘目录，为媒体文件生成 / 更新 `.strm`，并跟踪目录与文件的索引。
 - **入口**：页面「文件夹监控」的监控卡片（运行、停止、定时、Webhook `POST /webhook/{任务名}`）；刮削页「扫描监控」按钮（`POST /monitor/scan`，局部指定目录）；CLI `monitor start|stop|list|logs`。
@@ -113,6 +121,7 @@
 | `app/routes/strm.py` | 播放代理（`/strm/proxy`、`/strm/relay`）与孤儿刮削元数据清理 |
 | `app/routes/events.py` | SSE 状态推送 `/events` 与 `/status-summary` |
 | `app/routes/cross_copy.py` | 跨盘复制：源×目标能力矩阵、任务增查、取消 / 重试、清除记录（批量 + 单条） |
+| `app/routes/servarr.py` | Radarr/Sonarr v3 兼容层（Seerr 点播对接）：静态系统信息、电影/剧集查询与点播增删，X-Api-Key 鉴权，转订阅任务 |
 
 ### 服务（业务逻辑层）`app/services/`
 

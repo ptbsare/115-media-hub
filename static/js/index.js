@@ -318,6 +318,7 @@
                 'ai_match_api_key',
                 'pansou_password',
                 'webhook_secret',
+                'servarr_api_key',
             ];
             const meta = window.providerMeta || [];
             meta.forEach(p => {
@@ -843,6 +844,17 @@
             }
             void loadSettingsTabModule().then((mod) => {
                 mod?.generateWebhookSecret?.({ showToast });
+            });
+        }
+
+        function generateServarrApiKey() {
+            const settingsModule = tabRuntimeState.tabModuleCache.settings;
+            if (settingsModule?.generateServarrApiKey) {
+                settingsModule.generateServarrApiKey({ showToast });
+                return;
+            }
+            void loadSettingsTabModule().then((mod) => {
+                mod?.generateServarrApiKey?.({ showToast });
             });
         }
 

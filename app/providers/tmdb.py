@@ -543,6 +543,38 @@ def infer_tmdb_episode_mode(detail: Dict[str, Any]) -> str:
         return "absolute"
     return "seasonal"
 
+def find_tmdb_id_by_tvdb_id(
+    tvdb_id: int,
+    cfg: Optional[Dict[str, Any]] = None,
+    force_refresh: bool = False,
+) -> int:
+    """按 TVDB ID 查 TMDB 剧集 ID（Seerr 点播剧集只带 tvdbId）。
+
+    走 TMDB /find 接口，命中返回 tmdb id，未命中返回 0（由调用方决定报错还是兜底）。
+    """
+    normalized_tvdb_id = max(0, int(tvdb_id or 0))
+    if normalized_tvdb_id <= 0:
+        return 0
+    try:
+        payload = tmdb_request_json(
+            f"/find/{normalized_tvdb_id}",
+            params={"external_source": "tvdb_id"},
+            cfg=cfg,
+            force_refresh=force_refresh,
+        )
+    except Exception:
+        return 0
+    results = payload.get("tv_results")
+    if not isinstance(results, list):
+        return 0
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        tmdb_id = max(0, parse_int(item.get("id", 0), 0))
+        if tmdb_id > 0:
+            return tmdb_id
+    return 0
+
 def build_tmdb_task_binding(detail: Dict[str, Any], media_type: str = "") -> Dict[str, Any]:
     normalized_media_type = normalize_tmdb_media_type(detail.get("media_type", ""), fallback=media_type)
     task_binding = {

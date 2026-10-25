@@ -8,6 +8,7 @@ from .routes.pages import router as pages_router
 from .routes.recommendation import router as recommendation_router
 from .routes.resource import router as resource_router
 from .routes.scraper import router as scraper_router
+from .routes.servarr import router as servarr_router
 from .routes.settings import router as settings_router
 from .routes.strm import router as strm_router
 from .routes.subscription import router as subscription_router
@@ -29,6 +30,7 @@ app.include_router(events_router, dependencies=_auth_deps)
 app.include_router(monitor_router, dependencies=_auth_deps)
 app.include_router(recommendation_router, dependencies=_auth_deps)
 app.include_router(cross_copy_router, dependencies=_auth_deps)
+app.include_router(servarr_router)  # 自带 /api/v3 前缀与 X-Api-Key 鉴权，不走登录会话
 
 from . import startup  # noqa: E402,F401
 

@@ -801,6 +801,26 @@
                             主要用于“油猴脚本导入磁力链接”的请求防伪；这是全站唯一的密钥，所有文件夹监控任务（含接收夹任务）共用它，脚本里配一次即可长期校验。未配置则不校验。
                             <br>当前支持：`X-Webhook-Token` 或 `X-Webhook-Ts / X-Webhook-Nonce / X-Webhook-Sign`。
                         </div>
+                        <label class="block">
+                            <span class="text-xs text-slate-500 inline-flex items-center gap-2">
+                                点播接口 API Key（Seerr / Jellyseerr / Overseerr 用）
+                                <button type="button" class="info-dot" onclick="showHelp('用途：让 Seerr 等点播门户把 115 Media Hub 当成 Radarr / Sonarr 服务器。家人在 Seerr 点播后，这里会自动创建对应的订阅任务并立即开始找资源。留空则关闭点播接口。')">i</button>
+                            </span>
+                            <input id="servarr_api_key" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="建议 32 位随机字符串">
+                            <div class="mt-2 flex items-center gap-2 flex-wrap">
+                                <button type="button" onclick="generateServarrApiKey()" class="px-3 py-1.5 rounded-lg bg-emerald-600 hover:bg-emerald-500 text-white text-xs font-bold">随机生成密钥</button>
+                                <span class="text-[11px] text-slate-500">生成后请点击“保存全部配置”。</span>
+                            </div>
+                        </label>
+                        <label class="block">
+                            <span class="text-xs text-slate-500">点播默认保存目录（115 网盘相对路径）</span>
+                            <input id="servarr_default_savepath" class="w-full bg-slate-900 border-slate-700 rounded-xl p-3 text-sm mt-1" placeholder="例如：Seerr点播">
+                            <div class="mt-1 text-[11px] text-slate-500">Seerr 点播创建的任务统一存到这里：电影自动建「片名 年份」子目录，剧集建「Season NN」子目录。留空则无法接受点播。</div>
+                        </label>
+                        <div class="text-xs text-slate-500 leading-6">
+                            对接方法：在 Seerr（Jellyseerr / Overseerr）的「设置 → Radarr / Sonarr」里各添加一条服务器，地址填 <code>http://面板地址</code>，API Key 填上面生成的同一个密钥；Radarr 对应电影点播，Sonarr 对应剧集点播，保存后 Seerr 会显示连接成功。
+                            <br>家人在 Seerr 提交点播后，本面板「影视订阅」页会出现对应任务并自动搜索资源，找到后自动转存、入库、生成 STRM，与手动订阅完全同链路；在 Seerr 删除点播请求会同时删掉这里的订阅任务。
+                        </div>
                         <details class="settings-help-fold">
                             <summary>查看说明：油猴脚本和文件夹监控的关系</summary>
                             <div class="settings-help-fold-body">

@@ -11,6 +11,7 @@ _STATIC_SENSITIVE_KEYS: Tuple[str, ...] = (
     "pansou_password",
     "pansou_token",
     "webhook_secret",
+    "servarr_api_key",
 )
 
 
