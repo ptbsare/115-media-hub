@@ -18,6 +18,9 @@ from ..core import *  # noqa: F401,F403
 from ..services.subscription import queue_subscription_job
 from ..versioning import load_local_version
 
+import logging
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/api/v3", tags=["servarr"])
 
 SERVARR_QUALITY_PROFILE_ID = 1
@@ -592,6 +595,7 @@ async def servarr_movie_detail(mid: int, _: None = servarr_auth) -> RadarrMovie:
 async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union[RadarrMovie, ServarrIdResponse]:
     """Seerr 电影点播：建一个电影订阅任务并立即跑一次全量搜索。"""
     tmdb_id = max(0, int(movie.tmdbId or 0))
+    logger.warning("[SERV] ADD_MOVIE_IN tmdb_id=%s title=%s year=%s", tmdb_id, movie.title, movie.year)
     if tmdb_id <= 0:
         raise HTTPException(status_code=400, detail="请求缺少 tmdbId")
     cfg = get_config()
@@ -605,9 +609,13 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
                 status_code=400,
                 detail="未配置电影点播保存目录：请先在「参数配置 → 后台安全管理」填写",
             )
+        logger.warning("[SERV] BUILD_TASK tmdb_id=%s fallback_title=%s fallback_year=%s", tmdb_id, movie.title, movie.year)
         task = _build_servarr_movie_task(tmdb_id, cfg, fallback_title=str(movie.title or ""), fallback_year=str(movie.year or ""))
+        logger.warning("[SERV] TASK_BUILT name=%s savepath=%s", task.get("name"), task.get("savepath"))
         appended = _append_subscription_tasks([task])
+        logger.warning("[SERV] APPENDED count=%s", len(appended))
         for item in appended:
+            logger.warning("[SERV] QUEUE_JOB task_name=%s trigger=%s", item.get("name"), SERVARR_TRIGGER)
             queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
     
     title = movie.title or "Unknown"
@@ -664,11 +672,13 @@ async def servarr_update_movie(movie: RadarrMovie, _: None = servarr_auth) -> Ra
 @router.delete("/movie/{mid}")
 async def servarr_remove_movie(mid: int, _: None = servarr_auth) -> Dict[str, Any]:
     result = _drop_subscription_tasks(
-        lambda task: str(task.get("media_type", "")) == "movie" and _task_tmdb_id(task) == mid
+        lambda task: str(task.get("media_type", "")) == "movie" and (
+            _task_tmdb_id(task) == mid or str(mid) in str(task.get("name", ""))
+        )
     )
     if not result["deleted"]:
-        raise HTTPException(status_code=404, detail="未找到该电影订阅")
-    return {"ok": True}
+        return {"ok": True, "deleted": False}
+    return {"ok": True, "deleted": True}
 
 
 # ---------------------------------------------------------------- 剧集端点
@@ -760,7 +770,7 @@ async def servarr_series(tvdbId: Optional[int] = None, _: None = servarr_auth) -
         if not config_error:
             tmdb_id = find_tmdb_id_by_tvdb_id(tvdbId, cfg)
         if tmdb_id <= 0:
-            return []
+            tmdb_id = tvdbId
     tasks = _subscription_tasks(cfg)
     if tmdb_id > 0:
         tasks = [task for task in tasks if _task_tmdb_id(task) == tmdb_id]
@@ -865,12 +875,22 @@ async def servarr_update_series(tv: SonarrSeries, _: None = servarr_auth) -> Ser
 
 @router.delete("/series/{tid}")
 async def servarr_remove_series(tid: int, _: None = servarr_auth) -> Dict[str, Any]:
+    cfg = get_config()
+    target_tmdb_id = tid
+    # 如果传进来的是 tvdbId，尝试转出 tmdb_id
+    if target_tmdb_id > 0:
+        mapped = find_tmdb_id_by_tvdb_id(target_tmdb_id, cfg)
+        if mapped > 0:
+            target_tmdb_id = mapped
+
     result = _drop_subscription_tasks(
-        lambda task: str(task.get("media_type", "")) == "tv" and _task_tmdb_id(task) == tid
+        lambda task: str(task.get("media_type", "")) == "tv" and (
+            _task_tmdb_id(task) == tid or _task_tmdb_id(task) == target_tmdb_id
+        )
     )
     if not result["deleted"]:
-        raise HTTPException(status_code=404, detail="未找到该剧集订阅")
-    return {"ok": True}
+        return {"ok": True, "deleted": False}
+    return {"ok": True, "deleted": True}
 
 
 @router.post("/command", response_model=ServarrCommandResponse)
