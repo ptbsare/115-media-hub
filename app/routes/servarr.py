@@ -410,16 +410,24 @@ def _series_tasks_to_sonarr(tasks: List[Dict[str, Any]], tvdb_id: int = 0) -> Op
     )
 
 
-def _build_servarr_movie_task(tmdb_id: int, cfg: Dict[str, Any]) -> Dict[str, Any]:
+def _build_servarr_movie_task(
+    tmdb_id: int,
+    cfg: Dict[str, Any],
+    fallback_title: str = "",
+    fallback_year: str = "",
+) -> Dict[str, Any]:
+    binding = {}
+    title = fallback_title
+    year = fallback_year
     try:
         detail = get_tmdb_media_detail(tmdb_id, "movie", cfg)
+        binding = build_tmdb_task_binding(detail, media_type="movie")
+        title = str(binding.get("tmdb_title") or detail.get("title") or title).strip()
+        year = str(binding.get("tmdb_year") or year).strip()
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取 TMDB 电影信息失败：{exc}") from exc
-    binding = build_tmdb_task_binding(detail, media_type="movie")
-    title = str(binding.get("tmdb_title") or detail.get("title") or "").strip()
-    year = str(binding.get("tmdb_year") or "").strip()
-    if not title:
-        raise HTTPException(status_code=500, detail="TMDB 电影信息解析失败：标题为空")
+        logger.warning("获取 TMDB 电影详情失败(%s)，使用降级标题创建点播任务: %s", tmdb_id, exc)
+
+    title = title or f"TMDB-{tmdb_id}"
     return normalize_subscription_task(
         {
             "name": _servarr_title_year(title, year),
@@ -431,6 +439,8 @@ def _build_servarr_movie_task(tmdb_id: int, cfg: Dict[str, Any]) -> Dict[str, An
             "savepath": _servarr_movie_savepath(cfg),
             "enabled": True,
             "organize_on_import": True,
+            "tmdb_id": tmdb_id,
+            "tmdb_media_type": "movie",
             **binding,
         }
     )
@@ -498,13 +508,19 @@ async def servarr_quality_profiles(_: None = servarr_auth) -> List[ServarrQualit
 
 
 @router.get("/rootfolder", response_model=List[ServarrRootFolder])
-async def servarr_root_folders(_: None = servarr_auth) -> List[ServarrRootFolder]:
-    movie_root = _servarr_movie_savepath(get_config())
-    tv_root = _servarr_tv_savepath(get_config())
+async def servarr_root_folders(request: Request, _: None = servarr_auth) -> List[ServarrRootFolder]:
+    cfg = get_config()
+    movie_root = _servarr_movie_savepath(cfg)
+    tv_root = _servarr_tv_savepath(cfg)
+    ua = str(request.headers.get("User-Agent", "") or "").lower()
+    if "sonarr" in ua:
+        return [ServarrRootFolder(path=tv_root or "/")]
+    if "radarr" in ua:
+        return [ServarrRootFolder(path=movie_root or "/")]
     folders = []
     if movie_root:
         folders.append(ServarrRootFolder(path=movie_root))
-    if tv_root:
+    if tv_root and tv_root != movie_root:
         folders.append(ServarrRootFolder(path=tv_root))
     return folders or [ServarrRootFolder(path="/")]
 
@@ -597,7 +613,7 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
                 status_code=400,
                 detail="未配置电影点播保存目录：请先在「参数配置 → 后台安全管理」填写",
             )
-        task = _build_servarr_movie_task(tmdb_id, cfg)
+        task = _build_servarr_movie_task(tmdb_id, cfg, fallback_title=str(movie.title or ""), fallback_year=str(movie.year or ""))
         appended = _append_subscription_tasks([task])
         for item in appended:
             queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
