@@ -207,7 +207,7 @@ class SonarrSeries(BaseModel):
 # ---------------------------------------------------------------- 鉴权
 
 async def verify_servarr_api_key(request: Request) -> None:
-    """校验 X-Api-Key；未配置密钥时整个接口关闭（503），密钥不符 401。"""
+    """校验 X-Api-Key / Query apikey / Bearer；未配置密钥时整个接口关闭（503），密钥不符 401。"""
     cfg = get_config()
     expected = str(cfg.get("servarr_api_key", "") or "").strip()
     if not expected:
@@ -215,7 +215,9 @@ async def verify_servarr_api_key(request: Request) -> None:
             status_code=503,
             detail="点播接口未启用：请先在「参数配置 → 后台安全管理」生成 API Key",
         )
-    provided = str(request.headers.get("X-Api-Key", "") or "").strip()
+    provided = str(request.query_params.get("apikey", "") or request.query_params.get("api_key", "") or "").strip()
+    if not provided:
+        provided = str(request.headers.get("X-Api-Key", "") or "").strip()
     if not provided:
         auth_header = str(request.headers.get("Authorization", "") or "").strip()
         if auth_header.lower().startswith("bearer "):
