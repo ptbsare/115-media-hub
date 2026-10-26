@@ -137,6 +137,11 @@ class ServarrLanguageProfile(BaseModel):
     languages: List[ServarrLanguageProfileItem] = Field(default_factory=list)
 
 
+class ServarrCommandResponse(BaseModel):
+    id: int = 1
+    name: str = ""
+    status: str = "completed"
+
 class ServarrIdResponse(BaseModel):
     id: int = 0
 
@@ -557,29 +562,65 @@ async def servarr_movie_detail(mid: int, _: None = servarr_auth) -> RadarrMovie:
     return _movie_task_to_radarr(task)
 
 
-@router.post("/movie", response_model=ServarrIdResponse)
-async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> ServarrIdResponse:
+@router.post("/movie", response_model=Union[RadarrMovie, ServarrIdResponse])
+async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union[RadarrMovie, ServarrIdResponse]:
     """Seerr 电影点播：建一个电影订阅任务并立即跑一次全量搜索。"""
     tmdb_id = max(0, int(movie.tmdbId or 0))
     if tmdb_id <= 0:
         raise HTTPException(status_code=400, detail="请求缺少 tmdbId")
     cfg = get_config()
-    if _find_movie_task(cfg, tmdb_id):
-        # 幂等：已点播过直接返回，不重复建任务（Seerr 会显示「已请求」）。
-        return ServarrIdResponse(id=tmdb_id)
-    config_error = validate_tmdb_runtime_config(cfg)
-    if config_error:
-        raise HTTPException(status_code=400, detail=f"无法创建点播任务：{config_error}")
-    if not _servarr_default_savepath(cfg):
-        raise HTTPException(
-            status_code=400,
-            detail="未配置点播默认保存目录：请先在「参数配置 → 后台安全管理」填写",
-        )
-    task = _build_servarr_movie_task(tmdb_id, cfg)
-    appended = _append_subscription_tasks([task])
-    for item in appended:
-        queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
-    return ServarrIdResponse(id=tmdb_id)
+    existing = _find_movie_task(cfg, tmdb_id)
+    if not existing:
+        config_error = validate_tmdb_runtime_config(cfg)
+        if config_error:
+            raise HTTPException(status_code=400, detail=f"无法创建点播任务：{config_error}")
+        if not _servarr_default_savepath(cfg):
+            raise HTTPException(
+                status_code=400,
+                detail="未配置点播默认保存目录：请先在「参数配置 → 后台安全管理」填写",
+            )
+        task = _build_servarr_movie_task(tmdb_id, cfg)
+        appended = _append_subscription_tasks([task])
+        for item in appended:
+            queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
+    
+    return RadarrMovie(
+        id=tmdb_id,
+        title=movie.title or "Unknown",
+        year=str(movie.year or ""),
+        isAvailable=True,
+        monitored=True,
+        hasFile=False,
+        tmdbId=tmdb_id,
+        profileId=SERVARR_QUALITY_PROFILE_ID,
+        qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
+        rootFolderPath=_servarr_default_savepath(cfg) or None,
+    )
+
+
+
+@router.put("/movie", response_model=RadarrMovie)
+async def servarr_update_movie(movie: RadarrMovie, _: None = servarr_auth) -> RadarrMovie:
+    """Seerr 更新电影点播/监控状态。"""
+    tmdb_id = max(0, int(movie.tmdbId or 0))
+    if tmdb_id <= 0:
+        raise HTTPException(status_code=400, detail="请求缺少 tmdbId")
+    cfg = get_config()
+    existing = _find_movie_task(cfg, tmdb_id)
+    if not existing:
+        await servarr_add_movie(movie, _)
+    return RadarrMovie(
+        id=tmdb_id,
+        title=movie.title or "Unknown",
+        year=str(movie.year or ""),
+        isAvailable=True,
+        monitored=True,
+        hasFile=False,
+        tmdbId=tmdb_id,
+        profileId=SERVARR_QUALITY_PROFILE_ID,
+        qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
+        rootFolderPath=_servarr_default_savepath(cfg) or None,
+    )
 
 
 @router.delete("/movie/{mid}")
@@ -789,3 +830,15 @@ async def servarr_remove_series(tid: int, _: None = servarr_auth) -> Dict[str, A
     if not result["deleted"]:
         raise HTTPException(status_code=404, detail="未找到该剧集订阅")
     return {"ok": True}
+
+
+@router.post("/command", response_model=ServarrCommandResponse)
+async def servarr_command(body: Dict[str, Any], _: None = servarr_auth) -> ServarrCommandResponse:
+    """响应 Seerr 发出的 MoviesSearch / SeriesSearch 命令。"""
+    name = str(body.get("name", "") if isinstance(body, dict) else "")
+    return ServarrCommandResponse(id=1, name=name, status="completed")
+
+@router.get("/episode")
+async def servarr_episodes(seriesId: Optional[int] = None, _: None = servarr_auth) -> List[Dict[str, Any]]:
+    """响应 Sonarr 点播后查询剧集清单，返回空列表避免 404。"""
+    return []
