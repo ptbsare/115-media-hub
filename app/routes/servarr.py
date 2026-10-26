@@ -584,14 +584,20 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
         for item in appended:
             queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
     
+    title = movie.title or "Unknown"
+    year = str(movie.year or "")
+    slug = movie.titleSlug or str(tmdb_id)
+    folder = movie.folderName or _servarr_title_year(title, year)
     return RadarrMovie(
         id=tmdb_id,
-        title=movie.title or "Unknown",
-        year=str(movie.year or ""),
+        title=title,
+        year=year,
         isAvailable=True,
         monitored=True,
         hasFile=False,
         tmdbId=tmdb_id,
+        titleSlug=slug,
+        folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
         rootFolderPath=_servarr_default_savepath(cfg) or None,
@@ -609,14 +615,20 @@ async def servarr_update_movie(movie: RadarrMovie, _: None = servarr_auth) -> Ra
     existing = _find_movie_task(cfg, tmdb_id)
     if not existing:
         await servarr_add_movie(movie, _)
+    title = movie.title or "Unknown"
+    year = str(movie.year or "")
+    slug = movie.titleSlug or str(tmdb_id)
+    folder = movie.folderName or _servarr_title_year(title, year)
     return RadarrMovie(
         id=tmdb_id,
-        title=movie.title or "Unknown",
-        year=str(movie.year or ""),
+        title=title,
+        year=year,
         isAvailable=True,
         monitored=True,
         hasFile=False,
         tmdbId=tmdb_id,
+        titleSlug=slug,
+        folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
         rootFolderPath=_servarr_default_savepath(cfg) or None,
