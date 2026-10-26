@@ -455,12 +455,14 @@ def _build_servarr_series_task(
     cfg: Dict[str, Any],
     multi_season: bool,
 ) -> Dict[str, Any]:
+    title = str(title or f"TMDB-{tmdb_id}").strip()
+    year = str(year or "").strip()
     name = _servarr_title_year(title, year)
     if multi_season:
         name = f"{name} S{season:02d}"
-    season_episode_map = binding.get("tmdb_season_episode_map") or {}
+    season_episode_map = binding.get("tmdb_season_episode_map") or {} if isinstance(binding, dict) else {}
     total_episodes = max(0, int(season_episode_map.get(str(season), 0) or 0))
-    # 电视剧 savepath 指向 剧集根/剧名(年份)，整理器会在其下建 Season NN/
+    # 电视剧 savepath 强锁定为: 电视剧保存根目录 / 剧名(年份)
     tv_root = _servarr_tv_savepath(cfg)
     series_folder = _servarr_title_year(title, year)
     series_savepath = f"{tv_root}/{series_folder}" if tv_root else series_folder
@@ -476,7 +478,9 @@ def _build_servarr_series_task(
             "savepath": series_savepath,
             "enabled": True,
             "organize_on_import": True,
-            **binding,
+            "tmdb_id": tmdb_id,
+            "tmdb_media_type": "tv",
+            **(binding if isinstance(binding, dict) else {}),
         }
     )
 
@@ -508,21 +512,9 @@ async def servarr_quality_profiles(_: None = servarr_auth) -> List[ServarrQualit
 
 
 @router.get("/rootfolder", response_model=List[ServarrRootFolder])
-async def servarr_root_folders(request: Request, _: None = servarr_auth) -> List[ServarrRootFolder]:
-    cfg = get_config()
-    movie_root = _servarr_movie_savepath(cfg)
-    tv_root = _servarr_tv_savepath(cfg)
-    ua = str(request.headers.get("User-Agent", "") or "").lower()
-    if "sonarr" in ua:
-        return [ServarrRootFolder(path=tv_root or "/")]
-    if "radarr" in ua:
-        return [ServarrRootFolder(path=movie_root or "/")]
-    folders = []
-    if movie_root:
-        folders.append(ServarrRootFolder(path=movie_root))
-    if tv_root and tv_root != movie_root:
-        folders.append(ServarrRootFolder(path=tv_root))
-    return folders or [ServarrRootFolder(path="/")]
+async def servarr_root_folders(_: None = servarr_auth) -> List[ServarrRootFolder]:
+    """返回固定根路径，使 Seerr 前端无需用户手动选择保存目录。"""
+    return [ServarrRootFolder(id=1, path="/")]
 
 
 @router.get("/tag", response_model=List[ServarrTag])
@@ -568,7 +560,7 @@ async def servarr_movie_lookup(term: str, _: None = servarr_auth) -> List[Radarr
             folderName=_servarr_title_year(title, year),
             profileId=SERVARR_QUALITY_PROFILE_ID,
             qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-            rootFolderPath=_servarr_movie_savepath(cfg) or None,
+            rootFolderPath="/",
         )
     ]
 
@@ -634,7 +626,7 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
         folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-        rootFolderPath=_servarr_movie_savepath(cfg) or None,
+        rootFolderPath="/",
     )
 
 
@@ -665,7 +657,7 @@ async def servarr_update_movie(movie: RadarrMovie, _: None = servarr_auth) -> Ra
         folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-        rootFolderPath=_servarr_movie_savepath(cfg) or None,
+        rootFolderPath="/",
     )
 
 
@@ -825,15 +817,18 @@ async def servarr_add_series(tv: SonarrSeries, _: None = servarr_auth) -> Servar
             status_code=400,
             detail="未配置电视剧点播保存目录：请先在「参数配置 → 后台安全管理」填写",
         )
+    binding = {}
+    title = str(tv.title or "").strip()
+    year = str(tv.year or "").strip()
     try:
         detail = get_tmdb_media_detail(tmdb_id, "tv", cfg)
+        binding = build_tmdb_task_binding(detail, media_type="tv")
+        title = str(binding.get("tmdb_title") or detail.get("title") or title).strip()
+        year = str(binding.get("tmdb_year") or year).strip()
     except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取 TMDB 剧集信息失败：{exc}") from exc
-    binding = build_tmdb_task_binding(detail, media_type="tv")
-    title = str(tv.title or binding.get("tmdb_title") or detail.get("title") or "").strip()
-    year = str(tv.year or binding.get("tmdb_year") or "").strip()
-    if not title:
-        raise HTTPException(status_code=500, detail="TMDB 剧集信息解析失败：标题为空")
+        logger.warning("剧集点播快速响应：TMDB 响应较慢或失败(%s)，使用点播标题【%s】直接建单: %s", tmdb_id, title, exc)
+
+    title = title or f"TMDB-{tmdb_id}" 
     season_episode_map = binding.get("tmdb_season_episode_map") or {}
     wanted: List[int] = []
     for season in tv.seasons or []:

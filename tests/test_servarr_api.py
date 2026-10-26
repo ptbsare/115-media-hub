@@ -202,14 +202,9 @@ class ServarrStaticEndpointsTest(ServarrApiTestBase):
         self.assertTrue(data[0]["items"])
 
     def test_rootfolder_default_and_configured(self):
-        with self._patched(cfg={"servarr_default_savepath": "", "servarr_movie_savepath": "", "servarr_tv_savepath": ""}):
-            resp = self.client.get("/api/v3/rootfolder", headers=HEADERS)
-        self.assertEqual(resp.json()[0]["path"], "/")
         with self._patched():
             resp = self.client.get("/api/v3/rootfolder", headers=HEADERS)
-        paths = [f["path"] for f in resp.json()]
-        self.assertIn("媒体库/网盘电影", paths)
-        self.assertIn("媒体库/网盘电视剧", paths)
+        self.assertEqual(resp.json(), [{"id": 1, "path": "/"}])
 
     def test_tag(self):
         with self._patched():
