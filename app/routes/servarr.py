@@ -240,6 +240,14 @@ def _servarr_default_savepath(cfg: Dict[str, Any]) -> str:
     return normalize_relative_path(cfg.get("servarr_default_savepath", ""))
 
 
+def _servarr_movie_savepath(cfg: Dict[str, Any]) -> str:
+    return normalize_relative_path(cfg.get("servarr_movie_savepath", "") or cfg.get("servarr_default_savepath", ""))
+
+
+def _servarr_tv_savepath(cfg: Dict[str, Any]) -> str:
+    return normalize_relative_path(cfg.get("servarr_tv_savepath", "") or cfg.get("servarr_default_savepath", ""))
+
+
 def _subscription_tasks(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
     raw = cfg.get("subscription_tasks", [])
     if not isinstance(raw, list):
@@ -420,7 +428,7 @@ def _build_servarr_movie_task(tmdb_id: int, cfg: Dict[str, Any]) -> Dict[str, An
             "title": title,
             "year": year,
             "season": 1,
-            "savepath": _servarr_default_savepath(cfg),
+            "savepath": _servarr_movie_savepath(cfg),
             "enabled": True,
             "organize_on_import": True,
             **binding,
@@ -442,6 +450,10 @@ def _build_servarr_series_task(
         name = f"{name} S{season:02d}"
     season_episode_map = binding.get("tmdb_season_episode_map") or {}
     total_episodes = max(0, int(season_episode_map.get(str(season), 0) or 0))
+    # 电视剧 savepath 指向 剧集根/剧名(年份)，整理器会在其下建 Season NN/
+    tv_root = _servarr_tv_savepath(cfg)
+    series_folder = _servarr_title_year(title, year)
+    series_savepath = f"{tv_root}/{series_folder}" if tv_root else series_folder
     return normalize_subscription_task(
         {
             "name": name,
@@ -451,7 +463,7 @@ def _build_servarr_series_task(
             "year": year,
             "season": season,
             "total_episodes": total_episodes,
-            "savepath": _servarr_default_savepath(cfg),
+            "savepath": series_savepath,
             "enabled": True,
             "organize_on_import": True,
             **binding,
@@ -487,8 +499,14 @@ async def servarr_quality_profiles(_: None = servarr_auth) -> List[ServarrQualit
 
 @router.get("/rootfolder", response_model=List[ServarrRootFolder])
 async def servarr_root_folders(_: None = servarr_auth) -> List[ServarrRootFolder]:
-    savepath = _servarr_default_savepath(get_config())
-    return [ServarrRootFolder(path=savepath or "/")]
+    movie_root = _servarr_movie_savepath(get_config())
+    tv_root = _servarr_tv_savepath(get_config())
+    folders = []
+    if movie_root:
+        folders.append(ServarrRootFolder(path=movie_root))
+    if tv_root:
+        folders.append(ServarrRootFolder(path=tv_root))
+    return folders or [ServarrRootFolder(path="/")]
 
 
 @router.get("/tag", response_model=List[ServarrTag])
@@ -534,7 +552,7 @@ async def servarr_movie_lookup(term: str, _: None = servarr_auth) -> List[Radarr
             folderName=_servarr_title_year(title, year),
             profileId=SERVARR_QUALITY_PROFILE_ID,
             qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-            rootFolderPath=_servarr_default_savepath(cfg) or None,
+            rootFolderPath=_servarr_movie_savepath(cfg) or None,
         )
     ]
 
@@ -574,10 +592,10 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
         config_error = validate_tmdb_runtime_config(cfg)
         if config_error:
             raise HTTPException(status_code=400, detail=f"无法创建点播任务：{config_error}")
-        if not _servarr_default_savepath(cfg):
+        if not _servarr_movie_savepath(cfg):
             raise HTTPException(
                 status_code=400,
-                detail="未配置点播默认保存目录：请先在「参数配置 → 后台安全管理」填写",
+                detail="未配置电影点播保存目录：请先在「参数配置 → 后台安全管理」填写",
             )
         task = _build_servarr_movie_task(tmdb_id, cfg)
         appended = _append_subscription_tasks([task])
@@ -600,7 +618,7 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
         folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-        rootFolderPath=_servarr_default_savepath(cfg) or None,
+        rootFolderPath=_servarr_movie_savepath(cfg) or None,
     )
 
 
@@ -631,7 +649,7 @@ async def servarr_update_movie(movie: RadarrMovie, _: None = servarr_auth) -> Ra
         folderName=folder,
         profileId=SERVARR_QUALITY_PROFILE_ID,
         qualityProfileId=SERVARR_QUALITY_PROFILE_ID,
-        rootFolderPath=_servarr_default_savepath(cfg) or None,
+        rootFolderPath=_servarr_movie_savepath(cfg) or None,
     )
 
 
@@ -786,10 +804,10 @@ async def servarr_add_series(tv: SonarrSeries, _: None = servarr_auth) -> Servar
     config_error = validate_tmdb_runtime_config(cfg)
     if config_error:
         raise HTTPException(status_code=400, detail=f"无法创建点播任务：{config_error}")
-    if not _servarr_default_savepath(cfg):
+    if not _servarr_tv_savepath(cfg):
         raise HTTPException(
             status_code=400,
-            detail="未配置点播默认保存目录：请先在「参数配置 → 后台安全管理」填写",
+            detail="未配置电视剧点播保存目录：请先在「参数配置 → 后台安全管理」填写",
         )
     try:
         detail = get_tmdb_media_detail(tmdb_id, "tv", cfg)
