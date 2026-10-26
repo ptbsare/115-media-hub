@@ -18,9 +18,6 @@ from ..core import *  # noqa: F401,F403
 from ..services.subscription import queue_subscription_job
 from ..versioning import load_local_version
 
-import logging
-logger = logging.getLogger(__name__)
-
 router = APIRouter(prefix="/api/v3", tags=["servarr"])
 
 SERVARR_QUALITY_PROFILE_ID = 1
@@ -427,8 +424,8 @@ def _build_servarr_movie_task(
         binding = build_tmdb_task_binding(detail, media_type="movie")
         title = str(binding.get("tmdb_title") or detail.get("title") or title).strip()
         year = str(binding.get("tmdb_year") or year).strip()
-    except Exception as exc:
-        logger.warning("获取 TMDB 电影详情失败(%s)，使用降级标题创建点播任务: %s", tmdb_id, exc)
+    except Exception:
+        pass
 
     title = title or f"TMDB-{tmdb_id}"
     return normalize_subscription_task(
@@ -442,6 +439,8 @@ def _build_servarr_movie_task(
             "savepath": _servarr_movie_savepath(cfg),
             "enabled": True,
             "organize_on_import": True,
+            "cross_copy_mode": "fallback",
+            "cross_copy_sources": ["quark"],
             "tmdb_id": tmdb_id,
             "tmdb_media_type": "movie",
             **binding,
@@ -481,6 +480,8 @@ def _build_servarr_series_task(
             "savepath": series_savepath,
             "enabled": True,
             "organize_on_import": True,
+            "cross_copy_mode": "fallback",
+            "cross_copy_sources": ["quark"],
             "tmdb_id": tmdb_id,
             "tmdb_media_type": "tv",
             **(binding if isinstance(binding, dict) else {}),
@@ -595,7 +596,6 @@ async def servarr_movie_detail(mid: int, _: None = servarr_auth) -> RadarrMovie:
 async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union[RadarrMovie, ServarrIdResponse]:
     """Seerr 电影点播：建一个电影订阅任务并立即跑一次全量搜索。"""
     tmdb_id = max(0, int(movie.tmdbId or 0))
-    logger.warning("[SERV] ADD_MOVIE_IN tmdb_id=%s title=%s year=%s", tmdb_id, movie.title, movie.year)
     if tmdb_id <= 0:
         raise HTTPException(status_code=400, detail="请求缺少 tmdbId")
     cfg = get_config()
@@ -609,13 +609,9 @@ async def servarr_add_movie(movie: RadarrMovie, _: None = servarr_auth) -> Union
                 status_code=400,
                 detail="未配置电影点播保存目录：请先在「参数配置 → 后台安全管理」填写",
             )
-        logger.warning("[SERV] BUILD_TASK tmdb_id=%s fallback_title=%s fallback_year=%s", tmdb_id, movie.title, movie.year)
         task = _build_servarr_movie_task(tmdb_id, cfg, fallback_title=str(movie.title or ""), fallback_year=str(movie.year or ""))
-        logger.warning("[SERV] TASK_BUILT name=%s savepath=%s", task.get("name"), task.get("savepath"))
         appended = _append_subscription_tasks([task])
-        logger.warning("[SERV] APPENDED count=%s", len(appended))
         for item in appended:
-            logger.warning("[SERV] QUEUE_JOB task_name=%s trigger=%s", item.get("name"), SERVARR_TRIGGER)
             queue_subscription_job(str(item.get("name", "")), SERVARR_TRIGGER)
     
     title = movie.title or "Unknown"
@@ -835,8 +831,8 @@ async def servarr_add_series(tv: SonarrSeries, _: None = servarr_auth) -> Servar
         binding = build_tmdb_task_binding(detail, media_type="tv")
         title = str(binding.get("tmdb_title") or detail.get("title") or title).strip()
         year = str(binding.get("tmdb_year") or year).strip()
-    except Exception as exc:
-        logger.warning("剧集点播快速响应：TMDB 响应较慢或失败(%s)，使用点播标题【%s】直接建单: %s", tmdb_id, title, exc)
+    except Exception:
+        pass
 
     title = title or f"TMDB-{tmdb_id}" 
     season_episode_map = binding.get("tmdb_season_episode_map") or {}
